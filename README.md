@@ -77,8 +77,19 @@ mpv-scripts/            Lua trigger script for mpv's scripts directory
 By default this scaffold calls ffmpeg/ffprobe as **sidecar** binaries
 bundled inside the app, not from your system PATH — so once you build a
 release with `cargo tauri build`, that `.msi` never needs ffmpeg installed
-separately, on your machine or anyone else's. Setting this up is a
-one-time step:
+separately, on your machine or anyone else's.
+
+**Easiest path:** run `scripts\setup-ffmpeg.ps1` from the repo root (or
+anywhere — it locates the repo relative to its own location). It
+downloads the current Windows ffmpeg build, detects your Rust target
+triple, and places both binaries in `src-tauri/binaries/` with the exact
+naming Tauri's sidecar mechanism requires. Re-run it any time to pick up
+a newer ffmpeg release. These binaries are `.gitignore`'d — anyone
+building this repo runs the script themselves rather than pulling ~80MB
+of binaries out of git.
+
+**Manual path**, if you'd rather not run a script or need a different
+platform's build:
 
 1. Download static ffmpeg + ffprobe builds for your platform (Windows:
    the "essentials" or "full" build from gyan.dev's ffmpeg-builds page;
@@ -91,9 +102,10 @@ one-time step:
    - `src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe`
    - `src-tauri/binaries/ffprobe-x86_64-pc-windows-msvc.exe`
    (swap the triple/extension for your platform)
-4. `cargo tauri dev` / `cargo tauri build` will now pick them up
-   automatically — `tauri.conf.json`'s `externalBin` entry already points
-   at this folder.
+
+Either way, `cargo tauri dev` / `cargo tauri build` will pick them up
+automatically — `tauri.conf.json`'s `externalBin` entry already points at
+that folder.
 
 If you'd rather not bundle them (smaller download, but back to requiring
 ffmpeg on PATH like the original scaffold), that's a valid tradeoff too —
@@ -112,9 +124,9 @@ check that crate's current docs for the exact call shape.
 1. `cargo tauri dev` first with placeholder ffmpeg binaries missing —
    confirm the window opens and the browser-preview UI behavior still
    holds inside the real webview before chasing ffmpeg issues.
-2. Drop in real ffmpeg/ffprobe sidecar binaries (see above), pick a
-   local video file's path manually in place of mpv for now, and test
-   `get_video_metadata` + `export_clip` end to end.
+2. Run `scripts\setup-ffmpeg.ps1` to get real ffmpeg/ffprobe binaries in
+   place, pick a local video file's path manually in place of mpv for
+   now, and test `get_video_metadata` + `export_clip` end to end.
 3. If either command errors, test the equivalent ffmpeg/ffprobe args by
    hand in a terminal first — cheaper to debug ffmpeg syntax outside the
    GUI/IPC loop.

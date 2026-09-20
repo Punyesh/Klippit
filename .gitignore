@@ -2,6 +2,11 @@
 /src-tauri/target/
 /src-tauri/gen/
 
+# Bundled ffmpeg/ffprobe sidecars — large binaries, fetched by
+# scripts/setup-ffmpeg.ps1 rather than committed. See README's
+# "Bundling ffmpeg" section.
+/src-tauri/binaries/
+
 # Node (if you add a bundler/dev-server later)
 node_modules/
 dist/
