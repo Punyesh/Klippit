@@ -17,7 +17,7 @@ var init = window.__KLIPPIT_INIT__ || {
   filePath: '',
   fileName: '(no file — dev preview mode)',
   startTime: 12.0,
-  subtitleAvailable: false
+  subtitle: { available: false }
 };
 
 var state = {
@@ -33,7 +33,8 @@ var state = {
   resolution: 0, // 0 = source
   gifFps: 24,
   targetMb: 10,
-  outputDir: '~/Videos/Clips'
+  outputDir: '~/Videos/Clips',
+  outputFileName: '' // populated once we know the source filename — see updateDefaultFilename()
 };
 
 var MED_STEP = 5;
@@ -82,7 +83,33 @@ function render() {
 
   selIn.setAttribute('aria-pressed', state.activeHandle === 'in');
   selOut.setAttribute('aria-pressed', state.activeHandle === 'out');
+  updateDefaultFilename();
 }
+
+// ---------- output filename ----------
+// Defaults to sourceName_in-out, editable freely — once the person types
+// anything in the field, we stop overwriting it as in/out change, so
+// their edit sticks rather than getting silently clobbered on the next
+// handle move.
+var filenameManuallyEdited = false;
+function fileStem(name) {
+  var idx = name.lastIndexOf('.');
+  return idx > 0 ? name.slice(0, idx) : name;
+}
+function updateDefaultFilename() {
+  if (filenameManuallyEdited) return;
+  var stem = (init.fileName && init.fileName.indexOf('(no file') !== 0) ? fileStem(init.fileName) : 'clip';
+  state.outputFileName = stem + '_' + state.inTime.toFixed(2) + '-' + state.outTime.toFixed(2);
+  var field = document.getElementById('output-filename');
+  if (field) field.value = state.outputFileName;
+}
+function updateOutputExt() {
+  document.getElementById('output-ext').textContent = '.' + state.format;
+}
+document.getElementById('output-filename').addEventListener('input', function (e) {
+  filenameManuallyEdited = true;
+  state.outputFileName = e.target.value;
+});
 
 // ---------- shared step function (mouse buttons AND keyboard both call this) ----------
 function step(deltaFrames) {
@@ -113,8 +140,8 @@ document.getElementById('fb-medfwd').onclick = function () { step(MED_STEP); };
 document.getElementById('fb-bigback').onclick = function () { step(-Math.round(state.fps)); };
 document.getElementById('fb-bigfwd').onclick = function () { step(Math.round(state.fps)); };
 
-selIn.onclick = function () { state.activeHandle = 'in'; render(); };
-selOut.onclick = function () { state.activeHandle = 'out'; render(); };
+selIn.onclick = function () { state.activeHandle = 'in'; video.currentTime = state.inTime; render(); };
+selOut.onclick = function () { state.activeHandle = 'out'; video.currentTime = state.outTime; render(); };
 
 // ---------- frame bar: keyboard ----------
 // Same , / . convention as sakuga-enhancer.js, so the muscle memory carries
@@ -122,14 +149,24 @@ selOut.onclick = function () { state.activeHandle = 'out'; render(); };
 // deliberately mouse/button-only (« / ») since it's a coarse repositioning
 // move, not something worth a dedicated key.
 window.addEventListener('keydown', function (e) {
-  // Don't hijack typing in the target-MB or other number fields.
+  // Don't hijack typing in the target-MB, filename, or other text fields.
   if (e.target.tagName === 'INPUT' && e.target.type !== 'range') return;
 
   if (e.key === ',') { step(e.shiftKey ? -MED_STEP : -1); e.preventDefault(); }
   else if (e.key === '.') { step(e.shiftKey ? MED_STEP : 1); e.preventDefault(); }
   else if (e.key === 'Enter' && e.target.tagName !== 'BUTTON') { exportClip(); }
   else if (e.key === 'Escape') { closePanel(); }
+  else if (e.key === ' ' && e.target.tagName !== 'BUTTON') { togglePlayback(); e.preventDefault(); }
 });
+
+// ---------- play/pause (editing preview) ----------
+var playPauseBtn = document.getElementById('play-pause-btn');
+function togglePlayback() {
+  if (video.paused) { video.play(); } else { video.pause(); }
+}
+playPauseBtn.onclick = togglePlayback;
+video.addEventListener('play', function () { playPauseBtn.innerHTML = '&#10074;&#10074;'; });
+video.addEventListener('pause', function () { playPauseBtn.innerHTML = '&#9654;'; });
 
 // ---------- draggable trim handles (mouse) ----------
 function makeDraggable(handle, which) {
@@ -177,6 +214,7 @@ function bindSeg(idOn, idOff, onSelect) {
 bindSeg('fmt-mp4', 'fmt-gif', function (id) {
   state.format = id === 'fmt-mp4' ? 'mp4' : 'gif';
   document.getElementById('fps-field').style.display = state.format === 'gif' ? 'block' : 'none';
+  updateOutputExt();
 });
 bindSeg('mode-quality', 'mode-size', function (id) {
   state.mode = id === 'mode-quality' ? 'quality' : 'size';
@@ -195,7 +233,7 @@ function disableSubtitleControls(message) {
   subsOnBtn.disabled = true;
   subsStatus.textContent = message;
 }
-if (!init.subtitleAvailable) {
+if (!(init.subtitle && init.subtitle.available)) {
   disableSubtitleControls('No active subtitle track detected');
 }
 
@@ -250,6 +288,18 @@ function setStatus(text, kind) {
   statusEl.className = kind || '';
 }
 
+var spinnerEl = document.getElementById('export-spinner');
+var exportBtn = document.getElementById('export-btn');
+var statusActions = document.getElementById('status-actions');
+var revealBtn = document.getElementById('reveal-btn');
+var playBtn = document.getElementById('play-btn');
+var lastExportedPath = null;
+
+function setBusy(busy) {
+  exportBtn.disabled = busy;
+  spinnerEl.style.display = busy ? 'inline-block' : 'none';
+}
+
 // ---------- export ----------
 function exportClip() {
   var params = {
@@ -263,31 +313,54 @@ function exportClip() {
     resolution: state.resolution,
     gifFps: state.gifFps,
     targetMb: state.targetMb,
-    outputDir: state.outputDir
+    outputDir: state.outputDir,
+    fileName: state.outputFileName
   };
   setStatus('exporting…', 'busy');
-  document.getElementById('export-btn').disabled = true;
+  statusActions.style.display = 'none';
+  setBusy(true);
 
   if (!window.__TAURI__) {
     // Standalone browser preview — no backend to actually encode against.
     console.log('[klippit] export_clip params (dev preview, no backend):', params);
     setTimeout(function () {
       setStatus('(dev preview) no Tauri backend here — see console for params', 'done');
-      document.getElementById('export-btn').disabled = false;
+      setBusy(false);
     }, 400);
     return;
   }
 
   window.__TAURI__.core.invoke('export_clip', { params: params }).then(function (path) {
     setStatus('done — ' + path, 'done');
+    lastExportedPath = path;
+    statusActions.style.display = 'flex';
   }).catch(function (err) {
     setStatus('export failed: ' + err, 'error');
   }).then(function () {
-    document.getElementById('export-btn').disabled = false;
+    setBusy(false);
   });
 }
 document.getElementById('export-btn').onclick = exportClip;
 document.getElementById('cancel-btn').onclick = closePanel;
+
+revealBtn.onclick = function () {
+  if (!lastExportedPath || !window.__TAURI__) return;
+  // TODO(verify): tauri-plugin-opener's exact JS export names — written
+  // against the documented v2 API (openPath / revealItemInDir under
+  // window.__TAURI__.opener) but not yet confirmed against a real build.
+  window.__TAURI__.opener.revealItemInDir(lastExportedPath).catch(function (err) {
+    setStatus('failed to open folder: ' + err, 'error');
+  });
+};
+playBtn.onclick = function () {
+  if (!lastExportedPath || !window.__TAURI__) return;
+  // Opens a small dedicated review window (review.html) with a native
+  // <video controls> player, rather than handing off to the OS default
+  // app — keeps the review experience inside Klippit itself.
+  window.__TAURI__.core.invoke('open_review_window', { path: lastExportedPath }).catch(function (err) {
+    setStatus('failed to open preview: ' + err, 'error');
+  });
+};
 
 function closePanel() {
   if (window.__TAURI__) {
@@ -297,10 +370,50 @@ function closePanel() {
   }
 }
 
-// ---------- init ----------
-document.getElementById('source-name').textContent = init.fileName;
-document.getElementById('source-name').title = init.filePath;
-if (init.filePath) video.src = 'file://' + init.filePath; // TODO(tauri): use tauri's asset protocol instead of raw file://
+// ---------- apply init (first launch, and later re-seeds from single-instance) ----------
+// Pressing mpv's trigger key while a Klippit window is already open
+// doesn't spawn a second one — see main.rs's single-instance plugin
+// handler, which calls window.applyInit(...) directly via eval() on the
+// existing window instead. Wrapping this in a named, re-callable
+// function (rather than one-shot top-level code) is what makes that
+// possible.
+function applyInit(newInit) {
+  init = newInit || init;
+  document.getElementById('source-name').textContent = init.fileName;
+  document.getElementById('source-name').title = init.filePath;
+
+  // Reset editing state for the new clip rather than carrying over
+  // whatever in/out/filename the previous file had.
+  state.inTime = init.startTime;
+  state.outTime = init.startTime + 3;
+  state.activeHandle = 'in';
+  filenameManuallyEdited = false;
+  lastExportedPath = null;
+  statusActions.style.display = 'none';
+  setStatus('', '');
+
+  // Subtitle controls: re-enable by default, loadMetadata() below will
+  // disable them again if this particular file genuinely has none.
+  subsOffBtn.disabled = false;
+  subsOnBtn.disabled = false;
+  subsStatus.textContent = '';
+  if (!(init.subtitle && init.subtitle.available)) {
+    disableSubtitleControls('No active subtitle track detected');
+  }
+
+  if (init.filePath) {
+    video.src = window.__TAURI__
+      ? window.__TAURI__.core.convertFileSrc(init.filePath)
+      : 'file://' + init.filePath; // browser dev-preview fallback only
+    video.load();
+  }
+
+  loadMetadata();
+  render();
+}
+// Exposed globally so main.rs's single-instance handler can call this
+// directly on the already-open window via window.eval(...).
+window.applyInit = applyInit;
 
 video.addEventListener('loadedmetadata', function () {
   state.duration = video.duration || 0;
@@ -308,5 +421,5 @@ video.addEventListener('loadedmetadata', function () {
   render();
 });
 
-loadMetadata();
-render();
+updateOutputExt();
+applyInit(init);

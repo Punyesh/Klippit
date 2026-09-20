@@ -8,20 +8,12 @@
   },
   "app": {
     "withGlobalTauri": true,
-    "windows": [
-      {
-        "title": "Klippit",
-        "width": 480,
-        "height": 720,
-        "minWidth": 400,
-        "minHeight": 560,
-        "resizable": true,
-        "alwaysOnTop": true,
-        "decorations": true
-      }
-    ],
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**"]
+      }
     }
   },
   "bundle": {

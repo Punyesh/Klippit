@@ -21,7 +21,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::ShellExt;
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +38,8 @@ struct ExportParams {
     gif_fps: u32,
     target_mb: f64,
     output_dir: String,
+    #[serde(default)]
+    file_name: Option<String>, // user-editable filename (no extension) from the Output field
 }
 
 #[derive(Debug, Serialize)]
@@ -104,6 +106,39 @@ async fn get_video_metadata(app: AppHandle, path: String) -> Result<VideoMetadat
     Ok(VideoMetadata { duration, fps, has_subtitles })
 }
 
+// Strips characters Windows won't allow in a filename, and drops a
+// trailing .mp4/.gif if the person typed one — we append the correct
+// extension ourselves regardless, so a stray/wrong one shouldn't double up.
+fn sanitize_filename_stem(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let trimmed = if lower.ends_with(".mp4") || lower.ends_with(".gif") {
+        &name[..name.len() - 4]
+    } else {
+        name
+    };
+    let cleaned: String = trimmed
+        .chars()
+        .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() { "clip".to_string() } else { cleaned.to_string() }
+}
+
+// Expands a leading "~" to the user's home directory. "~" is a shell
+// convention (bash/zsh expand it before the program ever sees it) — a
+// program that receives the literal string, like ffmpeg here, has no idea
+// what it means and will just try to open a folder named "~". This is
+// what caused "No such file or directory" when exporting with the
+// frontend's default output path before the user ever clicked Browse.
+fn expand_tilde(path: &str) -> String {
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok();
+    match (path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")), &home) {
+        (Some(rest), Some(h)) => format!("{}/{}", h.trim_end_matches(['/', '\\']), rest),
+        _ if path == "~" => home.unwrap_or_else(|| path.to_string()),
+        _ => path.to_string(),
+    }
+}
+
 // ---------- export ----------
 #[tauri::command]
 async fn export_clip(app: AppHandle, params: ExportParams) -> Result<String, String> {
@@ -112,17 +147,29 @@ async fn export_clip(app: AppHandle, params: ExportParams) -> Result<String, Str
         return Err("out point must be after in point".into());
     }
 
+    let output_dir = expand_tilde(&params.output_dir);
+    std::fs::create_dir_all(&output_dir)
+        .map_err(|e| format!("couldn't create output folder '{output_dir}': {e}"))?;
+
     let ext = if params.format == "gif" { "gif" } else { "mp4" };
-    let file_stem = std::path::Path::new(&params.file_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("clip");
+
+    // A name typed into the Output field is used exactly as given (minus
+    // any illegal characters / accidental extension) rather than having
+    // our own "_in-out" suffix appended on top of it — the whole point of
+    // that field is "this is what the file will be called," not "append
+    // to our own naming scheme."
+    let stem = match params.file_name.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => sanitize_filename_stem(s),
+        _ => std::path::Path::new(&params.file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("clip")
+            .to_string(),
+    };
     let out_path = format!(
-        "{}/{}_{:.2}-{:.2}.{}",
-        params.output_dir.trim_end_matches('/'),
-        file_stem,
-        params.in_time,
-        params.out_time,
+        "{}/{}.{}",
+        output_dir.trim_end_matches(['/', '\\']),
+        stem,
         ext
     );
 
@@ -190,11 +237,24 @@ async fn run_ffmpeg_2pass(
     let bitrate = format!("{}k", video_kbps as u64);
     let audio = format!("{}k", audio_kbps as u64);
 
+    // 2-pass encoding writes small ffmpeg2pass-*.log files into whatever
+    // directory it's told to (via -passlogfile), defaulting to ffmpeg's
+    // own working directory if not specified. In `cargo tauri dev`, that
+    // default lands inside src-tauri/ — a folder the dev watcher treats
+    // as source and rebuilds+relaunches the whole app on any change,
+    // which looked like a crash but was actually this. Pointing it at
+    // the OS temp dir instead avoids that everywhere, dev or release.
+    let passlog_prefix = std::env::temp_dir()
+        .join(format!("klippit-2pass-{}", std::process::id()))
+        .to_string_lossy()
+        .to_string();
+
     let mut pass1: Vec<String> = vec![
         "-y".into(), "-ss".into(), start.to_string(), "-i".into(), input.into(),
         "-t".into(), duration.to_string(),
         "-c:v".into(), "libx264".into(), "-b:v".into(), bitrate.clone(),
-        "-pass".into(), "1".into(), "-an".into(), "-f".into(), "mp4".into(),
+        "-pass".into(), "1".into(), "-passlogfile".into(), passlog_prefix.clone(),
+        "-an".into(), "-f".into(), "mp4".into(),
     ];
     if let Some(f) = vf { pass1.push("-vf".into()); pass1.push(f.into()); }
     #[cfg(windows)] pass1.push("NUL".into());
@@ -205,12 +265,19 @@ async fn run_ffmpeg_2pass(
         "-y".into(), "-ss".into(), start.to_string(), "-i".into(), input.into(),
         "-t".into(), duration.to_string(),
         "-c:v".into(), "libx264".into(), "-b:v".into(), bitrate,
-        "-pass".into(), "2".into(),
+        "-pass".into(), "2".into(), "-passlogfile".into(), passlog_prefix.clone(),
         "-c:a".into(), "aac".into(), "-b:a".into(), audio,
     ];
     if let Some(f) = vf { pass2.push("-vf".into()); pass2.push(f.into()); }
     pass2.push(out_path.into());
-    run_bin(app, "ffmpeg", &pass2).await.map(|_| ())
+    let result = run_bin(app, "ffmpeg", &pass2).await.map(|_| ());
+
+    // Best-effort cleanup — leftover pass-log files in the temp dir are
+    // harmless either way, so a failed removal here doesn't fail the export.
+    let _ = std::fs::remove_file(format!("{passlog_prefix}-0.log"));
+    let _ = std::fs::remove_file(format!("{passlog_prefix}-0.log.mbtree"));
+
+    result
 }
 
 async fn export_gif(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str) -> Result<(), String> {
@@ -269,6 +336,10 @@ async fn encode_gif_attempt(app: &AppHandle, params: &ExportParams, duration: f6
 // requested outside of an active mpv session.
 #[tauri::command]
 async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, out_path: String) -> Result<String, String> {
+    let out_path = expand_tilde(&out_path);
+    if let Some(parent) = std::path::Path::new(&out_path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("couldn't create output folder: {e}"))?;
+    }
     let mut args: Vec<String> = vec![
         "-y".into(), "-ss".into(), at.to_string(), "-i".into(), path.clone(),
         "-frames:v".into(), "1".into(),
@@ -282,14 +353,105 @@ async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, o
     Ok(out_path)
 }
 
+// Opens a small dedicated window playing the given file, with native
+// <video controls> — used by the Play button so review happens inside
+// Klippit rather than handing off to the OS default media player.
+#[tauri::command]
+async fn open_review_window(app: AppHandle, path: String) -> Result<(), String> {
+    // If a review window is already open (e.g. Play clicked twice), close
+    // it first rather than erroring on a duplicate window label.
+    if let Some(existing) = app.get_webview_window("review") {
+        let _ = existing.close();
+    }
+
+    let path_json = serde_json::to_string(&path).map_err(|e| e.to_string())?;
+    let script = format!("window.__KLIPPIT_REVIEW_PATH__ = {path_json};");
+
+    tauri::WebviewWindowBuilder::new(&app, "review", tauri::WebviewUrl::App("review.html".into()))
+        .title("Klippit — Preview")
+        .inner_size(640.0, 480.0)
+        .initialization_script(&script)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+// Reads --init <json> from argv (passed by clip-trigger.lua, or by hand
+// for testing without mpv at all — see README) and returns it so it can
+// be injected into the webview before app.js runs.
+// Extracted so the same "find --init <json> in an argv list" logic works
+// both for this process's own launch args (main()) and for a second
+// launch's args handed to us by the single-instance plugin below.
+fn extract_init_arg(args: &[String]) -> Option<String> {
+    args.iter()
+        .position(|a| a == "--init")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+fn read_init_arg() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    extract_init_arg(&args)
+}
+
 fn main() {
+    let init_json = read_init_arg();
+
     tauri::Builder::default()
+        // Must be registered first — this plugin needs to be able to
+        // short-circuit everything else when it detects a second launch,
+        // per Tauri's own docs. When mpv's trigger key is pressed while a
+        // Klippit window is already open, the SECOND process's argv gets
+        // handed to this closure running inside the FIRST (already
+        // running) process, and the second process exits immediately
+        // without ever reaching .setup() below or creating its own
+        // window — so this is genuinely "reuse the existing window," not
+        // "hide a second one."
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(json) = extract_init_arg(&argv) {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.eval(&format!("window.applyInit && window.applyInit({json});"));
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .setup(move |app| {
+            // The window is built here programmatically, rather than
+            // declared in tauri.conf.json, specifically so
+            // initialization_script can run — that's the mechanism that
+            // guarantees window.__KLIPPIT_INIT__ exists BEFORE app.js's
+            // own top-level code runs (a plain window.eval after the
+            // window already exists can't make that guarantee, since
+            // app.js may have already started executing by then).
+            let mut builder = tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                tauri::WebviewUrl::App("index.html".into()),
+            )
+            .title("Klippit")
+            .inner_size(480.0, 720.0)
+            .min_inner_size(420.0, 660.0)
+            .resizable(true)
+            .always_on_top(true);
+
+            if let Some(json) = &init_json {
+                let script = format!("window.__KLIPPIT_INIT__ = {json};");
+                builder = builder.initialization_script(&script);
+            }
+
+            builder.build()?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_video_metadata,
             export_clip,
-            extract_frame
+            extract_frame,
+            open_review_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

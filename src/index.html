@@ -14,10 +14,11 @@
   </div>
 
   <div id="preview-wrap">
-    <video id="preview" muted></video>
+    <video id="preview" muted preload="auto"></video>
   </div>
 
   <div id="seek-row">
+    <button class="frame-btn" id="play-pause-btn" title="Play/Pause (Space)">&#9654;</button>
     <input id="seek-bar" type="range" min="0" max="1000" value="0"
            aria-label="Seek position" />
   </div>
@@ -101,9 +102,9 @@
     <!-- Target-size mode -->
     <div id="panel-size" style="display:none">
       <div class="preset-row" role="group" aria-label="Size presets" style="margin-top:10px">
-        <button class="preset-btn" data-mb="10" aria-pressed="false">Discord 10MB</button>
-        <button class="preset-btn" data-mb="50" aria-pressed="false">Discord 50MB</button>
-        <button class="preset-btn" data-mb="8" aria-pressed="false">GIF &lt;8MB</button>
+        <button class="preset-btn" data-mb="10" aria-pressed="false">10MB</button>
+        <button class="preset-btn" data-mb="50" aria-pressed="false">50MB</button>
+        <button class="preset-btn" data-mb="8" aria-pressed="false">GIF 8MB</button>
       </div>
       <div class="row">
         <div class="field">
@@ -114,6 +115,15 @@
     </div>
 
     <div class="section-label">Output</div>
+    <div class="row">
+      <div class="field">
+        <label for="output-filename">Filename</label>
+        <div style="display:flex; align-items:center; gap:4px">
+          <input class="input" type="text" id="output-filename" />
+          <span class="frame-time" id="output-ext" style="margin:0; white-space:nowrap"></span>
+        </div>
+      </div>
+    </div>
     <div id="output-row">
       <div id="output-path" title="">~/Videos/Clips</div>
       <button class="btn secondary" id="browse-btn">Browse…</button>
@@ -121,11 +131,20 @@
 
   </div>
 
-  <div id="status"></div>
+  <div id="status-row">
+    <div id="status"></div>
+    <div id="status-actions" style="display:none">
+      <button class="btn secondary" id="reveal-btn">Show in folder</button>
+      <button class="btn secondary" id="play-btn">Play</button>
+    </div>
+  </div>
 
   <div id="export-row">
     <button class="btn secondary" id="cancel-btn">Escape</button>
-    <button class="btn" id="export-btn">Export (Enter)</button>
+    <button class="btn" id="export-btn">
+      <span id="export-spinner" class="spinner" style="display:none"></span>
+      <span id="export-label">Export (Enter)</span>
+    </button>
   </div>
 
 </div>

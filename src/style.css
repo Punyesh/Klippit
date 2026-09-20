@@ -99,11 +99,16 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: center;
-  flex: 1 1 auto;
-  min-height: 0;
+  flex: 1 1 0;
+  min-height: 70px;
   position: relative;
 }
-#preview { max-width: 100%; max-height: 100%; display: block; }
+#preview {
+  width: 100%; height: 100%;
+  object-fit: contain;
+  display: block;
+  background: #000;
+}
 
 /* Seek scrubber */
 #seek-row {
@@ -111,10 +116,14 @@ html, body {
   background: var(--panel2);
   border-top: 1px solid var(--line);
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
+#play-pause-btn { flex-shrink: 0; font-size: 9px; padding: 3px 6px; }
 #seek-bar {
   -webkit-appearance: none;
-  width: 100%;
+  flex: 1;
   height: 3px;
   border-radius: 0;
   background: var(--line);
@@ -170,19 +179,20 @@ html, body {
 
 /* ---------- frame bar ---------- */
 .frame-bar { padding: 5px 10px; background: var(--panel2); border-top: 1px solid var(--line); flex-shrink: 0; }
-.frame-row { display: flex; align-items: center; gap: 3px; }
+.frame-row { display: flex; align-items: center; gap: 2px; flex-wrap: nowrap; }
 .frame-btn {
   background: var(--bg); border: 1px solid var(--line); color: var(--text);
-  border-radius: 2px; padding: 3px 8px; font-size: 12px; cursor: pointer;
-  font-family: var(--mono); line-height: 1.4;
+  border-radius: 2px; padding: 2px 5px; font-size: 11px; cursor: pointer;
+  font-family: var(--mono); line-height: 1.4; flex-shrink: 0; white-space: nowrap;
 }
 .frame-btn:hover { border-color: var(--red); color: var(--red); }
 .frame-btn:disabled { opacity: .35; cursor: default; }
 .frame-count {
-  flex: 1; text-align: center; font-size: 12px; font-weight: 600;
-  color: var(--text); font-family: var(--mono); letter-spacing: .3px;
+  flex: 1 1 auto; min-width: 0; text-align: center; font-size: 11px; font-weight: 600;
+  color: var(--text); font-family: var(--mono); letter-spacing: .2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.frame-time { text-align: center; font-size: 10px; color: var(--dim); margin-top: 3px; font-family: var(--mono); }
+.frame-time { text-align: center; font-size: 10px; color: var(--dim); margin-top: 3px; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Which handle (In / Out) the frame bar currently arms — a lit dot marks
    the armed one, echoing a tape deck's record-arm indicator. */
@@ -201,7 +211,7 @@ html, body {
 .handle-btn[aria-pressed="true"]::before { background: var(--red); box-shadow: 0 0 3px var(--red); }
 
 /* ---------- body / options ---------- */
-#body { padding: 8px 10px; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
+#body { padding: 8px 10px; overflow-y: auto; flex: 0 1 auto; }
 .section-label {
   font-size: 9px; letter-spacing: .09em; text-transform: uppercase;
   color: var(--dim); margin: 9px 0 5px; padding-top: 7px; border-top: 1px solid var(--line);
@@ -260,7 +270,25 @@ input[type="range"].input, input[type="range"]#seek-bar { accent-color: var(--re
 #export-row { display: flex; gap: 6px; padding: 7px 10px; border-top: 1px solid var(--line); background: var(--panel2); flex-shrink: 0; }
 #export-btn { flex: 1; }
 
-#status { padding: 0 10px 6px; font-size: 10px; color: var(--dim); min-height: 12px; font-family: var(--mono); word-break: break-word; }
+#status-row { display: flex; align-items: center; justify-content: space-between; padding: 0 10px 6px; gap: 8px; }
+#status { font-size: 10px; color: var(--dim); min-height: 12px; font-family: var(--mono); word-break: break-word; flex: 1; }
 #status.busy { color: var(--red); }
 #status.error { color: var(--red); }
 #status.done { color: var(--text); }
+#status-actions { display: flex; gap: 6px; flex-shrink: 0; }
+#status-actions .btn { padding: 3px 8px; font-size: 10px; }
+
+/* Indeterminate spinner shown on the export button while busy — real
+   percentage progress would need ffmpeg's own -progress output streamed
+   live (see README); this just confirms something is happening. */
+.spinner {
+  display: inline-block;
+  width: 11px; height: 11px;
+  border: 2px solid rgba(255,255,255,.3);
+  border-top-color: var(--text);
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+  vertical-align: -2px;
+  margin-right: 6px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
