@@ -7,25 +7,33 @@
 // scale, palette gen/use, subtitle burn-in) ports over conceptually from
 // the wasm version; only the "how it's invoked" layer changes.
 //
+// ffmpeg/ffprobe are called as bundled *sidecar* binaries (via
+// tauri-plugin-shell) rather than from the system PATH. That's what lets
+// `cargo tauri build` produce a single distributable that never needs
+// ffmpeg installed separately — see README.md's "Bundling ffmpeg" section
+// for how to actually supply the binaries this expects to find.
+//
 // STATUS: scaffold. Not compiled/run in this environment (no GUI/display
-// or Tauri CLI available here) — verify `ffmpeg`/`ffprobe` are on PATH and
-// adjust paths for your OS before building.
+// or Tauri CLI available here) — verify the tauri-plugin-shell API below
+// against the version that lands in your Cargo.lock; sidecar method names
+// have shifted across Tauri 2.x point releases.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
-use std::process::Command;
+use tauri::AppHandle;
+use tauri_plugin_shell::ShellExt;
 
 #[derive(Debug, Deserialize)]
 struct ExportParams {
     file_path: String,
     in_time: f64,
     out_time: f64,
-    format: String,     // "mp4" | "gif"
+    format: String,   // "mp4" | "gif"
     burn_subs: bool,
-    mode: String,        // "quality" | "size"
+    mode: String,     // "quality" | "size"
     crf: u32,
-    resolution: u32,      // 0 = source
+    resolution: u32,  // 0 = source
     gif_fps: u32,
     target_mb: f64,
     output_dir: String,
@@ -38,27 +46,40 @@ struct VideoMetadata {
     has_subtitles: bool,
 }
 
-// ---------- metadata (ffprobe) ----------
-#[tauri::command]
-fn get_video_metadata(path: String) -> Result<VideoMetadata, String> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v", "error",
-            "-show_entries", "format=duration:stream=r_frame_rate,codec_type",
-            "-of", "default=noprint_wrappers=1",
-            &path,
-        ])
+// ---------- shared sidecar runner ----------
+// Every ffmpeg/ffprobe invocation in this file funnels through here, same
+// principle as the old plain-PATH `run()` helper — just backed by the
+// bundled binary instead. `app` is auto-injected by Tauri when a command
+// declares an `AppHandle` parameter; it costs nothing at the call site.
+async fn run_bin(app: &AppHandle, name: &str, args: &[String]) -> Result<Vec<u8>, String> {
+    let sidecar = app
+        .shell()
+        .sidecar(name)
+        .map_err(|e| format!("sidecar '{name}' not found in this build: {e}"))?;
+
+    let output = sidecar
+        .args(args)
         .output()
-        .map_err(|e| format!("failed to run ffprobe: {e}"))?;
+        .await
+        .map_err(|e| format!("failed to run {name}: {e}"))?;
 
     if !output.status.success() {
-        return Err(format!(
-            "ffprobe exited with error: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
     }
+    Ok(output.stdout)
+}
 
-    let text = String::from_utf8_lossy(&output.stdout);
+// ---------- metadata (ffprobe) ----------
+#[tauri::command]
+async fn get_video_metadata(app: AppHandle, path: String) -> Result<VideoMetadata, String> {
+    let stdout = run_bin(&app, "ffprobe", &[
+        "-v".into(), "error".into(),
+        "-show_entries".into(), "format=duration:stream=r_frame_rate,codec_type".into(),
+        "-of".into(), "default=noprint_wrappers=1".into(),
+        path,
+    ]).await?;
+
+    let text = String::from_utf8_lossy(&stdout);
     let mut duration = 0.0;
     let mut fps = 24.0;
     let mut has_subtitles = false;
@@ -83,7 +104,7 @@ fn get_video_metadata(path: String) -> Result<VideoMetadata, String> {
 
 // ---------- export ----------
 #[tauri::command]
-fn export_clip(params: ExportParams) -> Result<String, String> {
+async fn export_clip(app: AppHandle, params: ExportParams) -> Result<String, String> {
     let duration = params.out_time - params.in_time;
     if duration <= 0.0 {
         return Err("out point must be after in point".into());
@@ -104,9 +125,9 @@ fn export_clip(params: ExportParams) -> Result<String, String> {
     );
 
     if params.format == "gif" {
-        export_gif(&params, duration, &out_path)?;
+        export_gif(&app, &params, duration, &out_path).await?;
     } else {
-        export_mp4(&params, duration, &out_path)?;
+        export_mp4(&app, &params, duration, &out_path).await?;
     }
 
     Ok(out_path)
@@ -121,7 +142,7 @@ fn scale_filter(resolution: u32) -> Option<String> {
 
 fn subtitle_filter(params: &ExportParams) -> Option<String> {
     if !params.burn_subs { return None; }
-    // IMPORTANT: -ss before -i (see the input-seek note below) shifts the
+    // IMPORTANT: -ss before -i (input-side seek, see below) shifts the
     // subtitle filter's own timeline too, since it reads straight from the
     // original file's timestamps — that's what keeps burned subs in sync
     // with a trimmed clip instead of drifting by `in_time` seconds.
@@ -130,7 +151,7 @@ fn subtitle_filter(params: &ExportParams) -> Option<String> {
     Some(format!("subtitles='{}'", params.file_path.replace('\'', "\\'")))
 }
 
-fn export_mp4(params: &ExportParams, duration: f64, out_path: &str) -> Result<(), String> {
+async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str) -> Result<(), String> {
     let mut filters: Vec<String> = vec![];
     if let Some(f) = scale_filter(params.resolution) { filters.push(f); }
     if let Some(f) = subtitle_filter(params) { filters.push(f); }
@@ -143,7 +164,7 @@ fn export_mp4(params: &ExportParams, duration: f64, out_path: &str) -> Result<()
         let audio_kbps = 128.0;
         let video_kbps = ((target_bits / duration / 1000.0) - audio_kbps).max(200.0);
 
-        run_ffmpeg_2pass(&params.file_path, params.in_time, duration, vf.as_deref(), video_kbps, audio_kbps, out_path)
+        run_ffmpeg_2pass(app, &params.file_path, params.in_time, duration, vf.as_deref(), video_kbps, audio_kbps, out_path).await
     } else {
         let mut args: Vec<String> = vec![
             "-y".into(),
@@ -156,12 +177,12 @@ fn export_mp4(params: &ExportParams, duration: f64, out_path: &str) -> Result<()
         ];
         if let Some(f) = &vf { args.push("-vf".into()); args.push(f.clone()); }
         args.push(out_path.into());
-        run(&args)
+        run_bin(app, "ffmpeg", &args).await.map(|_| ())
     }
 }
 
-fn run_ffmpeg_2pass(
-    input: &str, start: f64, duration: f64, vf: Option<&str>,
+async fn run_ffmpeg_2pass(
+    app: &AppHandle, input: &str, start: f64, duration: f64, vf: Option<&str>,
     video_kbps: f64, audio_kbps: f64, out_path: &str,
 ) -> Result<(), String> {
     let bitrate = format!("{}k", video_kbps as u64);
@@ -176,7 +197,7 @@ fn run_ffmpeg_2pass(
     if let Some(f) = vf { pass1.push("-vf".into()); pass1.push(f.into()); }
     #[cfg(windows)] pass1.push("NUL".into());
     #[cfg(not(windows))] pass1.push("/dev/null".into());
-    run(&pass1)?;
+    run_bin(app, "ffmpeg", &pass1).await?;
 
     let mut pass2: Vec<String> = vec![
         "-y".into(), "-ss".into(), start.to_string(), "-i".into(), input.into(),
@@ -187,10 +208,10 @@ fn run_ffmpeg_2pass(
     ];
     if let Some(f) = vf { pass2.push("-vf".into()); pass2.push(f.into()); }
     pass2.push(out_path.into());
-    run(&pass2)
+    run_bin(app, "ffmpeg", &pass2).await.map(|_| ())
 }
 
-fn export_gif(params: &ExportParams, duration: f64, out_path: &str) -> Result<(), String> {
+async fn export_gif(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str) -> Result<(), String> {
     // Two-pass palette gen/use — same technique as the wasm version, just
     // real ffmpeg instead of a wasm build. Target-size mode iterates width/
     // fps rather than a bitrate knob, since GIF has none.
@@ -201,7 +222,7 @@ fn export_gif(params: &ExportParams, duration: f64, out_path: &str) -> Result<()
     };
 
     for attempt in 0..3 {
-        encode_gif_attempt(params, duration, width, fps, out_path)?;
+        encode_gif_attempt(app, params, duration, width, fps, out_path).await?;
         if params.mode != "size" { break; }
 
         let size_mb = std::fs::metadata(out_path).map(|m| m.len() as f64 / 1_000_000.0).unwrap_or(0.0);
@@ -213,40 +234,29 @@ fn export_gif(params: &ExportParams, duration: f64, out_path: &str) -> Result<()
     Ok(())
 }
 
-fn encode_gif_attempt(params: &ExportParams, duration: f64, width: u32, fps: u32, out_path: &str) -> Result<(), String> {
+async fn encode_gif_attempt(app: &AppHandle, params: &ExportParams, duration: f64, width: u32, fps: u32, out_path: &str) -> Result<(), String> {
     let mut base_filters = vec![format!("fps={fps}"), format!("scale={width}:-2:flags=lanczos")];
     if let Some(f) = subtitle_filter(params) { base_filters.push(f); }
     let base = base_filters.join(",");
 
     let palette = format!("{out_path}.palette.png");
 
-    run(&[
+    run_bin(app, "ffmpeg", &[
         "-y".into(), "-ss".into(), params.in_time.to_string(), "-i".into(), params.file_path.clone(),
         "-t".into(), duration.to_string(),
         "-vf".into(), format!("{base},palettegen"),
         palette.clone(),
-    ])?;
+    ]).await?;
 
-    run(&[
+    run_bin(app, "ffmpeg", &[
         "-y".into(), "-ss".into(), params.in_time.to_string(), "-i".into(), params.file_path.clone(),
         "-t".into(), duration.to_string(),
         "-i".into(), palette.clone(),
         "-lavfi".into(), format!("{base}[x];[x][1:v]paletteuse=dither=bayer"),
         out_path.into(),
-    ])?;
+    ]).await?;
 
     let _ = std::fs::remove_file(&palette);
-    Ok(())
-}
-
-fn run(args: &[String]) -> Result<(), String> {
-    let output = Command::new("ffmpeg")
-        .args(args)
-        .output()
-        .map_err(|e| format!("failed to run ffmpeg: {e}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
-    }
     Ok(())
 }
 
@@ -256,7 +266,7 @@ fn run(args: &[String]) -> Result<(), String> {
 // fallback for extracting a still via ffmpeg if a screenshot is ever
 // requested outside of an active mpv session.
 #[tauri::command]
-fn extract_frame(path: String, at: f64, burn_subs: bool, out_path: String) -> Result<String, String> {
+async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, out_path: String) -> Result<String, String> {
     let mut args: Vec<String> = vec![
         "-y".into(), "-ss".into(), at.to_string(), "-i".into(), path.clone(),
         "-frames:v".into(), "1".into(),
@@ -266,12 +276,13 @@ fn extract_frame(path: String, at: f64, burn_subs: bool, out_path: String) -> Re
         args.push(format!("subtitles='{}'", path.replace('\'', "\\'")));
     }
     args.push(out_path.clone());
-    run(&args)?;
+    run_bin(&app, "ffmpeg", &args).await?;
     Ok(out_path)
 }
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             get_video_metadata,
             export_clip,

@@ -55,6 +55,41 @@ src-tauri/              Tauri shell: Cargo.toml, tauri.conf.json, main.rs
 mpv-scripts/            Lua trigger script for mpv's scripts directory
 ```
 
+## Bundling ffmpeg (no separate install for end users)
+
+By default this scaffold calls ffmpeg/ffprobe as **sidecar** binaries
+bundled inside the app, not from your system PATH — so once you build a
+release with `cargo tauri build`, that `.msi` never needs ffmpeg installed
+separately, on your machine or anyone else's. Setting this up is a
+one-time step:
+
+1. Download static ffmpeg + ffprobe builds for your platform (Windows:
+   the "essentials" or "full" build from gyan.dev's ffmpeg-builds page;
+   macOS/Linux: evermeet.cx or the official ffmpeg.org static builds page).
+2. Find your Rust target triple: run `rustc -Vv` and look at the `host:`
+   line (e.g. `x86_64-pc-windows-msvc`).
+3. Create `src-tauri/binaries/` and place the two binaries there, renamed
+   to include that triple — Tauri's sidecar mechanism requires this exact
+   naming:
+   - `src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe`
+   - `src-tauri/binaries/ffprobe-x86_64-pc-windows-msvc.exe`
+   (swap the triple/extension for your platform)
+4. `cargo tauri dev` / `cargo tauri build` will now pick them up
+   automatically — `tauri.conf.json`'s `externalBin` entry already points
+   at this folder.
+
+If you'd rather not bundle them (smaller download, but back to requiring
+ffmpeg on PATH like the original scaffold), that's a valid tradeoff too —
+just swap `run_bin`'s sidecar calls in `main.rs` back to
+`std::process::Command::new("ffmpeg")`/`("ffprobe")`.
+
+**Not yet verified against a real build**: the `tauri-plugin-shell`
+sidecar API (`app.shell().sidecar(name).args(...).output().await`) is
+written from the documented v2 pattern but hasn't been compiled in this
+environment — method names have shifted slightly across 2.x point
+releases, so if `cargo build` complains about `ShellExt` or `.sidecar(...)`,
+check that crate's current docs for the exact call shape.
+
 ## Suggested next steps, in order
 
 1. Run `src/index.html` in a browser and sanity-check the interaction
