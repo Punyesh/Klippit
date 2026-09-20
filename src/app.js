@@ -123,10 +123,17 @@ function step(deltaFrames) {
 
 function setHandleTime(which, t, skipSeek) {
   t = clamp(t, 0, state.duration);
+  // No longer clamped against the other handle's position (see the real
+  // bug this caused: In defaults to armed, Out starts just 3s after In,
+  // so any scrub/seek past 3s got silently pinned back to ~3s until Out
+  // was moved somewhere real first — looked exactly like "seeking doesn't
+  // work until you've clicked something," which is what it was). Export
+  // already validates in < out at export time, so the UI doesn't need to
+  // enforce it live too — doing so only got in the way of free scrubbing.
   if (which === 'in') {
-    state.inTime = Math.min(t, state.outTime);
+    state.inTime = t;
   } else {
-    state.outTime = Math.max(t, state.inTime);
+    state.outTime = t;
   }
   // Scrub the preview to whichever point was just touched, so clicking a
   // frame-step button doubles as a visual check of where you landed.
@@ -175,10 +182,41 @@ playPauseBtn.onclick = togglePlayback;
 video.addEventListener('play', function () { playPauseBtn.innerHTML = '&#10074;&#10074;'; });
 video.addEventListener('pause', function () { playPauseBtn.innerHTML = '&#9654;'; });
 
+// ---------- subtitle preview visibility (separate from export burn-in) ----------
+// A distinct control from the Subtitles Off/Burn-in toggle in the
+// sidebar (which governs the FINAL EXPORT) — this one governs whether
+// you currently SEE the overlay while editing, and doubles as what
+// screenshots capture: "screenshot shows what you're currently looking
+// at" is the more intuitive tie-in than reusing the export setting,
+// which is a separate decision about the eventual clip.
+var subsPreviewVisible = true;
+var subsPreviewToggleBtn = document.getElementById('subs-preview-toggle');
+subsPreviewToggleBtn.onclick = function () {
+  subsPreviewVisible = !subsPreviewVisible;
+  subsPreviewToggleBtn.setAttribute('aria-pressed', String(subsPreviewVisible));
+  applySubsPreviewVisibility();
+};
+function applySubsPreviewVisibility() {
+  if (octopusInstance && octopusInstance.canvas) {
+    octopusInstance.canvas.style.display = subsPreviewVisible ? '' : 'none';
+  }
+}
+
+// Small accessors rather than duplicating this into separate state —
+// init.subtitle is already the single source of truth, refreshed
+// correctly on every file switch via applyInit().
+function currentSubtitleLang() {
+  return (init.subtitle && init.subtitle.lang) || null;
+}
+function currentSubtitleExternalFile() {
+  return (init.subtitle && init.subtitle.externalFile) || null;
+}
+
 // ---------- screenshot ----------
-// Reuses the same Subtitles on/off toggle that governs export burn-in —
-// "do you want subs baked in" is the same question whether it's a still
-// or a clip, so one control covers both rather than a second near-duplicate.
+// Uses the live preview visibility toggle above, not the export burn-in
+// setting — "with or without subtitles" for a screenshot is answered by
+// whatever you're currently seeing on screen, independent of whatever
+// you've decided for the full clip's export.
 var screenshotBtn = document.getElementById('screenshot-btn');
 screenshotBtn.onclick = function () {
   if (!init.filePath || !window.__TAURI__) {
@@ -192,10 +230,12 @@ screenshotBtn.onclick = function () {
   window.__TAURI__.core.invoke('extract_frame', {
     path: init.filePath,
     at: video.currentTime,
-    burnSubs: state.burnSubs,
+    burnSubs: subsPreviewVisible,
     outPath: outPath,
     sourceWidth: state.sourceWidth,
-    sourceHeight: state.sourceHeight
+    sourceHeight: state.sourceHeight,
+    subtitleLang: currentSubtitleLang(),
+    subtitleExternalFile: currentSubtitleExternalFile()
   }).then(function (path) {
     setStatus('screenshot saved — ' + path, 'done');
   }).catch(function (err) {
@@ -234,17 +274,46 @@ makeDraggable(handleOut, 'out');
 // ---------- seek bar (whole-file scrub, independent of trim range) ----------
 seekBar.addEventListener('input', function () {
   var pct = seekBar.value / 1000;
-  video.currentTime = pct * state.duration;
+  var t = pct * state.duration;
+  video.currentTime = t;
+  // Drive the armed-handle sync directly here rather than relying solely
+  // on the video's 'timeupdate' event below — for a paused, discrete seek
+  // (as opposed to continuous playback), browsers don't reliably fire
+  // 'timeupdate' for every rapid intermediate position during a drag, so
+  // depending on it alone meant dragging this bar could silently fail to
+  // move the trim handle until something else (like clicking In/Out)
+  // happened to trigger a sync some other way.
+  setHandleTime(state.activeHandle, t, true);
 });
 video.addEventListener('timeupdate', function () {
   if (state.duration) seekBar.value = (video.currentTime / state.duration) * 1000;
+
+  var t = video.currentTime;
+  // During unattended *playback* specifically (not deliberate scrubbing,
+  // which stays completely free — see setHandleTime), auto-pause right
+  // when the armed handle's forward drift would cross the other,
+  // already-meaningfully-set point, like a preview loop stopping at its
+  // boundary. Without this, In (the default-armed handle) just drifts
+  // forever past a real Out point during hands-off playback, leaving you
+  // to notice and manually walk it back afterward.
+  if (!video.paused && state.activeHandle === 'in' && state.outTime > state.inTime && t >= state.outTime) {
+    video.pause();
+    setHandleTime('in', state.outTime, false);
+    return;
+  }
+  if (!video.paused && state.activeHandle === 'out' && state.inTime < state.outTime && t <= state.inTime) {
+    video.pause();
+    setHandleTime('out', state.inTime, false);
+    return;
+  }
+
   // Whichever handle is armed (In or Out) follows video.currentTime for
   // any reason it changes — playback advancing, dragging the seek bar,
   // frame-stepping, or dragging a trim handle. This is what makes
   // pressing Play actually move the armed point instead of just playing
   // disconnected from editing: press Play, watch, press Pause/Space
   // right when you want that point, and it's already set.
-  setHandleTime(state.activeHandle, video.currentTime, true);
+  setHandleTime(state.activeHandle, t, true);
 });
 
 // ---------- format / subtitle / mode toggles ----------
@@ -275,8 +344,17 @@ function disableSubtitleControls(message) {
   subsOnBtn.disabled = true;
   subsStatus.textContent = message;
 }
-if (!(init.subtitle && init.subtitle.available)) {
-  disableSubtitleControls('No active subtitle track detected');
+// A curt, VLC-specific message when there's no embedded subtitle and the
+// trigger came from VLC specifically — external subtitle files loaded in
+// VLC ("Add Subtitle File") aren't detectable (see the VLC scripts'
+// comments for why an earlier attempt at guessing this was dropped as
+// too speculative), so it's worth being upfront about rather than just
+// showing the generic "no subtitle stream" message, which reads as if
+// Klippit failed to notice something that's actually just unsupported.
+function noSubtitleMessage() {
+  return init.trigger === 'vlc'
+    ? 'No embedded sub detected. External sub handling not supported on VLC.'
+    : 'No subtitle stream detected';
 }
 
 // ---------- size presets ----------
@@ -319,9 +397,16 @@ function loadMetadata() {
     state.sourceWidth = meta.width || 0;
     state.sourceHeight = meta.height || 0;
     if (!meta.hasSubtitles) {
-      disableSubtitleControls('No subtitle stream detected');
+      disableSubtitleControls(noSubtitleMessage());
       disposeSubtitleOverlay();
     } else {
+      // This ffprobe-based check is the reliable signal — re-enable
+      // regardless of what mpv/VLC's active-track state guessed earlier
+      // in applyInit(), since that only reflects whether a track was
+      // actively selected in the player, not whether the file has one.
+      subsOffBtn.disabled = false;
+      subsOnBtn.disabled = false;
+      subsStatus.textContent = '';
       loadSubtitleOverlay();
     }
     render();
@@ -348,16 +433,51 @@ function disposeSubtitleOverlay() {
 }
 function loadSubtitleOverlay() {
   disposeSubtitleOverlay();
-  window.__TAURI__.core.invoke('extract_subtitles_for_preview', { path: init.filePath }).then(function (data) {
+  window.__TAURI__.core.invoke('extract_subtitles_for_preview', {
+    path: init.filePath,
+    subtitleLang: currentSubtitleLang(),
+    subtitleExternalFile: currentSubtitleExternalFile()
+  }).then(function (data) {
     var convert = window.__TAURI__.core.convertFileSrc;
-    octopusInstance = new SubtitlesOctopus({
-      video: video,
-      subUrl: convert(data.assPath),
-      fonts: data.fontPaths.map(convert),
-      workerUrl: 'lib/subtitles-octopus/subtitles-octopus-worker.js',
-      onError: function (err) {
-        console.log('[klippit] subtitle overlay error:', err);
-      }
+
+    // Fetch on the MAIN thread (proven to work — same mechanism the video
+    // element itself already uses successfully) and hand the worker
+    // plain blob: URLs instead of Tauri's own asset-protocol URLs
+    // directly. Confirmed via a real "Loading data file ... failed"
+    // error that the worker can't reliably fetch those custom-scheme
+    // URLs itself, even once correctly formed — a known category of
+    // issue with Worker-based libraries in Tauri/Electron-style apps.
+    // blob: URLs are a standard mechanism any context can resolve,
+    // sidestepping that entirely.
+    function toBlobUrl(path) {
+      return fetch(convert(path))
+        .then(function (r) { return r.blob(); })
+        .then(function (b) { return URL.createObjectURL(b); });
+    }
+
+    Promise.all([
+      toBlobUrl(data.assPath),
+      Promise.all(data.fontPaths.map(toBlobUrl))
+    ]).then(function (results) {
+      octopusInstance = new SubtitlesOctopus({
+        video: video,
+        subUrl: results[0],
+        fonts: results[1],
+        workerUrl: 'lib/subtitles-octopus/subtitles-octopus-worker.js',
+        onReady: function () {
+          // Apply the current preview-visibility toggle to this freshly
+          // created instance (e.g. after switching files) — onReady is
+          // used rather than assuming canvas exists immediately after
+          // construction, since the library's setup may finish async.
+          applySubsPreviewVisibility();
+        },
+        onError: function (err) {
+          console.log('[klippit] subtitle overlay error:', err);
+        }
+      });
+      applySubsPreviewVisibility(); // harmless if canvas isn't ready yet — onReady above covers that case
+    }).catch(function (err) {
+      console.log('[klippit] failed to prepare subtitle blob URLs:', err);
     });
   }).catch(function (err) {
     // Non-fatal — editing still works fine without the subtitle overlay,
@@ -399,7 +519,9 @@ function exportClip() {
     outputDir: state.outputDir,
     fileName: state.outputFileName,
     sourceWidth: state.sourceWidth,
-    sourceHeight: state.sourceHeight
+    sourceHeight: state.sourceHeight,
+    subtitleLang: currentSubtitleLang(),
+    subtitleExternalFile: currentSubtitleExternalFile()
   };
   setStatus('exporting…', 'busy');
   statusActions.style.display = 'none';
@@ -480,14 +602,14 @@ function applyInit(newInit) {
   setStatus('', '');
   disposeSubtitleOverlay(); // old file's overlay shouldn't linger over the new video
 
-  // Subtitle controls: re-enable by default, loadMetadata() below will
-  // disable them again if this particular file genuinely has none.
+  // Neutral starting state — loadMetadata() below is the sole authority
+  // on whether this file actually has subtitles (a real ffprobe check),
+  // so nothing here should pre-emptively disable anything based on
+  // mpv/VLC's active-track state, which only reflects what was selected
+  // in the player, not what the file contains.
   subsOffBtn.disabled = false;
   subsOnBtn.disabled = false;
   subsStatus.textContent = '';
-  if (!(init.subtitle && init.subtitle.available)) {
-    disableSubtitleControls('No active subtitle track detected');
-  }
 
   if (init.filePath) {
     video.src = window.__TAURI__

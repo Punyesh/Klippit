@@ -23,8 +23,14 @@ local function get_subtitle_context()
     end
     return {
         available = true,
-        track_id = sid,
-        external_file = mp.get_property("current-tracks/sub/external-filename"),
+        trackId = sid,
+        -- Language tag is the key piece here — it's what lets the Rust
+        -- side match this against the right embedded stream by content
+        -- (via ffprobe's stream_tags=language) rather than trying to
+        -- map mpv's own internal track numbering onto ffprobe's stream
+        -- indices, which aren't guaranteed to correspond 1:1.
+        lang = mp.get_property("current-tracks/sub/lang"),
+        externalFile = mp.get_property("current-tracks/sub/external-filename"),
         delay = mp.get_property_number("sub-delay") or 0
     }
 end
@@ -45,6 +51,7 @@ local function open_clip_tool()
         filePath = utils.join_path(mp.get_property("working-directory"), path),
         fileName = mp.get_property("filename"),
         startTime = mp.get_property_number("time-pos") or 0,
+        trigger = "mpv",
         subtitle = get_subtitle_context()
     }
 

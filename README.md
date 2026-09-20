@@ -182,6 +182,239 @@ but a real single keypress), or revisiting why `key-pressed` didn't fire
 behavior change in this VLC version versus whatever older examples of
 this technique were written against).
 
+## Subtitle overlay: three real bugs, found one at a time from actual
+## evidence (not guessed)
+
+Each of these was found from real console errors/screenshots, in order:
+
+1. **`SubtitlePreviewData` missing `#[serde(rename_all = "camelCase")]`** —
+   serialized as `ass_path`/`font_paths`, but `app.js` read
+   `data.assPath`/`data.fontPaths` — both `undefined`, causing a `.map`
+   crash on `undefined`. Fixed by adding the same attribute
+   `VideoMetadata`/`ExportParams` already had.
+2. **Backslash paths breaking `convertFileSrc()`** — `extract_subtitles_for_preview`
+   returned Windows-native backslash paths; confirmed via a real
+   `Loading data file "...%5CRoboto-Medium.ttf" failed` error containing
+   a literal URL-encoded backslash. Fixed by normalizing to forward
+   slashes, matching the same fix already applied to the export path's
+   `subtitle_filter()`.
+3. **Worker can't fetch Tauri's asset-protocol URLs at all** — even with
+   a correctly-formed forward-slash URL, `subtitles-octopus-worker.js`
+   (running in a Web Worker) still couldn't load the font file — a known
+   category of issue with Worker-based libraries in Tauri/Electron-style
+   apps, where the main thread can fetch custom-scheme URLs but a worker
+   often can't. Fixed by fetching on the main thread (proven to work —
+   same mechanism the video element itself uses) and handing the worker
+   plain `blob:` URLs instead.
+4. **Subtitle canvas positioned way outside the video area** — once text
+   actually started rendering (confirmed real progress), it appeared
+   stretched across the sidebar instead of confined to the video. Root
+   cause: `subtitles-octopus.js` injects a new `<div
+   class="libassjs-canvas-parent">` as a sibling of `<video>` to hold its
+   canvas — inside `#preview-wrap`, a flex container with no explicit
+   `flex-direction` (defaults to row), this became a second flex item
+   competing with the video for space, breaking the library's own
+   position math (which assumes a normal block-flow parent). Fixed with
+   a CSS override taking that injected div out of flex flow entirely
+   (`position: absolute; inset: 0`) so it stretches to fill
+   `#preview-wrap` without disturbing the video's layout.
+
+## Correct subtitle track selection (multiple tracks / external files)
+
+Previously, extraction always grabbed whichever subtitle stream appeared
+**first** in the video container — silently wrong if you were watching a
+non-default track (a file with English + Spanish + French, say, where
+you'd switched to Spanish), and completely blind to an externally-loaded
+subtitle file (VLC's "Add Subtitle File," or mpv playing alongside a
+same-named `.srt`) that isn't embedded in the container at all.
+
+- **External file, when active, now takes priority** — `extract_subtitles_to`
+  converts it directly rather than searching the container. mpv already
+  exposes this via `current-tracks/sub/external-filename`, now actually
+  wired through end to end (previously captured in the `--init` payload
+  but silently discarded).
+- **Embedded-track selection now matches by language**, not just "first
+  found" — far more robust than trying to map a player's internal track
+  numbering onto ffprobe's container stream indices, which aren't
+  guaranteed to correspond. mpv reports a clean ISO code
+  (`current-tracks/sub/lang`, e.g. `"eng"`); the Rust-side match tries an
+  exact match first, falling back to a lenient substring check either
+  direction. Falls back to the first stream found if there's no language
+  match at all (same behavior as before this fix, not worse — just no
+  longer the *only* behavior).
+- **mpv side: high confidence.** The data was already being captured
+  correctly; this just stops throwing it away. Multiple external
+  subtitle files loaded simultaneously (e.g. several `.srt`s added at
+  once) work correctly for free — mpv's `current-tracks/sub/*` properties
+  always reflect whichever *one* is currently active, regardless of how
+  many others are loaded alongside it.
+- **VLC side: genuinely lower confidence** on the language-matching
+  attempt — reads the active subtitle track's description via
+  `vlc.var.get`/`get_list` on `"spu-es"`, wrapped in `pcall` so a wrong
+  guess at VLC's API fails safely (falls back to "first stream," not a
+  crash). What it reports is likely a human-readable name ("English")
+  rather than a clean ISO code, which the lenient substring match is
+  specifically there to give a real chance against.
+- **VLC external subtitle files are not supported at all**, deliberately.
+  VLC's Lua API doesn't appear to expose a full path for an
+  externally-loaded subtitle directly (a known limitation) — only that
+  same track description, which for an external file is typically just
+  the bare filename ("subtitle.srt"). An earlier attempt guessed a full
+  path by joining that filename with the video's own folder — dropped as
+  too speculative to ship (a wrong guess would fail as a confusing ffmpeg
+  error rather than a clear message). Instead, `klippit-extension.lua`
+  sends `"trigger":"vlc"` in its payload, and `app.js` shows a plain,
+  honest message when there's no embedded subtitle and the trigger came
+  from VLC: *"No embedded sub detected. External sub handling not
+  supported on VLC."* — rather than the generic message, which would
+  read as if Klippit failed to notice something that's actually just
+  unsupported.
+
+## Subtitle timing fix + preview visibility toggle + screenshot control
+
+Once export finally succeeded, a real, distinct bug surfaced: burned-in
+subtitles were badly out of sync. Root cause: the export uses input-side
+`-ss`, which rebases the video's own frame timestamps to start near zero
+at the trim point — but the extracted subtitle file still carried its
+*original absolute* timestamps (e.g. a line at 5:29 in the source), so
+the subtitles filter was comparing "rebased-to-zero video time" against
+"absolute subtitle time," wildly out of sync. Fixed by extracting the
+subtitle stream with the **same trim window** as the actual export
+(`extract_subtitles_to` now takes an optional `(in_time, duration)` and
+applies matching `-ss`/`-t` during extraction), so both streams rebase to
+the same zero-point consistently. Output-side seek is used for this
+specific extraction (subtitle streams are cheap enough that frame-exact
+accuracy costs nothing), while the main video encode still uses fast
+input-side seek — so subtitle sync should be accurate to the same
+tolerance the video's own trim point already is (the existing
+keyframe-snap caveat documented elsewhere), not worse.
+
+Also added, both straightforward: a **live preview visibility toggle**
+(the "CC" button next to Play/Screenshot) that shows/hides the subtitle
+overlay while editing — separate from the Subtitles Off/Burn-in toggle
+in the sidebar, which governs the eventual export — and **screenshots
+now respect this same preview toggle** rather than the export setting,
+since "with or without subtitles" for a still is naturally answered by
+whatever you're currently looking at on screen.
+
+## Subtitle burn-in export: three attempts, the third one avoids the
+## problem entirely instead of continuing to guess at ffmpeg's escaping rules
+
+Each attempt was driven by a real, fresh error from an actual test file,
+not guessed:
+
+1. **`original_size=0x0`** — ffmpeg's auto-detection of this failed
+   depending on filter order. Fixed by passing it explicitly. Necessary,
+   but not the whole story.
+2. **Bracket-heavy filenames corrupting the parser** — a real file like
+   `[SubsPlease] Show - 09 [ABCD1234].mkv` broke the filter string when
+   pointed at directly. Fixed by pointing at a cleanly-named extracted
+   copy instead (`extract_subtitles_to`). Also necessary, also not the
+   whole story.
+3. **The Windows drive-letter colon itself** — even against a clean
+   extracted path with no brackets, `No option name near
+   '/Users/...':original_size=...'` kept recurring, in slightly different
+   forms, across two different escaping strategies (single-quote-wrapping
+   the value, then backslash-escaping the colon per ffmpeg's own
+   documented rule for named options) — each time, the "near" text showed
+   the parser choking right at the `C:` drive letter. Rather than keep
+   guessing at the exact colon-escaping rule ffmpeg wants here, the fix
+   sidesteps the problem entirely: `run_bin` now accepts an optional
+   working directory, the subtitle-burn encode step runs with `cwd` set
+   to the extracted subtitle's temp folder, and `subtitle_filter()`
+   references it by **bare filename** (`subs.ass`) — no path, no drive
+   letter, no colon, nothing left to escape at all. This threads through
+   `export_mp4`, `run_ffmpeg_2pass`, `export_gif`, `encode_gif_attempt`,
+   and `extract_frame` (screenshots), all of which now pass a matching
+   `cwd` alongside the filter string wherever burn-in is active.
+
+**Unverified**: `.current_dir(dir)` on `tauri-plugin-shell`'s sidecar
+builder is written from its documented API (which mirrors
+`std::process::Command`), not yet confirmed against a real compile — if
+that exact method doesn't exist, the rest of this fix's logic (bare
+filename + matching cwd) is still correct regardless of what that one
+call ends up being.
+
+`fontsdir` remains dropped (from the previous attempt) — burned-in
+subtitles should display correctly, just potentially in a system
+fallback font instead of the exact embedded one if it isn't already
+installed. Revisit if font accuracy turns out to matter in practice.
+
+## More real bugs found on closer re-inspection (not yet re-tested)
+
+After the previous round of fixes was confirmed still failing on a fresh
+rebuild, I re-traced the actual code (rather than guessing a third time)
+and found genuine additional bugs:
+
+- **Seek bar / playback still not moving the trim handle** — the real
+  cause turned out to be different from the timing theory in the
+  previous fix. `setHandleTime()` clamped `state.inTime` to never exceed
+  `state.outTime` (and vice versa) — but `outTime` starts as just
+  `startTime + 3` (three seconds after In). Since In is the default armed
+  handle, and any real scrub/seek lands well past three seconds, In got
+  silently pinned in place regardless of where you dragged — until Out
+  was moved somewhere real first, which is exactly why clicking In/Out
+  once appeared to "fix" it. Removed the cross-handle clamp entirely;
+  `export_clip` already validates `in < out` at export time, so the UI
+  doesn't need to enforce it live too, and doing so is what broke free
+  scrubbing.
+- **Subtitle burn-in export — a second bug beyond the filename-bracket
+  fix.** `extract_subtitles_to`'s temp path comes from
+  `std::env::temp_dir()`, which returns **backslash**-separated paths on
+  Windows. The previously-working version of this filter always received
+  **forward-slash** paths from the frontend (deliberately, from an
+  earlier fix dodging JS backslash-escaping issues). `subtitle_filter()`
+  now explicitly normalizes to forward slashes before embedding the path
+  in the ffmpeg filter string, matching the format actually proven to
+  work in this exact context rather than assuming backslashes behave
+  identically once quoted.
+- **DevTools were completely unavailable** — `Cargo.toml` never enabled
+  the `devtools` Tauri feature, so right-click → Inspect likely didn't
+  even work in the release build. Enabled now. This matters specifically
+  for the subtitle-overlay-not-showing issue, which produces no visible
+  error anywhere except the browser console (`[klippit] subtitle overlay
+  error` / `subtitle preview extraction failed`) — **if subtitles still
+  don't appear after this rebuild, opening DevTools and checking for
+  those specific messages is the next real diagnostic step**, since nothing
+  else in the codebase points to an obvious cause on inspection alone.
+- **VLC extension silent failure** — `vlc.input.item()` can return `nil`
+  for a brief moment right when VLC launches with a file, and clicking
+  the extension in that window failed completely silently (a
+  `vlc.msg.warn` line only visible in VLC's Messages window, which
+  nobody has open). Now shows an actual dialog telling you to wait a
+  moment and try again, rather than appearing to do nothing.
+
+## ~~Subtitle burn-in fails on real-world filenames~~ — fixed properly
+
+Confirmed on a real file: a name like `[SubsPlease] Show - 09 (720p)
+[ABCD1234].mkv` — brackets and all — corrupted ffmpeg's filter-option
+string parsing when the `subtitles` filter pointed directly at it,
+producing a garbled `Unable to parse "original_size" option value` error
+that had nothing to do with `original_size` itself. The earlier fix
+(passing `original_size` explicitly) treated a symptom; this treats the
+actual cause: `subtitle_filter()` and `extract_frame`'s burn-in path both
+now point at a **cleanly-named extracted copy** of the subtitle track
+(via the same `extract_subtitles_to` helper the preview overlay already
+used) rather than the messy original filename, for both export and
+screenshots. Absolute subtitle timestamps are preserved during
+extraction, which is what keeps this correctly in sync with a trimmed,
+`-ss`-shifted output — same timing assumption the original direct-file
+approach relied on, just via an intermediate clean path instead of the
+source file's own name.
+
+## ~~Seek bar doesn't move the trim handle until you've touched
+something else first~~ — fixed
+
+The armed handle (In or Out) was only synced to `video.currentTime` via
+the `timeupdate` event, which fires reliably during actual *playback*
+but not necessarily for every rapid, discrete seek while paused (browsers
+commonly throttle or skip `timeupdate` for that case) — so dragging the
+plain seek bar could silently fail to move anything on the trim-track
+ruler until some other action (clicking In/Out, which calls the sync
+function directly) happened to establish it. Fixed by having the seek
+bar's own drag handler call that sync function directly, rather than
+depending solely on the event round-trip.
+
 ## Layout: side-by-side editor, not a single vertical stack
 
 Restructured from one long vertical column (video → scrubber → all
@@ -196,6 +429,21 @@ This was a pure CSS/HTML restructure — every element kept its existing
 zero changes. Verified at both the new default and minimum window sizes,
 including the tallest-content combination (Target-size mode + post-export
 action buttons visible), with no scrolling needed at either size.
+
+## ~~Bundled subtitles not detected~~ — fixed
+
+Two different signals were getting conflated in `app.js`: mpv/VLC's
+`subtitle.available` (whether a track is *currently selected in the
+player* at trigger time — usually `false`, since VLC never reports it
+and mpv only reports `true` if subtitles were actively on in mpv itself)
+versus `get_video_metadata`'s `hasSubtitles` (a real `ffprobe` check of
+whether the file *contains* a subtitle stream at all). `applyInit()`
+disabled the Subtitles toggle based on the first, unreliable signal, and
+`loadMetadata()`'s later, correct check never re-enabled it — so any file
+with embedded subtitles got stuck showing "no subtitles." Fixed by
+removing the premature disabling from `applyInit()` entirely and making
+the `ffprobe`-based check in `loadMetadata()` the sole authority, in both
+directions (disables *and* re-enables as appropriate).
 
 ## Subtitle preview while editing (libass-wasm)
 

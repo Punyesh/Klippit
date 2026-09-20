@@ -45,6 +45,13 @@ struct ExportParams {
     #[serde(default)]   // filter can be told original_size explicitly rather
     source_height: u32, // than relying on auto-detection, which fails when
                          // subtitles is applied after a scale filter
+    #[serde(default)]
+    subtitle_lang: Option<String>,        // from mpv's current-tracks/sub/lang, for
+    #[serde(default)]                     // picking the right embedded track when
+    subtitle_external_file: Option<String>, // there are several; external_file (an
+                                             // externally-loaded subtitle file, not
+                                             // embedded in the container) takes
+                                             // priority over lang matching when set
 }
 
 #[derive(Debug, Serialize)]
@@ -62,11 +69,33 @@ struct VideoMetadata {
 // principle as the old plain-PATH `run()` helper — just backed by the
 // bundled binary instead. `app` is auto-injected by Tauri when a command
 // declares an `AppHandle` parameter; it costs nothing at the call site.
-async fn run_bin(app: &AppHandle, name: &str, args: &[String]) -> Result<Vec<u8>, String> {
+//
+// `cwd`: only ever Some(...) for the subtitle-burn encode step. After two
+// different failed attempts at escaping a Windows drive-letter colon
+// inside a `-vf` filter string (single-quote-wrapping, then backslash-
+// escaping — both confirmed failing on real files with a "No option
+// name near ..." error each time, in slightly different ways), this
+// sidesteps the whole class of problem: run ffmpeg with its working
+// directory set to the subtitle temp folder and reference the file by
+// its bare filename ("subs.ass") instead — no path, no colon, nothing
+// left to escape at all.
+//
+// UNVERIFIED: `.current_dir(dir)` on tauri-plugin-shell's sidecar
+// builder is written from its documented std::process::Command-mirroring
+// API, not yet confirmed against a real compile. If this doesn't exist
+// under that exact name, check that crate's current docs for the actual
+// method — the rest of this fix's logic (bare filename + matching cwd)
+// stays correct regardless of what that one method call ends up being.
+async fn run_bin(app: &AppHandle, name: &str, args: &[String], cwd: Option<&std::path::Path>) -> Result<Vec<u8>, String> {
     let sidecar = app
         .shell()
         .sidecar(name)
         .map_err(|e| format!("sidecar '{name}' not found in this build: {e}"))?;
+
+    let sidecar = match cwd {
+        Some(dir) => sidecar.current_dir(dir),
+        None => sidecar,
+    };
 
     let output = sidecar
         .args(args)
@@ -88,7 +117,7 @@ async fn get_video_metadata(app: AppHandle, path: String) -> Result<VideoMetadat
         "-show_entries".into(), "format=duration:stream=r_frame_rate,codec_type,width,height".into(),
         "-of".into(), "default=noprint_wrappers=1".into(),
         path,
-    ]).await?;
+    ], None).await?;
 
     let text = String::from_utf8_lossy(&stdout);
     let mut duration = 0.0;
@@ -191,10 +220,36 @@ async fn export_clip(app: AppHandle, params: ExportParams) -> Result<String, Str
         ext
     );
 
-    if params.format == "gif" {
-        export_gif(&app, &params, duration, &out_path).await?;
+    // Extracted once here (not per-attempt inside export_gif's retry
+    // loop) since it's the same subtitle data regardless of how many
+    // encode attempts target-size mode ends up needing.
+    let subtitle_filter_str: Option<String> = if params.burn_subs {
+        let temp_dir = std::env::temp_dir().join(format!("klippit-burn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let extracted = extract_subtitles_to(
+            &app, &params.file_path, &temp_dir, Some((params.in_time, duration)),
+            params.subtitle_external_file.as_deref(), params.subtitle_lang.as_deref(),
+        ).await?;
+        Some(subtitle_filter(&extracted, params.source_width, params.source_height))
     } else {
-        export_mp4(&app, &params, duration, &out_path).await?;
+        None
+    };
+    // The encode step's ffmpeg process runs with its working directory
+    // set to this same temp folder whenever burn_subs is active — see
+    // subtitle_filter()'s comment for why (sidesteps a Windows
+    // drive-letter-colon escaping problem inside the filter string
+    // entirely, rather than continuing to fight ffmpeg's exact escaping
+    // rules for it).
+    let subtitle_cwd = if params.burn_subs {
+        Some(std::env::temp_dir().join(format!("klippit-burn-{}", std::process::id())))
+    } else {
+        None
+    };
+
+    if params.format == "gif" {
+        export_gif(&app, &params, duration, &out_path, subtitle_filter_str.as_deref(), subtitle_cwd.as_deref()).await?;
+    } else {
+        export_mp4(&app, &params, duration, &out_path, subtitle_filter_str.as_deref(), subtitle_cwd.as_deref()).await?;
     }
 
     Ok(out_path)
@@ -207,35 +262,62 @@ fn scale_filter(resolution: u32) -> Option<String> {
     Some(format!("scale=-2:{resolution}"))
 }
 
-fn subtitle_filter(params: &ExportParams) -> Option<String> {
-    if !params.burn_subs { return None; }
-    // IMPORTANT: -ss before -i (input-side seek, see below) shifts the
-    // subtitle filter's own timeline too, since it reads straight from the
-    // original file's timestamps — that's what keeps burned subs in sync
-    // with a trimmed clip instead of drifting by `in_time` seconds.
-    // itsoffset/setpts adjustments are only needed here if subs come from
-    // a *separate* external file not already aligned with the video's PTS.
-    let mut filter = format!("subtitles='{}'", params.file_path.replace('\'', "\\'"));
+// Builds the actual `subtitles=...` filter string from already-extracted,
+// clean-path subtitle/font files (see extract_subtitles_to) — never from
+// the original source path directly. That's the fix for a real bug: a
+// real-world filename like "[SubsPlease] Show - 09 [ABCD1234].mkv"
+// contains brackets that corrupted ffmpeg's filter-option parsing when
+// pointed at directly, producing a garbled "unable to parse
+// original_size" error that had nothing to do with original_size
+// itself — parsing had already gone wrong on the bracket-heavy path
+// before reaching that option.
+//
+// Timing correctness note: extraction preserves the subtitle stream's
+// original absolute timestamps (no -ss applied during extraction), which
+// is what keeps this correctly in sync with a trimmed, -ss-shifted
+// output — the filter matches its subtitle file's absolute timestamps
+// against frame timing in the graph the same way it would reading
+// straight from the original source, just via a cleanly-named
+// intermediate file instead of the messy original path.
+fn subtitle_filter(extracted: &ExtractedSubtitles, source_width: u32, source_height: u32) -> String {
+    // Bare filename, no path at all — after two different colon-escaping
+    // attempts both failed on real files with variations of "No option
+    // name near ..." right at the Windows drive-letter colon, the robust
+    // fix is to not have a colon (or any path at all) in this string in
+    // the first place. The ffmpeg process invoking this filter runs with
+    // its working directory set to this same folder (see export_clip /
+    // extract_frame, which pass Some(cwd) to run_bin for exactly this
+    // encode step), so a bare filename resolves correctly without any
+    // escaping question at all.
+    let filename = extracted.ass_path.file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| "subs.ass".to_string());
+    // fontsdir intentionally dropped: it was implicated in the same class
+    // of error and, unlike filename/original_size, I don't have a
+    // confident fix for its specific escaping behavior yet — rather than
+    // stack another unverified guess on top, dropping it entirely gets a
+    // working export now. Tradeoff: burned-in text may render in a
+    // system fallback font instead of the exact embedded one if that
+    // font isn't already installed. Revisit if font accuracy turns out
+    // to matter in practice.
+    let mut filter = format!("subtitles=filename={filename}");
     // Explicitly telling the filter the source's real resolution avoids a
-    // real bug hit in testing: ffmpeg's auto-detection of this can fail
-    // ("Unable to parse 'original_size' option value '0x0'") depending on
-    // where in the filter chain subtitles sits — passing it explicitly
-    // sidesteps that regardless of the exact cause. Falls back to no
-    // explicit size (the old, sometimes-broken auto-detect behavior) only
-    // if metadata genuinely wasn't available.
-    if params.source_width > 0 && params.source_height > 0 {
-        filter.push_str(&format!(":original_size={}x{}", params.source_width, params.source_height));
+    // separate real bug hit in testing: ffmpeg's auto-detection of this
+    // can fail ("Unable to parse 'original_size' option value '0x0'")
+    // depending on where in the filter chain subtitles sits.
+    if source_width > 0 && source_height > 0 {
+        filter.push_str(&format!(":original_size={source_width}x{source_height}"));
     }
-    Some(filter)
+    filter
 }
 
-async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str) -> Result<(), String> {
+async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str, subtitle_filter_str: Option<&str>, subtitle_cwd: Option<&std::path::Path>) -> Result<(), String> {
     let mut filters: Vec<String> = vec![];
     // Subtitles before scale: burns onto the original-resolution frame,
     // matching the coordinates the ASS/SSA styling was authored against,
     // then scale runs afterward on the already-burned-in frame. Also
     // avoids the original_size auto-detection bug noted in subtitle_filter.
-    if let Some(f) = subtitle_filter(params) { filters.push(f); }
+    if let Some(f) = subtitle_filter_str { filters.push(f.to_string()); }
     if let Some(f) = scale_filter(params.resolution) { filters.push(f); }
     let vf = if filters.is_empty() { None } else { Some(filters.join(",")) };
 
@@ -246,7 +328,7 @@ async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_p
         let audio_kbps = 128.0;
         let video_kbps = ((target_bits / duration / 1000.0) - audio_kbps).max(200.0);
 
-        run_ffmpeg_2pass(app, &params.file_path, params.in_time, duration, vf.as_deref(), video_kbps, audio_kbps, out_path).await
+        run_ffmpeg_2pass(app, &params.file_path, params.in_time, duration, vf.as_deref(), video_kbps, audio_kbps, out_path, subtitle_cwd).await
     } else {
         let mut args: Vec<String> = vec![
             "-y".into(),
@@ -259,13 +341,13 @@ async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_p
         ];
         if let Some(f) = &vf { args.push("-vf".into()); args.push(f.clone()); }
         args.push(out_path.into());
-        run_bin(app, "ffmpeg", &args).await.map(|_| ())
+        run_bin(app, "ffmpeg", &args, subtitle_cwd).await.map(|_| ())
     }
 }
 
 async fn run_ffmpeg_2pass(
     app: &AppHandle, input: &str, start: f64, duration: f64, vf: Option<&str>,
-    video_kbps: f64, audio_kbps: f64, out_path: &str,
+    video_kbps: f64, audio_kbps: f64, out_path: &str, subtitle_cwd: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let bitrate = format!("{}k", video_kbps as u64);
     let audio = format!("{}k", audio_kbps as u64);
@@ -277,6 +359,9 @@ async fn run_ffmpeg_2pass(
     // as source and rebuilds+relaunches the whole app on any change,
     // which looked like a crash but was actually this. Pointing it at
     // the OS temp dir instead avoids that everywhere, dev or release.
+    // (This is an absolute path regardless of subtitle_cwd, so changing
+    // the process's working directory for the subtitle-burn case below
+    // doesn't affect it.)
     let passlog_prefix = std::env::temp_dir()
         .join(format!("klippit-2pass-{}", std::process::id()))
         .to_string_lossy()
@@ -292,7 +377,7 @@ async fn run_ffmpeg_2pass(
     if let Some(f) = vf { pass1.push("-vf".into()); pass1.push(f.into()); }
     #[cfg(windows)] pass1.push("NUL".into());
     #[cfg(not(windows))] pass1.push("/dev/null".into());
-    run_bin(app, "ffmpeg", &pass1).await?;
+    run_bin(app, "ffmpeg", &pass1, subtitle_cwd).await?;
 
     let mut pass2: Vec<String> = vec![
         "-y".into(), "-ss".into(), start.to_string(), "-i".into(), input.into(),
@@ -303,7 +388,7 @@ async fn run_ffmpeg_2pass(
     ];
     if let Some(f) = vf { pass2.push("-vf".into()); pass2.push(f.into()); }
     pass2.push(out_path.into());
-    let result = run_bin(app, "ffmpeg", &pass2).await.map(|_| ());
+    let result = run_bin(app, "ffmpeg", &pass2, subtitle_cwd).await.map(|_| ());
 
     // Best-effort cleanup — leftover pass-log files in the temp dir are
     // harmless either way, so a failed removal here doesn't fail the export.
@@ -313,7 +398,7 @@ async fn run_ffmpeg_2pass(
     result
 }
 
-async fn export_gif(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str) -> Result<(), String> {
+async fn export_gif(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str, subtitle_filter_str: Option<&str>, subtitle_cwd: Option<&std::path::Path>) -> Result<(), String> {
     // Two-pass palette gen/use — same technique as the wasm version, just
     // real ffmpeg instead of a wasm build. Target-size mode iterates width/
     // fps rather than a bitrate knob, since GIF has none.
@@ -324,7 +409,7 @@ async fn export_gif(app: &AppHandle, params: &ExportParams, duration: f64, out_p
     };
 
     for attempt in 0..3 {
-        encode_gif_attempt(app, params, duration, width, fps, out_path).await?;
+        encode_gif_attempt(app, params, duration, width, fps, out_path, subtitle_filter_str, subtitle_cwd).await?;
         if params.mode != "size" { break; }
 
         let size_mb = std::fs::metadata(out_path).map(|m| m.len() as f64 / 1_000_000.0).unwrap_or(0.0);
@@ -336,16 +421,21 @@ async fn export_gif(app: &AppHandle, params: &ExportParams, duration: f64, out_p
     Ok(())
 }
 
-async fn encode_gif_attempt(app: &AppHandle, params: &ExportParams, duration: f64, width: u32, fps: u32, out_path: &str) -> Result<(), String> {
+async fn encode_gif_attempt(app: &AppHandle, params: &ExportParams, duration: f64, width: u32, fps: u32, out_path: &str, subtitle_filter_str: Option<&str>, subtitle_cwd: Option<&std::path::Path>) -> Result<(), String> {
     // Same ordering fix as export_mp4: subtitles before scale, so the
     // filter burns onto the original-resolution frame rather than an
     // already-downscaled one — both for correct ASS positioning and to
     // avoid the original_size auto-detection failure (see subtitle_filter).
     let mut base_filters = vec![format!("fps={fps}")];
-    if let Some(f) = subtitle_filter(params) { base_filters.push(f); }
+    if let Some(f) = subtitle_filter_str { base_filters.push(f.to_string()); }
     base_filters.push(format!("scale={width}:-2:flags=lanczos"));
     let base = base_filters.join(",");
 
+    // palette/out_path/params.file_path are all absolute paths passed as
+    // plain argv elements (not embedded in a filter string), so they're
+    // unaffected by subtitle_cwd — only the subtitle filter string
+    // itself (base, above) depends on the process's working directory
+    // being set correctly.
     let palette = format!("{out_path}.palette.png");
 
     run_bin(app, "ffmpeg", &[
@@ -353,7 +443,7 @@ async fn encode_gif_attempt(app: &AppHandle, params: &ExportParams, duration: f6
         "-t".into(), duration.to_string(),
         "-vf".into(), format!("{base},palettegen"),
         palette.clone(),
-    ]).await?;
+    ], subtitle_cwd).await?;
 
     run_bin(app, "ffmpeg", &[
         "-y".into(), "-ss".into(), params.in_time.to_string(), "-i".into(), params.file_path.clone(),
@@ -361,7 +451,7 @@ async fn encode_gif_attempt(app: &AppHandle, params: &ExportParams, duration: f6
         "-i".into(), palette.clone(),
         "-lavfi".into(), format!("{base}[x];[x][1:v]paletteuse=dither=bayer"),
         out_path.into(),
-    ]).await?;
+    ], subtitle_cwd).await?;
 
     let _ = std::fs::remove_file(&palette);
     Ok(())
@@ -373,7 +463,7 @@ async fn encode_gif_attempt(app: &AppHandle, params: &ExportParams, duration: f6
 // fallback for extracting a still via ffmpeg if a screenshot is ever
 // requested outside of an active mpv session.
 #[tauri::command]
-async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, out_path: String, source_width: u32, source_height: u32) -> Result<String, String> {
+async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, out_path: String, source_width: u32, source_height: u32, subtitle_lang: Option<String>, subtitle_external_file: Option<String>) -> Result<String, String> {
     let out_path = expand_tilde(&out_path);
     if let Some(parent) = std::path::Path::new(&out_path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("couldn't create output folder: {e}"))?;
@@ -382,85 +472,197 @@ async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, o
         "-y".into(), "-ss".into(), at.to_string(), "-i".into(), path.clone(),
         "-frames:v".into(), "1".into(),
     ];
+    let mut cwd: Option<std::path::PathBuf> = None;
     if burn_subs {
-        // Same original_size fix as subtitle_filter() in the export path —
-        // a screenshot has no scale filter ahead of it (the actual trigger
-        // for that bug elsewhere), so auto-detection likely would have
-        // worked fine here regardless, but passing it explicitly is free
-        // and removes any doubt.
-        let mut filter = format!("subtitles='{}'", path.replace('\'', "\\'"));
-        if source_width > 0 && source_height > 0 {
-            filter.push_str(&format!(":original_size={source_width}x{source_height}"));
-        }
+        // Same clean-extracted-path approach as subtitle_filter() in the
+        // export path, for the same reason: pointing the filter directly
+        // at the original source file risks the same bracket-in-filename
+        // parser corruption bug documented there. cwd gets set below so
+        // subtitle_filter()'s bare filename resolves correctly.
+        let temp_dir = std::env::temp_dir().join(format!("klippit-shot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let extracted = extract_subtitles_to(
+            &app, &path, &temp_dir, Some((at, 1.0)),
+            subtitle_external_file.as_deref(), subtitle_lang.as_deref(),
+        ).await?;
         args.push("-vf".into());
-        args.push(filter);
+        args.push(subtitle_filter(&extracted, source_width, source_height));
+        cwd = Some(temp_dir);
     }
     args.push(out_path.clone());
-    run_bin(&app, "ffmpeg", &args).await?;
+    run_bin(&app, "ffmpeg", &args, cwd.as_deref()).await?;
     Ok(out_path)
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SubtitlePreviewData {
     ass_path: String,
     font_paths: Vec<String>,
 }
 
-// Extracts the first subtitle stream (converted to ASS regardless of its
-// source codec — SRT, SSA, whatever) plus any embedded font attachments,
-// as standalone temp files. This is for the live EDITING preview only:
-// a plain browser <video> element cannot render embedded ASS/SSA tracks
-// from an MKV at all (not a bug — Chromium's media pipeline just doesn't
-// support it), so libass-wasm (subtitles-octopus.js, vendored under
-// src/lib/) renders them separately as an overlay, reading these
-// extracted files directly rather than trying to pull subtitles out of
-// the video element itself.
+// Shared by both the preview overlay and export burn-in: extracts the
+// first subtitle stream (converted to ASS regardless of source codec —
+// SRT, SSA, whatever) plus embedded font attachments, all into a clean
+// temp directory with safe, predictable filenames — deliberately NOT the
+// original file's own name, which is a real bug source: a real-world
+// filename like "[SubsPlease] Show - 09 (720p) [ABCD1234].mkv" contains
+// brackets that corrupted ffmpeg's filter-option parsing when the
+// subtitles filter pointed directly at it, producing garbled downstream
+// errors (a mangled "original_size" value) that had nothing to do with
+// original_size itself — the parser had already gone off the rails on
+// the bracket-heavy path before it got there. Pointing at a clean
+// extracted path sidesteps the whole class of problem regardless of how
+// messy the source filename is.
+//
+// Absolute subtitle timestamps are preserved (no -ss during extraction),
+// matching the same assumption documented on the old direct-file
+// approach: burning in against a file whose subtitle timestamps still
+// match the original absolute timeline stays correctly synced with a
+// trimmed, -ss-shifted output.
 //
 // STATUS: the attachment-dumping command construction here (multiple
 // -dump_attachment:INDEX flags batched into one ffmpeg call) is written
 // from documented ffmpeg wiki patterns, not yet confirmed against a real
 // run — if font extraction silently returns nothing, that command is the
 // first place to check by running it manually in a terminal.
-#[tauri::command]
-async fn extract_subtitles_for_preview(app: AppHandle, path: String) -> Result<SubtitlePreviewData, String> {
-    let sub_index_stdout = run_bin(&app, "ffprobe", &[
+struct ExtractedSubtitles {
+    ass_path: std::path::PathBuf,
+    font_paths: Vec<std::path::PathBuf>,
+}
+
+// `trim`: Some((in_time, duration)) for export/screenshot use — extracts
+// only that window, with output-side -ss/-t (subtitle streams are tiny,
+// so accuracy costs nothing here) so the extracted file's own timestamps
+// rebase to start near zero exactly like the main video's frames do
+// under the encode step's input-side -ss. Without this, a real timing
+// bug showed up: burned-in subtitles were completely out of sync,
+// because the subtitle filter was comparing the video's rebased-to-zero
+// frame times against the subtitle file's original absolute timestamps.
+// None for the live preview overlay, which shows the whole file, not a
+// trimmed segment, so no rebasing is needed or wanted there.
+// `trim`: Some((in_time, duration)) for export/screenshot use — extracts
+// only that window, with output-side -ss/-t (subtitle streams are tiny,
+// so accuracy costs nothing here) so the extracted file's own timestamps
+// rebase to start near zero exactly like the main video's frames do
+// under the encode step's input-side -ss. Without this, a real timing
+// bug showed up: burned-in subtitles were completely out of sync,
+// because the subtitle filter was comparing the video's rebased-to-zero
+// frame times against the subtitle file's original absolute timestamps.
+// None for the live preview overlay, which shows the whole file, not a
+// trimmed segment, so no rebasing is needed or wanted there.
+//
+// `external_file`: if the player has an externally-loaded subtitle file
+// active (not embedded in the video container — e.g. VLC's "Add
+// Subtitle File", or mpv playing alongside a same-named .srt), this
+// takes priority and gets used directly, since it's genuinely what's
+// being watched. Passed through as Some(path) only when non-empty.
+//
+// `preferred_lang`: when there's no external file, used to pick the
+// right EMBEDDED stream out of possibly several (a file with English +
+// Spanish + French tracks, say) by matching ffprobe's own
+// stream_tags=language against the player's reported active-track
+// language — far more robust than trying to map mpv's or VLC's internal
+// track numbering onto ffprobe's container stream indices, which aren't
+// guaranteed to correspond 1:1. Falls back to the first subtitle stream
+// found if there's no language match (or no language info available at
+// all) — better than failing outright, though it's the same "might
+// silently pick the wrong track" behavior this whole feature exists to
+// fix, just as a last resort rather than the default.
+async fn extract_subtitles_to(
+    app: &AppHandle, path: &str, temp_dir: &std::path::Path, trim: Option<(f64, f64)>,
+    external_file: Option<&str>, preferred_lang: Option<&str>,
+) -> Result<ExtractedSubtitles, String> {
+    std::fs::create_dir_all(temp_dir).map_err(|e| e.to_string())?;
+    let ass_path = temp_dir.join("subs.ass");
+
+    // External file takes priority — it's a separate, standalone
+    // subtitle file, not a stream within the video container at all, so
+    // there's no "-map 0:N" involved: just convert it directly.
+    if let Some(ext) = external_file.filter(|s| !s.is_empty()) {
+        let mut extract_args: Vec<String> = vec!["-y".into(), "-i".into(), ext.to_string()];
+        if let Some((in_time, duration)) = trim {
+            extract_args.push("-ss".into());
+            extract_args.push(in_time.to_string());
+            extract_args.push("-t".into());
+            extract_args.push(duration.to_string());
+        }
+        extract_args.push("-c:s".into());
+        extract_args.push("ass".into());
+        extract_args.push(ass_path.to_string_lossy().to_string());
+        run_bin(app, "ffmpeg", &extract_args, None).await?;
+        // External files don't carry embedded font attachments the way
+        // an MKV might — nothing to extract there.
+        return Ok(ExtractedSubtitles { ass_path, font_paths: vec![] });
+    }
+
+    // No external file — search the container's own subtitle streams,
+    // preferring one whose language tag matches what the player reported
+    // as active, falling back to the first one found.
+    let stream_probe = run_bin(app, "ffprobe", &[
         "-v".into(), "error".into(),
         "-select_streams".into(), "s".into(),
-        "-show_entries".into(), "stream=index".into(),
+        "-show_entries".into(), "stream=index:stream_tags=language".into(),
         "-of".into(), "csv=p=0".into(),
-        path.clone(),
-    ]).await?;
-    let sub_index = String::from_utf8_lossy(&sub_index_stdout)
-        .lines()
-        .next()
-        .and_then(|l| l.trim().parse::<u32>().ok())
+        path.to_string(),
+    ], None).await?;
+
+    let mut matched_index: Option<u32> = None;
+    let mut first_index: Option<u32> = None;
+    for line in String::from_utf8_lossy(&stream_probe).lines() {
+        let mut parts = line.splitn(2, ',');
+        let idx = parts.next().and_then(|s| s.trim().parse::<u32>().ok());
+        let Some(idx) = idx else { continue };
+        if first_index.is_none() { first_index = Some(idx); }
+        if let Some(pref) = preferred_lang {
+            let lang = parts.next().unwrap_or("").trim();
+            if !lang.is_empty() {
+                // Exact match first (this is what mpv's clean ISO codes
+                // like "eng" always hit), then a lenient substring check
+                // as a fallback — VLC's own track-language reporting is
+                // more likely to be a human-readable name ("English")
+                // than a clean ISO code, so this gives it a real chance
+                // to still match ffprobe's "eng" tag either direction.
+                let lang_lower = lang.to_ascii_lowercase();
+                let pref_lower = pref.to_ascii_lowercase();
+                if lang_lower == pref_lower
+                    || pref_lower.contains(&lang_lower)
+                    || lang_lower.contains(&pref_lower)
+                {
+                    matched_index = Some(idx);
+                    break;
+                }
+            }
+        }
+    }
+    let sub_index = matched_index.or(first_index)
         .ok_or_else(|| "no subtitle stream found".to_string())?;
 
-    let temp_dir = std::env::temp_dir().join(format!("klippit-subs-{}", std::process::id()));
-    // Clear any leftovers from a previously previewed file in this same
-    // session (switching files via single-instance re-seed) rather than
-    // letting old fonts/ass files accumulate here indefinitely.
-    let _ = std::fs::remove_dir_all(&temp_dir);
-    std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
-    let ass_path = temp_dir.join("preview.ass");
-
-    run_bin(&app, "ffmpeg", &[
-        "-y".into(), "-i".into(), path.clone(),
+    let mut extract_args: Vec<String> = vec![
+        "-y".into(), "-i".into(), path.to_string(),
         "-map".into(), format!("0:{sub_index}"),
-        "-c:s".into(), "ass".into(),
-        ass_path.to_string_lossy().to_string(),
-    ]).await?;
+    ];
+    if let Some((in_time, duration)) = trim {
+        extract_args.push("-ss".into());
+        extract_args.push(in_time.to_string());
+        extract_args.push("-t".into());
+        extract_args.push(duration.to_string());
+    }
+    extract_args.push("-c:s".into());
+    extract_args.push("ass".into());
+    extract_args.push(ass_path.to_string_lossy().to_string());
+    run_bin(app, "ffmpeg", &extract_args, None).await?;
 
     // Font attachments: best-effort. A file with none (or fonts already
     // present on the system) still works, just with less accurate font
-    // matching in the overlay.
-    let font_probe = run_bin(&app, "ffprobe", &[
+    // matching.
+    let font_probe = run_bin(app, "ffprobe", &[
         "-v".into(), "error".into(),
         "-select_streams".into(), "t".into(),
         "-show_entries".into(), "stream=index:stream_tags=filename".into(),
         "-of".into(), "csv=p=0".into(),
-        path.clone(),
-    ]).await.unwrap_or_default();
+        path.to_string(),
+    ], None).await.unwrap_or_default();
 
     let mut dump_args: Vec<String> = vec!["-y".into()];
     let mut pending: Vec<std::path::PathBuf> = vec![];
@@ -469,8 +671,6 @@ async fn extract_subtitles_for_preview(app: AppHandle, path: String) -> Result<S
         let (Some(idx_str), Some(filename)) = (parts.next(), parts.next()) else { continue };
         let Ok(idx) = idx_str.trim().parse::<u32>() else { continue };
         let filename = filename.trim();
-        // Reject anything that looks like a path rather than a bare
-        // filename — these come from the file's own (untrusted) tag data.
         if filename.is_empty() || filename.contains('/') || filename.contains('\\') || filename.contains("..") {
             continue;
         }
@@ -483,21 +683,47 @@ async fn extract_subtitles_for_preview(app: AppHandle, path: String) -> Result<S
     let mut font_paths = vec![];
     if !pending.is_empty() {
         dump_args.push("-i".into());
-        dump_args.push(path.clone());
+        dump_args.push(path.to_string());
         dump_args.push("-f".into());
         dump_args.push("null".into());
         dump_args.push("-".into());
-        let _ = run_bin(&app, "ffmpeg", &dump_args).await; // best-effort
+        let _ = run_bin(app, "ffmpeg", &dump_args, None).await; // best-effort
         for p in pending {
             if p.exists() {
-                font_paths.push(p.to_string_lossy().to_string());
+                font_paths.push(p);
             }
         }
     }
 
+    Ok(ExtractedSubtitles { ass_path, font_paths })
+}
+
+// Used for the live EDITING preview specifically: a plain browser
+// <video> element cannot render embedded ASS/SSA tracks from an MKV at
+// all (not a bug — Chromium's media pipeline just doesn't support it),
+// so libass-wasm (subtitles-octopus.js, vendored under src/lib/) renders
+// them separately as an overlay, reading these extracted files directly.
+#[tauri::command]
+async fn extract_subtitles_for_preview(app: AppHandle, path: String, subtitle_lang: Option<String>, subtitle_external_file: Option<String>) -> Result<SubtitlePreviewData, String> {
+    let temp_dir = std::env::temp_dir().join(format!("klippit-subs-preview-{}", std::process::id()));
+    // Clear any leftovers from a previously previewed file in this same
+    // session (switching files via single-instance re-seed) rather than
+    // letting old fonts/ass files accumulate here indefinitely.
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let extracted = extract_subtitles_to(
+        &app, &path, &temp_dir, None,
+        subtitle_external_file.as_deref(), subtitle_lang.as_deref(),
+    ).await?;
+    // Forward slashes, not whatever PathBuf naturally formats as — same
+    // fix as subtitle_filter() in the export path and for the same
+    // reason: Tauri's convertFileSrc() (called on these paths from the
+    // JS side) mishandles Windows backslashes, producing a malformed
+    // asset URL with a literal %5C in it instead of a working path —
+    // confirmed directly from a real "Loading data file ... failed"
+    // error containing exactly that in testing.
     Ok(SubtitlePreviewData {
-        ass_path: ass_path.to_string_lossy().to_string(),
-        font_paths,
+        ass_path: extracted.ass_path.to_string_lossy().replace('\\', "/"),
+        font_paths: extracted.font_paths.iter().map(|p| p.to_string_lossy().replace('\\', "/")).collect(),
     })
 }
 

@@ -84,7 +84,7 @@ local function trigger_klippit()
     -- covers, so this always reports "no subtitles" for now. The mpv
     -- path (clip-trigger.lua) does this properly.
     local json = string.format(
-        '{"filePath":"%s","fileName":"%s","startTime":%.3f,"subtitle":{"available":false}}',
+        '{"filePath":"%s","fileName":"%s","startTime":%.3f,"trigger":"vlc","subtitle":{"available":false}}',
         json_escape(path), json_escape(filename), start_time
     )
 
