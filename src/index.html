@@ -13,12 +13,16 @@
     <div class="source-name" id="source-name" title="">no file loaded</div>
   </div>
 
+  <div id="body-row">
+  <div id="main-column">
+
   <div id="preview-wrap">
     <video id="preview" muted preload="auto"></video>
   </div>
 
   <div id="seek-row">
     <button class="frame-btn" id="play-pause-btn" title="Play/Pause (Space)">&#9654;</button>
+    <button class="frame-btn" id="screenshot-btn" title="Screenshot at current position">&#128247;</button>
     <input id="seek-bar" type="range" min="0" max="1000" value="0"
            aria-label="Seek position" />
   </div>
@@ -48,6 +52,9 @@
     </div>
     <div class="frame-time" id="frame-time">in 0:00.00 &nbsp;&rarr;&nbsp; out 0:00.00 &nbsp;(0:00.00)</div>
   </div>
+
+  </div>
+  <div id="sidebar">
 
   <div id="body">
 
@@ -147,8 +154,12 @@
     </button>
   </div>
 
+  </div>
+  </div>
+
 </div>
 
+<script src="lib/subtitles-octopus/subtitles-octopus.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

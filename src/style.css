@@ -56,6 +56,32 @@ html, body {
   height: 100vh;
 }
 
+/* Below the header: video + trim controls on the left (grows with the
+   window), settings as a fixed-width sidebar on the right — replaces the
+   earlier single vertical stack, which capped video height regardless of
+   how wide the window got. */
+#body-row {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  min-height: 0;
+}
+#main-column {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+#sidebar {
+  width: 280px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel2);
+  border-left: 1px solid var(--line);
+  min-height: 0;
+}
+
 /* ---------- header ---------- */
 #head {
   display: flex;
@@ -211,7 +237,7 @@ html, body {
 .handle-btn[aria-pressed="true"]::before { background: var(--red); box-shadow: 0 0 3px var(--red); }
 
 /* ---------- body / options ---------- */
-#body { padding: 8px 10px; overflow-y: auto; flex: 0 1 auto; }
+#body { padding: 8px 10px; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
 .section-label {
   font-size: 9px; letter-spacing: .09em; text-transform: uppercase;
   color: var(--dim); margin: 9px 0 5px; padding-top: 7px; border-top: 1px solid var(--line);
@@ -270,7 +296,7 @@ input[type="range"].input, input[type="range"]#seek-bar { accent-color: var(--re
 #export-row { display: flex; gap: 6px; padding: 7px 10px; border-top: 1px solid var(--line); background: var(--panel2); flex-shrink: 0; }
 #export-btn { flex: 1; }
 
-#status-row { display: flex; align-items: center; justify-content: space-between; padding: 0 10px 6px; gap: 8px; }
+#status-row { display: flex; align-items: center; justify-content: space-between; padding: 0 10px 6px; gap: 8px; flex-shrink: 0; }
 #status { font-size: 10px; color: var(--dim); min-height: 12px; font-family: var(--mono); word-break: break-word; flex: 1; }
 #status.busy { color: var(--red); }
 #status.error { color: var(--red); }

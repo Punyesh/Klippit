@@ -85,6 +85,19 @@ so you can iterate on the UI without a full Tauri build every time.
   quality-mode MP4 path in `export_mp4` from input-side `-ss` (fast, can
   misbehave on edit-list files) to output-side `-ss` (slower, always
   accurate).
+- ~~**Subtitle burn-in fails with "Unable to parse 'original_size'
+  option value '0x0'"**~~ — fixed, confirmed against a real failing case
+  (an MKV with embedded ASS subtitles + fonts). Root cause: ffmpeg's
+  `subtitles` filter needs to know the source's real resolution to
+  correctly scale ASS positioning, and its auto-detection of that failed
+  in our filter chain — likely because `scale` ran *before* `subtitles`,
+  leaving nothing for it to detect against by the time it ran. Two-part
+  fix: `get_video_metadata` now also reports width/height (via ffprobe),
+  which `subtitle_filter` passes through explicitly as `original_size=`
+  rather than relying on auto-detection at all; and both `export_mp4` and
+  `encode_gif_attempt` now apply `subtitles` *before* `scale` in the
+  filter chain, which is also just the more correct order regardless (ASS
+  coordinates are authored against the original resolution).
 - **`mpv-scripts/clip-trigger.lua`** — reads the app's path from a
   `KLIPPIT_PATH` environment variable (falling back to a placeholder that
   triggers a clear on-screen warning if unset), rather than a hardcoded
@@ -110,10 +123,15 @@ so you can iterate on the UI without a full Tauri build every time.
   window. **Not yet tested against a real double-trigger** — worth
   confirming pressing `c` twice in a row (on two different files, ideally)
   actually re-seeds the same window rather than doing something stranger.
-- **Screenshots** — intentionally *not* routed through this app. Bind
-  mpv's own `screenshot video` / `screenshot subtitles` commands to keys
-  directly in your `input.conf`; `extract_frame` in `main.rs` is only a
-  fallback for pulling a still outside of a live mpv session.
+- ~~**Screenshots routed through mpv's own commands instead of the
+  app**~~ — reversed that decision. `extract_frame` in `main.rs` already
+  existed but was never wired to a UI button; now it is (the small
+  camera icon next to Play/pause), reusing the same Subtitles on/off
+  toggle that governs export burn-in — "subs baked in or not" is the same
+  question either way. The original reasoning ("mpv already has
+  `screenshot video`/`screenshot subtitles`") was mpv-specific and broke
+  down once VLC entered the picture, since VLC's own screenshot function
+  doesn't offer that choice at all.
 
 ## Structure
 
@@ -121,7 +139,101 @@ so you can iterate on the UI without a full Tauri build every time.
 src/                    panel UI — HTML/CSS/JS, opens standalone in a browser
 src-tauri/              Tauri shell: Cargo.toml, tauri.conf.json, main.rs
 mpv-scripts/            Lua trigger script for mpv's scripts directory
+vlc-scripts/            Lua trigger scripts for VLC — see below
 ```
+
+## VLC support
+
+Klippit itself has no idea which player triggered it — the whole app
+just consumes a generic `--init <json>` payload, whatever produced it.
+Two VLC scripts were tried, in order:
+
+- **`klippit-intf.lua`** (interface script, single-keypress attempt) —
+  **tried and abandoned.** This aimed for the same one-key experience as
+  mpv, by observing VLC's internal `key-pressed` libvlc variable. Tested
+  against a real VLC install (standard videolan.org build) via both
+  `--intf luaintf` and the corrected `--extraintf luaintf` invocations,
+  with `--lua-intf klippit` pointing at the script — in both cases, no
+  `[klippit] interface script loaded` message ever appeared in VLC's
+  Messages window, meaning the script never loaded at all. Left in the
+  repo for reference/future investigation, but not the path actually
+  used.
+- **`klippit-extension.lua`** (extension, menu-triggered) — **the one
+  actually in use.** VLC's more standard, better-documented scripting
+  surface — auto-discovered from a folder, no Preferences configuration
+  needed. Trade-off versus mpv: triggered via View > Extensions > "Send
+  to Klippit" rather than a single keypress. Still fully
+  keyboard-reachable without a mouse (`Alt` → `V` for View → arrow to
+  Extensions → `Enter`), just multi-step instead of one key. Install by
+  copying to `%APPDATA%\vlc\lua\extensions\klippit.lua` (note:
+  `extensions`, not `intf` — a sibling folder) and restarting VLC; no
+  Preferences changes needed, it just shows up in the View menu.
+
+Both scripts read `KLIPPIT_PATH` the same way `clip-trigger.lua` does for
+mpv, and both share the same known gap: subtitle-track detection isn't
+implemented for the VLC path yet — they always report "no subtitles,"
+unlike the mpv script which properly detects the active track.
+
+If menu-clicking turns out to be too much friction in practice, the
+options discussed but not built are: an AutoHotkey global hotkey paired
+with VLC's built-in HTTP remote-control interface (more moving parts,
+but a real single keypress), or revisiting why `key-pressed` didn't fire
+(could be a Lua syntax error VLC swallowed silently, or a genuine
+behavior change in this VLC version versus whatever older examples of
+this technique were written against).
+
+## Layout: side-by-side editor, not a single vertical stack
+
+Restructured from one long vertical column (video → scrubber → all
+settings stacked below) into a proper editor layout: video + trim
+controls in a growing left column (`#main-column`), export settings as a
+fixed-width right sidebar (`#sidebar`, 280px). Window default/min size
+changed from portrait (480×720) to widescreen (900×620 default,
+700×480 minimum) to suit it.
+
+This was a pure CSS/HTML restructure — every element kept its existing
+`id`, just re-parented into new wrapping containers, so `app.js` needed
+zero changes. Verified at both the new default and minimum window sizes,
+including the tallest-content combination (Target-size mode + post-export
+action buttons visible), with no scrolling needed at either size.
+
+## Subtitle preview while editing (libass-wasm)
+
+A plain browser `<video>` element cannot render embedded ASS/SSA
+subtitle tracks from an MKV — this isn't a Klippit limitation, Chromium's
+media pipeline simply doesn't support it. Fixed properly rather than
+worked around: `src/lib/subtitles-octopus/` vendors
+[libass-wasm](https://github.com/libass/JavascriptSubtitlesOctopus)
+(libass — the same subtitle renderer mpv and VLC use internally —
+compiled to WebAssembly), which overlays correctly-styled subtitles onto
+the video element as a separate canvas layer, synced automatically to
+its play/pause/seek state.
+
+- **`extract_subtitles_for_preview`** (`main.rs`) pulls the first
+  subtitle stream out of the source file (converted to ASS regardless of
+  its original codec — SRT, SSA, whatever) plus any embedded font
+  attachments, as standalone temp files, since libass-wasm needs these as
+  separate inputs rather than reading them out of the video file itself.
+  **The attachment-dumping ffmpeg command (multiple `-dump_attachment`
+  flags batched into one call) is written from documented ffmpeg wiki
+  patterns, not yet confirmed against a real run** — if font extraction
+  comes back empty, that's the first place to check by running the
+  equivalent command by hand.
+- Shown whenever the source has subtitles, **independent of the export
+  burn-in toggle** — seeing dialogue timing is useful for trimming
+  regardless of whether you actually plan to burn subs into the final
+  export.
+- **Licensing note**: `libass-wasm`'s own wrapper code is MIT, but the
+  compiled WebAssembly binary bundles libass, FreeType, HarfBuzz, and
+  several fonts under a mix of licenses (LGPL, MIT, and a few others) —
+  see `src/lib/subtitles-octopus/COPYRIGHT` for the full compound
+  attribution, kept alongside the vendored files as required. This
+  doesn't affect Klippit's own MIT license, but if you ever redistribute
+  this project, that attribution file needs to stay with it.
+- Only the WebAssembly worker was vendored, not
+  `subtitles-octopus-worker-legacy.js` (a ~4.8MB non-WASM fallback for
+  ancient browsers) — WebView2 fully supports WebAssembly, so that file
+  would just be dead weight here.
 
 ## Post-export actions, progress, and a known video-preview quirk
 

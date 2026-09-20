@@ -40,6 +40,11 @@ struct ExportParams {
     output_dir: String,
     #[serde(default)]
     file_name: Option<String>, // user-editable filename (no extension) from the Output field
+    #[serde(default)]
+    source_width: u32,  // from get_video_metadata — needed so the subtitles
+    #[serde(default)]   // filter can be told original_size explicitly rather
+    source_height: u32, // than relying on auto-detection, which fails when
+                         // subtitles is applied after a scale filter
 }
 
 #[derive(Debug, Serialize)]
@@ -48,6 +53,8 @@ struct VideoMetadata {
     duration: f64,
     fps: f64,
     has_subtitles: bool,
+    width: u32,
+    height: u32,
 }
 
 // ---------- shared sidecar runner ----------
@@ -78,7 +85,7 @@ async fn run_bin(app: &AppHandle, name: &str, args: &[String]) -> Result<Vec<u8>
 async fn get_video_metadata(app: AppHandle, path: String) -> Result<VideoMetadata, String> {
     let stdout = run_bin(&app, "ffprobe", &[
         "-v".into(), "error".into(),
-        "-show_entries".into(), "format=duration:stream=r_frame_rate,codec_type".into(),
+        "-show_entries".into(), "format=duration:stream=r_frame_rate,codec_type,width,height".into(),
         "-of".into(), "default=noprint_wrappers=1".into(),
         path,
     ]).await?;
@@ -87,6 +94,8 @@ async fn get_video_metadata(app: AppHandle, path: String) -> Result<VideoMetadat
     let mut duration = 0.0;
     let mut fps = 24.0;
     let mut has_subtitles = false;
+    let mut width = 0u32;
+    let mut height = 0u32;
 
     for line in text.lines() {
         if let Some(v) = line.strip_prefix("duration=") {
@@ -100,10 +109,19 @@ async fn get_video_metadata(app: AppHandle, path: String) -> Result<VideoMetadat
             }
         } else if line.contains("codec_type=subtitle") {
             has_subtitles = true;
+        } else if let Some(v) = line.strip_prefix("width=") {
+            // Only the first video stream's width/height — a file with an
+            // attached cover-art image (itself reported as a "video"
+            // stream by ffprobe) could otherwise clobber the real
+            // dimensions if it happened to come first, but that's an
+            // edge case not handled here.
+            if width == 0 { width = v.trim().parse().unwrap_or(0); }
+        } else if let Some(v) = line.strip_prefix("height=") {
+            if height == 0 { height = v.trim().parse().unwrap_or(0); }
         }
     }
 
-    Ok(VideoMetadata { duration, fps, has_subtitles })
+    Ok(VideoMetadata { duration, fps, has_subtitles, width, height })
 }
 
 // Strips characters Windows won't allow in a filename, and drops a
@@ -197,13 +215,28 @@ fn subtitle_filter(params: &ExportParams) -> Option<String> {
     // with a trimmed clip instead of drifting by `in_time` seconds.
     // itsoffset/setpts adjustments are only needed here if subs come from
     // a *separate* external file not already aligned with the video's PTS.
-    Some(format!("subtitles='{}'", params.file_path.replace('\'', "\\'")))
+    let mut filter = format!("subtitles='{}'", params.file_path.replace('\'', "\\'"));
+    // Explicitly telling the filter the source's real resolution avoids a
+    // real bug hit in testing: ffmpeg's auto-detection of this can fail
+    // ("Unable to parse 'original_size' option value '0x0'") depending on
+    // where in the filter chain subtitles sits — passing it explicitly
+    // sidesteps that regardless of the exact cause. Falls back to no
+    // explicit size (the old, sometimes-broken auto-detect behavior) only
+    // if metadata genuinely wasn't available.
+    if params.source_width > 0 && params.source_height > 0 {
+        filter.push_str(&format!(":original_size={}x{}", params.source_width, params.source_height));
+    }
+    Some(filter)
 }
 
 async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str) -> Result<(), String> {
     let mut filters: Vec<String> = vec![];
-    if let Some(f) = scale_filter(params.resolution) { filters.push(f); }
+    // Subtitles before scale: burns onto the original-resolution frame,
+    // matching the coordinates the ASS/SSA styling was authored against,
+    // then scale runs afterward on the already-burned-in frame. Also
+    // avoids the original_size auto-detection bug noted in subtitle_filter.
     if let Some(f) = subtitle_filter(params) { filters.push(f); }
+    if let Some(f) = scale_filter(params.resolution) { filters.push(f); }
     let vf = if filters.is_empty() { None } else { Some(filters.join(",")) };
 
     if params.mode == "size" {
@@ -304,8 +337,13 @@ async fn export_gif(app: &AppHandle, params: &ExportParams, duration: f64, out_p
 }
 
 async fn encode_gif_attempt(app: &AppHandle, params: &ExportParams, duration: f64, width: u32, fps: u32, out_path: &str) -> Result<(), String> {
-    let mut base_filters = vec![format!("fps={fps}"), format!("scale={width}:-2:flags=lanczos")];
+    // Same ordering fix as export_mp4: subtitles before scale, so the
+    // filter burns onto the original-resolution frame rather than an
+    // already-downscaled one — both for correct ASS positioning and to
+    // avoid the original_size auto-detection failure (see subtitle_filter).
+    let mut base_filters = vec![format!("fps={fps}")];
     if let Some(f) = subtitle_filter(params) { base_filters.push(f); }
+    base_filters.push(format!("scale={width}:-2:flags=lanczos"));
     let base = base_filters.join(",");
 
     let palette = format!("{out_path}.palette.png");
@@ -335,7 +373,7 @@ async fn encode_gif_attempt(app: &AppHandle, params: &ExportParams, duration: f6
 // fallback for extracting a still via ffmpeg if a screenshot is ever
 // requested outside of an active mpv session.
 #[tauri::command]
-async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, out_path: String) -> Result<String, String> {
+async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, out_path: String, source_width: u32, source_height: u32) -> Result<String, String> {
     let out_path = expand_tilde(&out_path);
     if let Some(parent) = std::path::Path::new(&out_path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("couldn't create output folder: {e}"))?;
@@ -345,12 +383,122 @@ async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, o
         "-frames:v".into(), "1".into(),
     ];
     if burn_subs {
+        // Same original_size fix as subtitle_filter() in the export path —
+        // a screenshot has no scale filter ahead of it (the actual trigger
+        // for that bug elsewhere), so auto-detection likely would have
+        // worked fine here regardless, but passing it explicitly is free
+        // and removes any doubt.
+        let mut filter = format!("subtitles='{}'", path.replace('\'', "\\'"));
+        if source_width > 0 && source_height > 0 {
+            filter.push_str(&format!(":original_size={source_width}x{source_height}"));
+        }
         args.push("-vf".into());
-        args.push(format!("subtitles='{}'", path.replace('\'', "\\'")));
+        args.push(filter);
     }
     args.push(out_path.clone());
     run_bin(&app, "ffmpeg", &args).await?;
     Ok(out_path)
+}
+
+#[derive(Debug, Serialize)]
+struct SubtitlePreviewData {
+    ass_path: String,
+    font_paths: Vec<String>,
+}
+
+// Extracts the first subtitle stream (converted to ASS regardless of its
+// source codec — SRT, SSA, whatever) plus any embedded font attachments,
+// as standalone temp files. This is for the live EDITING preview only:
+// a plain browser <video> element cannot render embedded ASS/SSA tracks
+// from an MKV at all (not a bug — Chromium's media pipeline just doesn't
+// support it), so libass-wasm (subtitles-octopus.js, vendored under
+// src/lib/) renders them separately as an overlay, reading these
+// extracted files directly rather than trying to pull subtitles out of
+// the video element itself.
+//
+// STATUS: the attachment-dumping command construction here (multiple
+// -dump_attachment:INDEX flags batched into one ffmpeg call) is written
+// from documented ffmpeg wiki patterns, not yet confirmed against a real
+// run — if font extraction silently returns nothing, that command is the
+// first place to check by running it manually in a terminal.
+#[tauri::command]
+async fn extract_subtitles_for_preview(app: AppHandle, path: String) -> Result<SubtitlePreviewData, String> {
+    let sub_index_stdout = run_bin(&app, "ffprobe", &[
+        "-v".into(), "error".into(),
+        "-select_streams".into(), "s".into(),
+        "-show_entries".into(), "stream=index".into(),
+        "-of".into(), "csv=p=0".into(),
+        path.clone(),
+    ]).await?;
+    let sub_index = String::from_utf8_lossy(&sub_index_stdout)
+        .lines()
+        .next()
+        .and_then(|l| l.trim().parse::<u32>().ok())
+        .ok_or_else(|| "no subtitle stream found".to_string())?;
+
+    let temp_dir = std::env::temp_dir().join(format!("klippit-subs-{}", std::process::id()));
+    // Clear any leftovers from a previously previewed file in this same
+    // session (switching files via single-instance re-seed) rather than
+    // letting old fonts/ass files accumulate here indefinitely.
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+    let ass_path = temp_dir.join("preview.ass");
+
+    run_bin(&app, "ffmpeg", &[
+        "-y".into(), "-i".into(), path.clone(),
+        "-map".into(), format!("0:{sub_index}"),
+        "-c:s".into(), "ass".into(),
+        ass_path.to_string_lossy().to_string(),
+    ]).await?;
+
+    // Font attachments: best-effort. A file with none (or fonts already
+    // present on the system) still works, just with less accurate font
+    // matching in the overlay.
+    let font_probe = run_bin(&app, "ffprobe", &[
+        "-v".into(), "error".into(),
+        "-select_streams".into(), "t".into(),
+        "-show_entries".into(), "stream=index:stream_tags=filename".into(),
+        "-of".into(), "csv=p=0".into(),
+        path.clone(),
+    ]).await.unwrap_or_default();
+
+    let mut dump_args: Vec<String> = vec!["-y".into()];
+    let mut pending: Vec<std::path::PathBuf> = vec![];
+    for line in String::from_utf8_lossy(&font_probe).lines() {
+        let mut parts = line.splitn(2, ',');
+        let (Some(idx_str), Some(filename)) = (parts.next(), parts.next()) else { continue };
+        let Ok(idx) = idx_str.trim().parse::<u32>() else { continue };
+        let filename = filename.trim();
+        // Reject anything that looks like a path rather than a bare
+        // filename — these come from the file's own (untrusted) tag data.
+        if filename.is_empty() || filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+            continue;
+        }
+        let out_font = temp_dir.join(filename);
+        dump_args.push(format!("-dump_attachment:{idx}"));
+        dump_args.push(out_font.to_string_lossy().to_string());
+        pending.push(out_font);
+    }
+
+    let mut font_paths = vec![];
+    if !pending.is_empty() {
+        dump_args.push("-i".into());
+        dump_args.push(path.clone());
+        dump_args.push("-f".into());
+        dump_args.push("null".into());
+        dump_args.push("-".into());
+        let _ = run_bin(&app, "ffmpeg", &dump_args).await; // best-effort
+        for p in pending {
+            if p.exists() {
+                font_paths.push(p.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    Ok(SubtitlePreviewData {
+        ass_path: ass_path.to_string_lossy().to_string(),
+        font_paths,
+    })
 }
 
 // Opens a small dedicated window playing the given file, with native
@@ -434,8 +582,8 @@ fn main() {
                 tauri::WebviewUrl::App("index.html".into()),
             )
             .title("Klippit")
-            .inner_size(480.0, 720.0)
-            .min_inner_size(420.0, 660.0)
+            .inner_size(900.0, 620.0)
+            .min_inner_size(700.0, 480.0)
             .resizable(true)
             .always_on_top(true);
 
@@ -451,6 +599,7 @@ fn main() {
             get_video_metadata,
             export_clip,
             extract_frame,
+            extract_subtitles_for_preview,
             open_review_window
         ])
         .run(tauri::generate_context!())

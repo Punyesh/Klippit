@@ -34,7 +34,9 @@ var state = {
   gifFps: 24,
   targetMb: 10,
   outputDir: '~/Videos/Clips',
-  outputFileName: '' // populated once we know the source filename — see updateDefaultFilename()
+  outputFileName: '', // populated once we know the source filename — see updateDefaultFilename()
+  sourceWidth: 0,
+  sourceHeight: 0
 };
 
 var MED_STEP = 5;
@@ -119,7 +121,7 @@ function step(deltaFrames) {
   setHandleTime(state.activeHandle, timeOfFrame(next));
 }
 
-function setHandleTime(which, t) {
+function setHandleTime(which, t, skipSeek) {
   t = clamp(t, 0, state.duration);
   if (which === 'in') {
     state.inTime = Math.min(t, state.outTime);
@@ -128,7 +130,12 @@ function setHandleTime(which, t) {
   }
   // Scrub the preview to whichever point was just touched, so clicking a
   // frame-step button doubles as a visual check of where you landed.
-  video.currentTime = which === 'in' ? state.inTime : state.outTime;
+  // skipSeek is set by the timeupdate listener below, where
+  // video.currentTime is already the source of the change — re-assigning
+  // it there would just interrupt playback with a redundant seek.
+  if (!skipSeek) {
+    video.currentTime = which === 'in' ? state.inTime : state.outTime;
+  }
   render();
 }
 
@@ -168,6 +175,34 @@ playPauseBtn.onclick = togglePlayback;
 video.addEventListener('play', function () { playPauseBtn.innerHTML = '&#10074;&#10074;'; });
 video.addEventListener('pause', function () { playPauseBtn.innerHTML = '&#9654;'; });
 
+// ---------- screenshot ----------
+// Reuses the same Subtitles on/off toggle that governs export burn-in —
+// "do you want subs baked in" is the same question whether it's a still
+// or a clip, so one control covers both rather than a second near-duplicate.
+var screenshotBtn = document.getElementById('screenshot-btn');
+screenshotBtn.onclick = function () {
+  if (!init.filePath || !window.__TAURI__) {
+    setStatus('screenshot needs a real file + Tauri backend (not available in dev preview)', 'error');
+    return;
+  }
+  var stem = (init.fileName && init.fileName.indexOf('(no file') !== 0) ? fileStem(init.fileName) : 'clip';
+  var outPath = state.outputDir.replace(/[\\/]+$/, '') + '/' + stem + '_' + video.currentTime.toFixed(2) + '.png';
+
+  setStatus('capturing screenshot…', 'busy');
+  window.__TAURI__.core.invoke('extract_frame', {
+    path: init.filePath,
+    at: video.currentTime,
+    burnSubs: state.burnSubs,
+    outPath: outPath,
+    sourceWidth: state.sourceWidth,
+    sourceHeight: state.sourceHeight
+  }).then(function (path) {
+    setStatus('screenshot saved — ' + path, 'done');
+  }).catch(function (err) {
+    setStatus('screenshot failed: ' + err, 'error');
+  });
+};
+
 // ---------- draggable trim handles (mouse) ----------
 function makeDraggable(handle, which) {
   handle.addEventListener('pointerdown', function (e) {
@@ -203,6 +238,13 @@ seekBar.addEventListener('input', function () {
 });
 video.addEventListener('timeupdate', function () {
   if (state.duration) seekBar.value = (video.currentTime / state.duration) * 1000;
+  // Whichever handle is armed (In or Out) follows video.currentTime for
+  // any reason it changes — playback advancing, dragging the seek bar,
+  // frame-stepping, or dragging a trim handle. This is what makes
+  // pressing Play actually move the armed point instead of just playing
+  // disconnected from editing: press Play, watch, press Pause/Space
+  // right when you want that point, and it's already set.
+  setHandleTime(state.activeHandle, video.currentTime, true);
 });
 
 // ---------- format / subtitle / mode toggles ----------
@@ -274,12 +316,53 @@ function loadMetadata() {
   window.__TAURI__.core.invoke('get_video_metadata', { path: init.filePath }).then(function (meta) {
     state.duration = meta.duration;
     state.fps = meta.fps || state.fps;
+    state.sourceWidth = meta.width || 0;
+    state.sourceHeight = meta.height || 0;
     if (!meta.hasSubtitles) {
       disableSubtitleControls('No subtitle stream detected');
+      disposeSubtitleOverlay();
+    } else {
+      loadSubtitleOverlay();
     }
     render();
   }).catch(function (err) {
     setStatus('failed to read video metadata: ' + err, 'error');
+  });
+}
+
+// ---------- subtitle preview overlay (libass-wasm) ----------
+// A plain <video> element cannot render embedded ASS/SSA tracks from an
+// MKV at all — not a bug, Chromium's media pipeline just doesn't support
+// it. subtitles-octopus.js (libass compiled to WebAssembly, vendored
+// under src/lib/) renders them as a separate overlay synced to the same
+// video element instead. Shown whenever the source has subtitles,
+// independent of the export burn-in toggle — seeing dialogue timing is
+// useful for trimming regardless of whether you plan to burn subs into
+// the final export.
+var octopusInstance = null;
+function disposeSubtitleOverlay() {
+  if (octopusInstance) {
+    try { octopusInstance.dispose(); } catch (e) { /* already gone */ }
+    octopusInstance = null;
+  }
+}
+function loadSubtitleOverlay() {
+  disposeSubtitleOverlay();
+  window.__TAURI__.core.invoke('extract_subtitles_for_preview', { path: init.filePath }).then(function (data) {
+    var convert = window.__TAURI__.core.convertFileSrc;
+    octopusInstance = new SubtitlesOctopus({
+      video: video,
+      subUrl: convert(data.assPath),
+      fonts: data.fontPaths.map(convert),
+      workerUrl: 'lib/subtitles-octopus/subtitles-octopus-worker.js',
+      onError: function (err) {
+        console.log('[klippit] subtitle overlay error:', err);
+      }
+    });
+  }).catch(function (err) {
+    // Non-fatal — editing still works fine without the subtitle overlay,
+    // this just means you won't see dialogue timing while trimming.
+    console.log('[klippit] subtitle preview extraction failed:', err);
   });
 }
 
@@ -314,7 +397,9 @@ function exportClip() {
     gifFps: state.gifFps,
     targetMb: state.targetMb,
     outputDir: state.outputDir,
-    fileName: state.outputFileName
+    fileName: state.outputFileName,
+    sourceWidth: state.sourceWidth,
+    sourceHeight: state.sourceHeight
   };
   setStatus('exporting…', 'busy');
   statusActions.style.display = 'none';
@@ -389,8 +474,11 @@ function applyInit(newInit) {
   state.activeHandle = 'in';
   filenameManuallyEdited = false;
   lastExportedPath = null;
+  state.sourceWidth = 0;
+  state.sourceHeight = 0;
   statusActions.style.display = 'none';
   setStatus('', '');
+  disposeSubtitleOverlay(); // old file's overlay shouldn't linger over the new video
 
   // Subtitle controls: re-enable by default, loadMetadata() below will
   // disable them again if this particular file genuinely has none.
