@@ -14,7 +14,7 @@
 // or not you launched this from mpv. Metadata/export/dialog/close calls
 // below, on the other hand, are wired to the real Tauri backend.
 var init = window.__KLIPPIT_INIT__ || {
-  filePath: '',
+  filePath: 'C:\Users\Punyesh\Downloads\Video\Sentenced.mp4',
   fileName: '(no file — dev preview mode)',
   startTime: 12.0,
   subtitleAvailable: false
@@ -184,17 +184,19 @@ bindSeg('mode-quality', 'mode-size', function (id) {
   document.getElementById('panel-size').style.display = state.mode === 'size' ? 'block' : 'none';
 });
 
-var subsToggle = document.getElementById('subs-toggle');
-subsToggle.onclick = function () {
-  state.burnSubs = subsToggle.getAttribute('aria-checked') !== 'true';
-  subsToggle.setAttribute('aria-checked', String(state.burnSubs));
-};
-subsToggle.addEventListener('keydown', function (e) {
-  if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); subsToggle.click(); }
+bindSeg('subs-off', 'subs-on', function (id) {
+  state.burnSubs = id === 'subs-on';
 });
+var subsOffBtn = document.getElementById('subs-off');
+var subsOnBtn = document.getElementById('subs-on');
+var subsStatus = document.getElementById('subs-status');
+function disableSubtitleControls(message) {
+  subsOffBtn.disabled = true;
+  subsOnBtn.disabled = true;
+  subsStatus.textContent = message;
+}
 if (!init.subtitleAvailable) {
-  subsToggle.disabled = true;
-  document.getElementById('subs-label').textContent = 'No active subtitle track detected';
+  disableSubtitleControls('No active subtitle track detected');
 }
 
 // ---------- size presets ----------
@@ -235,8 +237,7 @@ function loadMetadata() {
     state.duration = meta.duration;
     state.fps = meta.fps || state.fps;
     if (!meta.hasSubtitles) {
-      subsToggle.disabled = true;
-      document.getElementById('subs-label').textContent = 'No subtitle stream detected';
+      disableSubtitleControls('No subtitle stream detected');
     }
     render();
   }).catch(function (err) {

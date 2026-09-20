@@ -1,21 +1,23 @@
 /* Klippit — panel styling
-   Design tokens and component patterns ported directly from sakuga-enhancer.js
-   (amber-on-charcoal, monospace accents, same toggle/tab/frame-bar shapes)
-   so this feels like the same app family, just in a native window instead
-   of a page overlay. */
+   "Tape deck / broadcast monitor" identity: true video-black, one tally-
+   red accent (the record-light color, tying directly to marking in/out
+   points), monospace timecodes, system UI font for labels so it reads as
+   a native Windows utility rather than a web page in a window frame.
+   Sharp rectangular controls throughout — no pill shapes, no iOS-style
+   switches — closer to labeled buttons on a hardware panel. */
 
 :root {
-  --bg: #15130f;
-  --panel: #1c1a15;
-  --panel2: #242119;
-  --line: #3a3527;
-  --text: #eae4d3;
-  --dim: #9c9581;
-  --amber: #ffb020;
-  --amber-dim: #7a5a1e;
-  --red: #d9634a;
-  --link: #6db3f2;
-  --focus: #ffb020;
+  --bg: #0b0c0e;
+  --panel: #16171a;
+  --panel2: #1c1e22;
+  --line: #2b2e33;
+  --text: #e7e9ec;
+  --dim: #7d828a;
+  --red: #e0342c;
+  --red-dim: #401512;
+  --focus: #e0342c;
+  --mono: "JetBrains Mono", "SFMono-Regular", Consolas, Menlo, monospace;
+  --sans: "Segoe UI", system-ui, -apple-system, sans-serif;
 }
 
 * { box-sizing: border-box; }
@@ -25,21 +27,15 @@ html, body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: "Neue Haas Grotesk", "Helvetica Neue", Arial, sans-serif;
+  font-family: var(--sans);
   font-size: 13px;
-  /* Native window, not a page overlay — no drag handle/resize corners needed,
-     the OS window chrome already provides that. */
   user-select: none;
 }
 
-/* Visible, on-brand focus ring everywhere — this replaces the browser
-   default outline, it does not remove focus indication. Every interactive
-   element in this file relies on a real <button>/<input>, so this one rule
-   covers keyboard navigation for the whole panel. */
 :focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
-  border-radius: 3px;
+  border-radius: 2px;
 }
 
 #app {
@@ -53,18 +49,33 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 14px;
+  padding: 9px 14px;
   border-bottom: 1px solid var(--line);
   background: var(--panel2);
 }
 #head .brand {
-  font-family: "Courier New", monospace;
+  font-family: var(--mono);
   font-size: 12px;
-  color: var(--dim);
-  letter-spacing: 1px;
+  color: var(--text);
+  letter-spacing: 2px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
 }
-#head .brand b { color: var(--amber); }
+/* The record-light dot: a fixed presence in the brand mark, not a
+   one-word color accent — this is the same red used everywhere an
+   in/out point gets armed, so the wordmark itself reads as "this app
+   marks recordings." */
+#head .brand::before {
+  content: "";
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--red);
+  box-shadow: 0 0 4px var(--red);
+  flex-shrink: 0;
+}
 #head .source-name {
+  font-family: var(--mono);
   font-size: 11px;
   color: var(--dim);
   max-width: 320px;
@@ -85,7 +96,7 @@ html, body {
 }
 #preview { max-width: 100%; max-height: 100%; display: block; }
 
-/* Seek scrubber (whole-file position, distinct from the in/out trim range) */
+/* Seek scrubber */
 #seek-row {
   padding: 8px 14px 4px;
   background: var(--panel2);
@@ -94,154 +105,155 @@ html, body {
 #seek-bar {
   -webkit-appearance: none;
   width: 100%;
-  height: 4px;
-  border-radius: 2px;
+  height: 3px;
+  border-radius: 0;
   background: var(--line);
   cursor: pointer;
 }
 #seek-bar::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 12px; height: 12px;
-  border-radius: 50%;
-  background: var(--amber);
+  width: 10px; height: 14px;
+  border-radius: 1px;
+  background: var(--text);
   cursor: pointer;
-  margin-top: -4px;
+  margin-top: -5.5px;
 }
 #seek-bar::-moz-range-thumb {
-  width: 12px; height: 12px; border: none; border-radius: 50%;
-  background: var(--amber); cursor: pointer;
+  width: 10px; height: 14px; border: none; border-radius: 1px;
+  background: var(--text); cursor: pointer;
 }
 
-/* Trim range track: full duration bar with in/out handles + shaded middle */
+/* Trim range track — styled like a tape counter/ruler: tick marks along
+   the bottom edge rather than a plain rounded bar. */
 #trim-track {
   position: relative;
-  height: 20px;
+  height: 22px;
   margin: 6px 0 2px;
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 3px;
+  background-image: repeating-linear-gradient(
+    to right, var(--line) 0, var(--line) 1px, transparent 1px, transparent 12.5%
+  );
+  background-position: 0 bottom;
+  background-size: 100% 5px;
+  background-repeat: no-repeat repeat;
 }
 #trim-range {
   position: absolute;
   top: 0; bottom: 0;
-  background: var(--amber-dim);
-  border-left: 1px solid var(--amber);
-  border-right: 1px solid var(--amber);
+  background: var(--red-dim);
+  border-left: 1px solid var(--red);
+  border-right: 1px solid var(--red);
 }
 .trim-handle {
   position: absolute;
   top: -3px;
-  width: 10px; height: 26px;
+  width: 9px; height: 28px;
   background: var(--panel);
-  border: 1px solid var(--amber);
-  border-radius: 2px;
+  border: 1px solid var(--red);
+  border-radius: 0;
   cursor: ew-resize;
   transform: translateX(-50%);
 }
-.trim-handle:hover, .trim-handle:focus-visible { background: var(--amber-dim); }
+.trim-handle:hover, .trim-handle:focus-visible { background: var(--red-dim); }
 .trim-handle .lbl {
   position: absolute; top: -18px; left: 50%; transform: translateX(-50%);
-  font-size: 9px; color: var(--dim); font-family: "Courier New", monospace;
+  font-size: 9px; color: var(--dim); font-family: var(--mono);
   white-space: nowrap;
 }
 
-/* ---------- frame bar (ported 1:1 from sk-frame-bar) ---------- */
+/* ---------- frame bar ---------- */
 .frame-bar { padding: 8px 14px; background: var(--panel2); border-top: 1px solid var(--line); }
 .frame-row { display: flex; align-items: center; gap: 4px; }
 .frame-btn {
   background: var(--bg); border: 1px solid var(--line); color: var(--text);
-  border-radius: 4px; padding: 6px 10px; font-size: 13px; cursor: pointer;
-  font-family: "Courier New", monospace;
+  border-radius: 2px; padding: 6px 10px; font-size: 13px; cursor: pointer;
+  font-family: var(--mono);
 }
-.frame-btn:hover { border-color: var(--amber); color: var(--amber); }
+.frame-btn:hover { border-color: var(--red); color: var(--red); }
 .frame-btn:disabled { opacity: .35; cursor: default; }
 .frame-count {
-  flex: 1; text-align: center; font-size: 13px; font-weight: bold;
-  color: var(--amber); font-family: "Courier New", monospace;
+  flex: 1; text-align: center; font-size: 13px; font-weight: 600;
+  color: var(--text); font-family: var(--mono); letter-spacing: .5px;
 }
-.frame-time { text-align: center; font-size: 11px; color: var(--dim); margin-top: 5px; }
+.frame-time { text-align: center; font-size: 11px; color: var(--dim); margin-top: 5px; font-family: var(--mono); }
 
-/* Which handle (In / Out) the frame bar currently nudges */
+/* Which handle (In / Out) the frame bar currently arms — a lit dot marks
+   the armed one, echoing a tape deck's record-arm indicator. */
 .handle-select { display: flex; gap: 6px; margin-bottom: 8px; }
 .handle-btn {
   flex: 1; padding: 6px 0; text-align: center; font-size: 11px;
-  letter-spacing: .04em; text-transform: uppercase; cursor: pointer;
-  color: var(--dim); background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+  letter-spacing: .08em; cursor: pointer; font-family: var(--mono);
+  color: var(--dim); background: var(--bg); border: 1px solid var(--line); border-radius: 2px;
+  display: flex; align-items: center; justify-content: center; gap: 6px;
 }
-.handle-btn[aria-pressed="true"] { color: var(--amber); border-color: var(--amber); background: var(--amber-dim); }
+.handle-btn::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--line); flex-shrink: 0;
+}
+.handle-btn[aria-pressed="true"] { color: var(--text); border-color: var(--red); background: var(--red-dim); }
+.handle-btn[aria-pressed="true"]::before { background: var(--red); box-shadow: 0 0 4px var(--red); }
 
 /* ---------- body / options ---------- */
 #body { padding: 12px 14px; overflow-y: auto; }
 .section-label {
-  font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+  font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
   color: var(--dim); margin: 14px 0 8px; padding-top: 10px; border-top: 1px solid var(--line);
+  font-family: var(--mono);
 }
 .section-label:first-child { margin-top: 0; padding-top: 0; border-top: none; }
 
-/* Segmented / toggle button groups (format, mode tabs, quality presets) —
-   real <button aria-pressed> elements, not styled divs, so they're
-   focusable and Space/Enter-operable with no extra wiring. */
+/* Segmented button groups — the one control shape used for every binary
+   or multi-way choice (format, subtitles, mode, handle select), rather
+   than mixing in a separate switch-shaped widget. */
 .seg-group { display: flex; gap: 6px; }
 .seg-btn {
   flex: 1; padding: 8px 6px; text-align: center; font-size: 12px;
   color: var(--dim); background: var(--bg); border: 1px solid var(--line);
-  border-radius: 4px; cursor: pointer;
+  border-radius: 2px; cursor: pointer; font-family: var(--sans);
 }
-.seg-btn[aria-pressed="true"] { color: var(--amber); border-color: var(--amber); background: var(--amber-dim); }
-.seg-btn:hover:not([aria-pressed="true"]) { border-color: var(--amber); color: var(--text); }
-
-/* Real toggle switch — <button role="switch" aria-checked> underneath the
-   same visual skin as sk-toggle-switch, so it's keyboard-operable natively. */
-.toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; }
-.toggle-label { font-size: 12px; color: var(--text); }
-.toggle-switch {
-  position: relative; width: 32px; height: 17px; border-radius: 9px;
-  background: var(--line); border: none; cursor: pointer; padding: 0; flex-shrink: 0;
-}
-.toggle-switch[aria-checked="true"] { background: var(--amber-dim); }
-.toggle-knob {
-  position: absolute; top: 2px; left: 2px; width: 13px; height: 13px;
-  border-radius: 50%; background: var(--dim); transition: left .15s ease, background .15s ease;
-}
-.toggle-switch[aria-checked="true"] .toggle-knob { left: 17px; background: var(--amber); }
+.seg-btn[aria-pressed="true"] { color: var(--text); border-color: var(--red); background: var(--red-dim); }
+.seg-btn:hover:not([aria-pressed="true"]) { border-color: var(--dim); color: var(--text); }
 
 .row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
 .field { flex: 1; }
 .field label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 4px; }
 .input, select.input {
   width: 100%; background: var(--bg); border: 1px solid var(--line); color: var(--text);
-  padding: 7px 9px; border-radius: 4px; font-size: 13px; outline: none;
+  padding: 7px 9px; border-radius: 2px; font-size: 13px; outline: none; font-family: var(--sans);
 }
-.input:focus { border-color: var(--amber); }
+.input:focus { border-color: var(--red); }
+input[type="range"].input, input[type="range"]#seek-bar { accent-color: var(--red); }
 
 .preset-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
 .preset-btn {
   background: var(--bg); border: 1px solid var(--line); color: var(--text);
-  padding: 6px 10px; border-radius: 20px; font-size: 11px; cursor: pointer;
-  font-family: "Courier New", monospace;
+  padding: 6px 10px; border-radius: 2px; font-size: 11px; cursor: pointer;
+  font-family: var(--mono);
 }
-.preset-btn[aria-pressed="true"] { border-color: var(--amber); color: var(--amber); background: var(--amber-dim); }
+.preset-btn[aria-pressed="true"] { border-color: var(--red); color: var(--text); background: var(--red-dim); }
 
 /* ---------- output + export ---------- */
 #output-row { display: flex; gap: 6px; align-items: center; }
 #output-path {
-  flex: 1; font-size: 11px; color: var(--dim); font-family: "Courier New", monospace;
+  flex: 1; font-size: 11px; color: var(--dim); font-family: var(--mono);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 7px 9px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 2px; padding: 7px 9px;
 }
 .btn {
-  background: var(--amber-dim); border: 1px solid var(--amber); color: var(--amber);
-  padding: 8px 14px; border-radius: 4px; font-size: 12px; cursor: pointer; font-weight: bold;
+  background: var(--red-dim); border: 1px solid var(--red); color: var(--text);
+  padding: 8px 14px; border-radius: 2px; font-size: 12px; cursor: pointer; font-weight: 600;
+  font-family: var(--sans);
 }
-.btn:hover { background: var(--amber); color: #1a1509; }
+.btn:hover { background: var(--red); color: #0b0c0e; }
 .btn:disabled { opacity: .4; cursor: default; }
 .btn.secondary { background: transparent; color: var(--dim); border-color: var(--line); font-weight: normal; }
-.btn.secondary:hover { border-color: var(--amber); color: var(--amber); background: transparent; }
+.btn.secondary:hover { border-color: var(--dim); color: var(--text); background: transparent; }
 
 #export-row { display: flex; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--line); background: var(--panel2); }
 #export-btn { flex: 1; }
 
-#status { padding: 0 14px 10px; font-size: 11px; color: var(--dim); min-height: 14px; }
-#status.busy { color: var(--amber); }
+#status { padding: 0 14px 10px; font-size: 11px; color: var(--dim); min-height: 14px; font-family: var(--mono); }
+#status.busy { color: var(--red); }
 #status.error { color: var(--red); }
 #status.done { color: var(--text); }

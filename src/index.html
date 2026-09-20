@@ -9,7 +9,7 @@
 <div id="app">
 
   <div id="head">
-    <div class="brand"><b>K</b>LIPPIT</div>
+    <div class="brand">KLIPPIT</div>
     <div class="source-name" id="source-name" title="">no file loaded</div>
   </div>
 
@@ -57,13 +57,11 @@
     </div>
 
     <div class="section-label">Subtitles</div>
-    <div class="toggle-row">
-      <span class="toggle-label" id="subs-label">Burn in current subtitle track</span>
-      <button class="toggle-switch" id="subs-toggle" role="switch" aria-checked="false"
-              aria-labelledby="subs-label">
-        <span class="toggle-knob"></span>
-      </button>
+    <div class="seg-group" role="group" aria-label="Burn in current subtitle track" id="subs-group">
+      <button class="seg-btn" id="subs-off" aria-pressed="true">Off</button>
+      <button class="seg-btn" id="subs-on" aria-pressed="false">Burn in</button>
     </div>
+    <div class="frame-time" id="subs-status" style="text-align:left;margin-top:4px"></div>
 
     <div class="section-label">Optimization</div>
     <div class="seg-group" role="group" aria-label="Optimization mode">
