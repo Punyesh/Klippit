@@ -7,36 +7,53 @@ system; backend uses native `ffmpeg`/`ffprobe` instead of `ffmpeg.wasm`.
 **Status: scaffold, not yet built or run.** This container has no display
 and no Rust/Tauri toolchain installed, so none of this has been compiled
 or visually checked — treat it as a structured starting point, not a
-finished build. Everything below is real, working logic *conceptually*
-(the panel HTML/CSS/JS runs fine standalone in a browser today), but the
-Tauri↔JS wiring and the mpv↔app handoff are stubbed with `TODO(tauri)`
-comments where they need your machine to actually finish them.
+finished build. The panel↔backend wiring (metadata, export, folder
+picker, closing the window) is real, written-through code now, not stubs —
+but it's untested against an actual compile, and the mpv↔app handoff
+(reading `--init` and getting it into the webview) is still unbuilt.
 
 ## What works right now, standalone
 
 Open `src/index.html` directly in a browser. The whole panel is
 interactive: format/subtitle/mode toggles, the frame bar, draggable trim
 handles, keyboard nudging (`,` / `.`, arrow keys on a focused handle,
-`Enter`/`Escape`). It falls back to dev-preview values since there's no
-mpv or Tauri backing it yet — `Export` logs its params to the console
-instead of calling ffmpeg.
+`Enter`/`Escape`). With no `window.__TAURI__` present (i.e. a plain
+browser tab), it falls back to dev-preview values and `Export` just logs
+its params to the console — that fallback path is intentional, not a bug,
+so you can iterate on the UI without a full Tauri build every time.
 
-## What's stubbed and needs wiring
+## What's real now vs. still unbuilt
 
-- **`app.js`** — every `TODO(tauri)` marks a spot that currently fakes
-  something the real Tauri APIs would do: the save-folder dialog,
-  `invoke('get_video_metadata', …)`, `invoke('export_clip', …)`, and
-  closing the window. These are one-line swaps once you scaffold this with
-  `tauri init` (or drop these files into that structure) and `window.__TAURI__`
-  is actually present.
-- **`src-tauri/src/main.rs`** — the real logic: ffprobe for metadata,
-  ffmpeg for MP4 (quality mode + 2-pass target-size mode) and GIF
-  (palette gen/use, with iterative width/fps backoff in target-size mode)
-  export, subtitle burn-in with PTS-aligned trimming. This hasn't been
-  compiled — check argument syntax against your installed ffmpeg version,
-  and confirm `-ss` before `-i` (input seek) lands close enough to frame-
-  accurate for your source files; if not, switch to output-side `-ss`
-  (slower, always accurate) for the final encode.
+- **`app.js` ↔ `main.rs`** — `get_video_metadata`, `export_clip`, the
+  folder-picker dialog, and closing the window all call the real Tauri
+  APIs now (`window.__TAURI__.core.invoke(...)`, `.dialog.open(...)`,
+  `.window.getCurrentWindow().close()`), guarded by an
+  `if (window.__TAURI__)` check so the browser-preview fallback above
+  still works. **Not yet compiled or run** — first real test should be
+  `cargo tauri dev` (see below).
+- **ffmpeg/ffprobe as sidecars** — `main.rs` calls them as bundled
+  binaries via `tauri-plugin-shell`, not from system PATH. See "Bundling
+  ffmpeg" below — this is the one manual step that doesn't work without
+  you supplying the actual binaries.
+- **`capabilities/default.json`** — Tauri v2's permission system needs
+  this to allow the dialog plugin and window-close call; included here,
+  but the `$schema` path assumes a standard `tauri init` layout. If
+  `cargo tauri dev` complains about it, that schema reference (not the
+  permissions list itself) is the likely culprit — safe to delete that
+  one line.
+- **The mpv↔app handoff is still incomplete.** `clip-trigger.lua` passes
+  `--init <json>` on the command line, but nothing in `main.rs` reads
+  `std::env::args()` and injects it into the webview as
+  `window.__KLIPPIT_INIT__` yet — so launching from mpv today still opens
+  the panel in dev-preview mode rather than seeded with the real file/
+  timestamp. That's the next real gap to close, once the build itself is
+  confirmed working.
+- **Loading the actual video file** — `app.js` currently sets
+  `video.src = 'file://' + path`, which may get blocked by WebView2's
+  cross-origin restrictions since the app itself runs under
+  `tauri://localhost`. If the preview shows blank once a real file is
+  wired up, switch to Tauri's asset protocol (`convertFileSrc` from
+  `window.__TAURI__.core`) instead of a raw `file://` URL.
 - **`mpv-scripts/clip-trigger.lua`** — `APP_PATH` is a placeholder. Also
   flagged inline: this always spawns a new app instance rather than
   messaging an already-open one. Worth fixing before this is a daily
@@ -92,14 +109,19 @@ check that crate's current docs for the exact call shape.
 
 ## Suggested next steps, in order
 
-1. Run `src/index.html` in a browser and sanity-check the interaction
-   model (frame bar, drag handles, keyboard) feels right before touching
-   Rust at all — this is the part most worth iterating on by feel.
-2. Scaffold a real Tauri project (`cargo install tauri-cli`, `tauri init`)
-   and merge these files in; wire the `TODO(tauri)` spots in `app.js`.
-3. Test `export_clip` against a real file from the command line first
-   (call the ffmpeg args `main.rs` builds, by hand, before wiring the UI
-   to them) — cheaper to debug ffmpeg syntax outside the GUI loop.
-4. Point `clip-trigger.lua`'s `APP_PATH` at the built binary, drop it in
-   mpv's `scripts/` directory, and test the handoff end to end.
+1. `cargo tauri dev` first with placeholder ffmpeg binaries missing —
+   confirm the window opens and the browser-preview UI behavior still
+   holds inside the real webview before chasing ffmpeg issues.
+2. Drop in real ffmpeg/ffprobe sidecar binaries (see above), pick a
+   local video file's path manually in place of mpv for now, and test
+   `get_video_metadata` + `export_clip` end to end.
+3. If either command errors, test the equivalent ffmpeg/ffprobe args by
+   hand in a terminal first — cheaper to debug ffmpeg syntax outside the
+   GUI/IPC loop.
+4. Wire the mpv↔app handoff: read `--init` in `main.rs`'s `main()`,
+   inject it into the webview as `window.__KLIPPIT_INIT__` before the
+   page loads. Point `clip-trigger.lua`'s `APP_PATH` at the built binary,
+   drop the script in mpv's `scripts/` directory, and test end to end.
 5. Come back to single-instance messaging once the core loop works.
+6. `cargo tauri build` once everything above works in `dev` mode — that's
+   what actually produces the distributable `.msi`/`.exe`.

@@ -7,11 +7,13 @@
 'use strict';
 
 // ---------- state ----------
-// Populated from mpv's handoff (see mpv-scripts/clip-trigger.lua) via
-// window.__SAKUGA_INIT__, injected by the Tauri shell before this script
-// runs. Falls back to placeholder values so the panel is still usable/
-// previewable standalone in a browser during development.
-var init = window.__SAKUGA_INIT__ || {
+// mpv's handoff (see mpv-scripts/clip-trigger.lua) still needs to inject
+// window.__KLIPPIT_INIT__ before this script runs — that wiring (reading
+// --init on the Rust side, evaluating it into the webview pre-load) isn't
+// done yet, so init below still falls back to dev-preview values whether
+// or not you launched this from mpv. Metadata/export/dialog/close calls
+// below, on the other hand, are wired to the real Tauri backend.
+var init = window.__KLIPPIT_INIT__ || {
   filePath: '',
   fileName: '(no file — dev preview mode)',
   startTime: 12.0,
@@ -215,20 +217,31 @@ document.getElementById('fps').addEventListener('change', function (e) { state.g
 
 // ---------- output location ----------
 document.getElementById('browse-btn').onclick = function () {
-  // TODO(tauri): replace with the real native dialog, e.g.
-  //   const { open } = window.__TAURI__.dialog;
-  //   const dir = await open({ directory: true, defaultPath: state.outputDir });
-  // Stubbed here so the panel is testable standalone in a browser.
-  var dir = prompt('Output folder (stub — wire to Tauri save dialog):', state.outputDir);
-  if (dir) { state.outputDir = dir; document.getElementById('output-path').textContent = dir; }
+  if (!window.__TAURI__) {
+    // Standalone browser preview — no Tauri backend to open a native dialog.
+    var dir = prompt('Output folder (dev preview — no Tauri backend here):', state.outputDir);
+    if (dir) { state.outputDir = dir; document.getElementById('output-path').textContent = dir; }
+    return;
+  }
+  window.__TAURI__.dialog.open({ directory: true, defaultPath: state.outputDir }).then(function (dir) {
+    if (dir) { state.outputDir = dir; document.getElementById('output-path').textContent = dir; }
+  }).catch(function (err) { setStatus('folder picker failed: ' + err, 'error'); });
 };
 
 // ---------- metadata + video loading ----------
 function loadMetadata() {
-  if (!init.filePath) return; // dev preview mode, no real source
-  // TODO(tauri): invoke('get_video_metadata', { path: init.filePath })
-  //   -> { duration, fps } via ffprobe, called from main.rs.
-  // Placeholder duration so the panel is interactive before that's wired up.
+  if (!init.filePath || !window.__TAURI__) return; // dev preview mode, no real source / no backend
+  window.__TAURI__.core.invoke('get_video_metadata', { path: init.filePath }).then(function (meta) {
+    state.duration = meta.duration;
+    state.fps = meta.fps || state.fps;
+    if (!meta.hasSubtitles) {
+      subsToggle.disabled = true;
+      document.getElementById('subs-label').textContent = 'No subtitle stream detected';
+    }
+    render();
+  }).catch(function (err) {
+    setStatus('failed to read video metadata: ' + err, 'error');
+  });
 }
 
 function setStatus(text, kind) {
@@ -254,24 +267,33 @@ function exportClip() {
   setStatus('exporting…', 'busy');
   document.getElementById('export-btn').disabled = true;
 
-  // TODO(tauri): replace with
-  //   const { invoke } = window.__TAURI__.tauri;
-  //   invoke('export_clip', { params })
-  //     .then(path => setStatus('done — ' + path, 'done'))
-  //     .catch(err => setStatus('export failed: ' + err, 'error'))
-  //     .then(() => { document.getElementById('export-btn').disabled = false; });
-  console.log('[klippit] export_clip params (stub):', params);
-  setTimeout(function () {
-    setStatus('(dev stub) would export now — see console for params', 'done');
+  if (!window.__TAURI__) {
+    // Standalone browser preview — no backend to actually encode against.
+    console.log('[klippit] export_clip params (dev preview, no backend):', params);
+    setTimeout(function () {
+      setStatus('(dev preview) no Tauri backend here — see console for params', 'done');
+      document.getElementById('export-btn').disabled = false;
+    }, 400);
+    return;
+  }
+
+  window.__TAURI__.core.invoke('export_clip', { params: params }).then(function (path) {
+    setStatus('done — ' + path, 'done');
+  }).catch(function (err) {
+    setStatus('export failed: ' + err, 'error');
+  }).then(function () {
     document.getElementById('export-btn').disabled = false;
-  }, 400);
+  });
 }
 document.getElementById('export-btn').onclick = exportClip;
 document.getElementById('cancel-btn').onclick = closePanel;
 
 function closePanel() {
-  // TODO(tauri): window.__TAURI__.window.getCurrent().close();
-  console.log('[klippit] close panel (stub)');
+  if (window.__TAURI__) {
+    window.__TAURI__.window.getCurrentWindow().close();
+  } else {
+    console.log('[klippit] close panel (dev preview, no window to close)');
+  }
 }
 
 // ---------- init ----------

@@ -25,6 +25,7 @@ use tauri::AppHandle;
 use tauri_plugin_shell::ShellExt;
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ExportParams {
     file_path: String,
     in_time: f64,
@@ -40,6 +41,7 @@ struct ExportParams {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct VideoMetadata {
     duration: f64,
     fps: f64,
@@ -283,6 +285,7 @@ async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, o
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             get_video_metadata,
             export_clip,
