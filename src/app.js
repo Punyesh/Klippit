@@ -14,7 +14,7 @@
 // or not you launched this from mpv. Metadata/export/dialog/close calls
 // below, on the other hand, are wired to the real Tauri backend.
 var init = window.__KLIPPIT_INIT__ || {
-  filePath: 'C:\Users\Punyesh\Downloads\Video\Sentenced.mp4',
+  filePath: '',
   fileName: '(no file — dev preview mode)',
   startTime: 12.0,
   subtitleAvailable: false

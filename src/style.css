@@ -4,7 +4,12 @@
    points), monospace timecodes, system UI font for labels so it reads as
    a native Windows utility rather than a web page in a window frame.
    Sharp rectangular controls throughout — no pill shapes, no iOS-style
-   switches — closer to labeled buttons on a hardware panel. */
+   switches — closer to labeled buttons on a hardware panel.
+
+   Density pass: this is a small utility window, not a spacious settings
+   page, so paddings/font-sizes below are deliberately tight — every
+   control should feel like a compact instrument reading, not a tap
+   target sized for a touchscreen. */
 
 :root {
   --bg: #0b0c0e;
@@ -28,15 +33,22 @@ html, body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--sans);
-  font-size: 13px;
+  font-size: 12px;
   user-select: none;
+  overflow-x: hidden;
 }
 
 :focus-visible {
   outline: 2px solid var(--focus);
-  outline-offset: 2px;
+  outline-offset: 1px;
   border-radius: 2px;
 }
+
+/* Thin, theme-matched scrollbars instead of the OS default */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: #3a3d44; background-clip: padding-box; }
 
 #app {
   display: flex;
@@ -49,36 +61,33 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 9px 14px;
+  padding: 6px 10px;
   border-bottom: 1px solid var(--line);
   background: var(--panel2);
+  flex-shrink: 0;
 }
 #head .brand {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 11px;
   color: var(--text);
-  letter-spacing: 2px;
+  letter-spacing: 1.5px;
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
 }
-/* The record-light dot: a fixed presence in the brand mark, not a
-   one-word color accent — this is the same red used everywhere an
-   in/out point gets armed, so the wordmark itself reads as "this app
-   marks recordings." */
 #head .brand::before {
   content: "";
-  width: 7px; height: 7px;
+  width: 6px; height: 6px;
   border-radius: 50%;
   background: var(--red);
-  box-shadow: 0 0 4px var(--red);
+  box-shadow: 0 0 3px var(--red);
   flex-shrink: 0;
 }
 #head .source-name {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 10px;
   color: var(--dim);
-  max-width: 320px;
+  max-width: 280px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -98,9 +107,10 @@ html, body {
 
 /* Seek scrubber */
 #seek-row {
-  padding: 8px 14px 4px;
+  padding: 5px 10px 3px;
   background: var(--panel2);
   border-top: 1px solid var(--line);
+  flex-shrink: 0;
 }
 #seek-bar {
   -webkit-appearance: none;
@@ -109,34 +119,35 @@ html, body {
   border-radius: 0;
   background: var(--line);
   cursor: pointer;
+  display: block;
 }
 #seek-bar::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 10px; height: 14px;
+  width: 9px; height: 12px;
   border-radius: 1px;
   background: var(--text);
   cursor: pointer;
-  margin-top: -5.5px;
+  margin-top: -4.5px;
 }
 #seek-bar::-moz-range-thumb {
-  width: 10px; height: 14px; border: none; border-radius: 1px;
+  width: 9px; height: 12px; border: none; border-radius: 1px;
   background: var(--text); cursor: pointer;
 }
 
-/* Trim range track — styled like a tape counter/ruler: tick marks along
-   the bottom edge rather than a plain rounded bar. */
+/* Trim range track — tape counter/ruler ticks along the bottom edge */
 #trim-track {
   position: relative;
-  height: 22px;
-  margin: 6px 0 2px;
+  height: 16px;
+  margin: 4px 0 1px;
   background: var(--bg);
   border: 1px solid var(--line);
   background-image: repeating-linear-gradient(
     to right, var(--line) 0, var(--line) 1px, transparent 1px, transparent 12.5%
   );
   background-position: 0 bottom;
-  background-size: 100% 5px;
+  background-size: 100% 4px;
   background-repeat: no-repeat repeat;
+  flex-shrink: 0;
 }
 #trim-range {
   position: absolute;
@@ -147,8 +158,8 @@ html, body {
 }
 .trim-handle {
   position: absolute;
-  top: -3px;
-  width: 9px; height: 28px;
+  top: -2px;
+  width: 7px; height: 20px;
   background: var(--panel);
   border: 1px solid var(--red);
   border-radius: 0;
@@ -156,93 +167,89 @@ html, body {
   transform: translateX(-50%);
 }
 .trim-handle:hover, .trim-handle:focus-visible { background: var(--red-dim); }
-.trim-handle .lbl {
-  position: absolute; top: -18px; left: 50%; transform: translateX(-50%);
-  font-size: 9px; color: var(--dim); font-family: var(--mono);
-  white-space: nowrap;
-}
 
 /* ---------- frame bar ---------- */
-.frame-bar { padding: 8px 14px; background: var(--panel2); border-top: 1px solid var(--line); }
-.frame-row { display: flex; align-items: center; gap: 4px; }
+.frame-bar { padding: 5px 10px; background: var(--panel2); border-top: 1px solid var(--line); flex-shrink: 0; }
+.frame-row { display: flex; align-items: center; gap: 3px; }
 .frame-btn {
   background: var(--bg); border: 1px solid var(--line); color: var(--text);
-  border-radius: 2px; padding: 6px 10px; font-size: 13px; cursor: pointer;
-  font-family: var(--mono);
+  border-radius: 2px; padding: 3px 8px; font-size: 12px; cursor: pointer;
+  font-family: var(--mono); line-height: 1.4;
 }
 .frame-btn:hover { border-color: var(--red); color: var(--red); }
 .frame-btn:disabled { opacity: .35; cursor: default; }
 .frame-count {
-  flex: 1; text-align: center; font-size: 13px; font-weight: 600;
-  color: var(--text); font-family: var(--mono); letter-spacing: .5px;
+  flex: 1; text-align: center; font-size: 12px; font-weight: 600;
+  color: var(--text); font-family: var(--mono); letter-spacing: .3px;
 }
-.frame-time { text-align: center; font-size: 11px; color: var(--dim); margin-top: 5px; font-family: var(--mono); }
+.frame-time { text-align: center; font-size: 10px; color: var(--dim); margin-top: 3px; font-family: var(--mono); }
 
 /* Which handle (In / Out) the frame bar currently arms — a lit dot marks
    the armed one, echoing a tape deck's record-arm indicator. */
-.handle-select { display: flex; gap: 6px; margin-bottom: 8px; }
+.handle-select { display: flex; gap: 4px; margin-bottom: 4px; }
 .handle-btn {
-  flex: 1; padding: 6px 0; text-align: center; font-size: 11px;
-  letter-spacing: .08em; cursor: pointer; font-family: var(--mono);
+  flex: 1; padding: 4px 0; text-align: center; font-size: 10px;
+  letter-spacing: .06em; cursor: pointer; font-family: var(--mono);
   color: var(--dim); background: var(--bg); border: 1px solid var(--line); border-radius: 2px;
-  display: flex; align-items: center; justify-content: center; gap: 6px;
+  display: flex; align-items: center; justify-content: center; gap: 5px;
 }
 .handle-btn::before {
-  content: ""; width: 6px; height: 6px; border-radius: 50%;
+  content: ""; width: 5px; height: 5px; border-radius: 50%;
   background: var(--line); flex-shrink: 0;
 }
 .handle-btn[aria-pressed="true"] { color: var(--text); border-color: var(--red); background: var(--red-dim); }
-.handle-btn[aria-pressed="true"]::before { background: var(--red); box-shadow: 0 0 4px var(--red); }
+.handle-btn[aria-pressed="true"]::before { background: var(--red); box-shadow: 0 0 3px var(--red); }
 
 /* ---------- body / options ---------- */
-#body { padding: 12px 14px; overflow-y: auto; }
+#body { padding: 8px 10px; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
 .section-label {
-  font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
-  color: var(--dim); margin: 14px 0 8px; padding-top: 10px; border-top: 1px solid var(--line);
+  font-size: 9px; letter-spacing: .09em; text-transform: uppercase;
+  color: var(--dim); margin: 9px 0 5px; padding-top: 7px; border-top: 1px solid var(--line);
   font-family: var(--mono);
 }
 .section-label:first-child { margin-top: 0; padding-top: 0; border-top: none; }
 
 /* Segmented button groups — the one control shape used for every binary
    or multi-way choice (format, subtitles, mode, handle select), rather
-   than mixing in a separate switch-shaped widget. */
-.seg-group { display: flex; gap: 6px; }
+   than mixing in a separate switch-shaped widget. Deliberately low and
+   plain, not full-height tap targets. */
+.seg-group { display: flex; gap: 4px; }
 .seg-btn {
-  flex: 1; padding: 8px 6px; text-align: center; font-size: 12px;
+  flex: 1; padding: 4px 6px; text-align: center; font-size: 11px;
   color: var(--dim); background: var(--bg); border: 1px solid var(--line);
   border-radius: 2px; cursor: pointer; font-family: var(--sans);
 }
 .seg-btn[aria-pressed="true"] { color: var(--text); border-color: var(--red); background: var(--red-dim); }
 .seg-btn:hover:not([aria-pressed="true"]) { border-color: var(--dim); color: var(--text); }
 
-.row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+.row { display: flex; gap: 6px; margin-bottom: 5px; align-items: center; }
 .field { flex: 1; }
-.field label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 4px; }
+.field label { display: block; font-size: 10px; color: var(--dim); margin-bottom: 2px; }
 .input, select.input {
   width: 100%; background: var(--bg); border: 1px solid var(--line); color: var(--text);
-  padding: 7px 9px; border-radius: 2px; font-size: 13px; outline: none; font-family: var(--sans);
+  padding: 4px 6px; border-radius: 2px; font-size: 11px; outline: none; font-family: var(--sans);
 }
 .input:focus { border-color: var(--red); }
 input[type="range"].input, input[type="range"]#seek-bar { accent-color: var(--red); }
 
-.preset-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.preset-row { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 5px; }
 .preset-btn {
   background: var(--bg); border: 1px solid var(--line); color: var(--text);
-  padding: 6px 10px; border-radius: 2px; font-size: 11px; cursor: pointer;
+  padding: 3px 8px; border-radius: 2px; font-size: 10px; cursor: pointer;
   font-family: var(--mono);
 }
 .preset-btn[aria-pressed="true"] { border-color: var(--red); color: var(--text); background: var(--red-dim); }
 
 /* ---------- output + export ---------- */
-#output-row { display: flex; gap: 6px; align-items: center; }
+#output-row { display: flex; gap: 5px; align-items: center; }
 #output-path {
-  flex: 1; font-size: 11px; color: var(--dim); font-family: var(--mono);
+  flex: 1; font-size: 10px; color: var(--dim); font-family: var(--mono);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  background: var(--bg); border: 1px solid var(--line); border-radius: 2px; padding: 7px 9px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 2px; padding: 4px 6px;
 }
 .btn {
   background: var(--red-dim); border: 1px solid var(--red); color: var(--text);
-  padding: 8px 14px; border-radius: 2px; font-size: 12px; cursor: pointer; font-weight: 600;
+  padding: 5px 10px; border-radius: 2px; font-size: 11px; cursor: pointer; font-weight: 600;
   font-family: var(--sans);
 }
 .btn:hover { background: var(--red); color: #0b0c0e; }
@@ -250,10 +257,10 @@ input[type="range"].input, input[type="range"]#seek-bar { accent-color: var(--re
 .btn.secondary { background: transparent; color: var(--dim); border-color: var(--line); font-weight: normal; }
 .btn.secondary:hover { border-color: var(--dim); color: var(--text); background: transparent; }
 
-#export-row { display: flex; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--line); background: var(--panel2); }
+#export-row { display: flex; gap: 6px; padding: 7px 10px; border-top: 1px solid var(--line); background: var(--panel2); flex-shrink: 0; }
 #export-btn { flex: 1; }
 
-#status { padding: 0 14px 10px; font-size: 11px; color: var(--dim); min-height: 14px; font-family: var(--mono); }
+#status { padding: 0 10px 6px; font-size: 10px; color: var(--dim); min-height: 12px; font-family: var(--mono); word-break: break-word; }
 #status.busy { color: var(--red); }
 #status.error { color: var(--red); }
 #status.done { color: var(--text); }
