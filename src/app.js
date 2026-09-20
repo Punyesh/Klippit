@@ -154,20 +154,31 @@ document.getElementById('fb-medfwd').onclick = function () { step(MED_STEP); };
 document.getElementById('fb-bigback').onclick = function () { step(-Math.round(state.fps)); };
 document.getElementById('fb-bigfwd').onclick = function () { step(Math.round(state.fps)); };
 
-selIn.onclick = function () { state.activeHandle = 'in'; video.currentTime = state.inTime; render(); };
-selOut.onclick = function () { state.activeHandle = 'out'; video.currentTime = state.outTime; render(); };
+// Marking is now an explicit, deliberate capture — click Mark In (or
+// press I) and whatever the playhead is doing RIGHT NOW becomes the new
+// in-point, full stop. No more "whichever point happens to be armed
+// silently follows every scrub/play/step you make" — that coupling was
+// the actual source of the bar feeling finicky to use, not the dragging
+// itself. Also arms that point for subsequent frame-stepping (,/.), so
+// you can mark roughly then nudge precisely right after, in one flow.
+selIn.onclick = function () { state.activeHandle = 'in'; setHandleTime('in', video.currentTime, true); };
+selOut.onclick = function () { state.activeHandle = 'out'; setHandleTime('out', video.currentTime, true); };
 
 // ---------- frame bar: keyboard ----------
 // Same , / . convention as sakuga-enhancer.js, so the muscle memory carries
 // over. Shift+,/. mirrors the medium-step buttons; the big ~1s jump is
 // deliberately mouse/button-only (« / ») since it's a coarse repositioning
-// move, not something worth a dedicated key.
+// move, not something worth a dedicated key. I/O mark In/Out at the
+// current position — the standard convention in most editing tools,
+// matching Mark In/Mark Out's button behavior exactly.
 window.addEventListener('keydown', function (e) {
   // Don't hijack typing in the target-MB, filename, or other text fields.
   if (e.target.tagName === 'INPUT' && e.target.type !== 'range') return;
 
   if (e.key === ',') { step(e.shiftKey ? -MED_STEP : -1); e.preventDefault(); }
   else if (e.key === '.') { step(e.shiftKey ? MED_STEP : 1); e.preventDefault(); }
+  else if (e.key === 'i' || e.key === 'I') { state.activeHandle = 'in'; setHandleTime('in', video.currentTime, true); e.preventDefault(); }
+  else if (e.key === 'o' || e.key === 'O') { state.activeHandle = 'out'; setHandleTime('out', video.currentTime, true); e.preventDefault(); }
   else if (e.key === 'Enter' && e.target.tagName !== 'BUTTON') { exportClip(); }
   else if (e.key === 'Escape') { closePanel(); }
   else if (e.key === ' ' && e.target.tagName !== 'BUTTON') { togglePlayback(); e.preventDefault(); }
@@ -271,49 +282,25 @@ function makeDraggable(handle, which) {
 makeDraggable(handleIn, 'in');
 makeDraggable(handleOut, 'out');
 
-// ---------- seek bar (whole-file scrub, independent of trim range) ----------
+// ---------- seek bar (pure navigation — no side effects on In/Out) ----------
 seekBar.addEventListener('input', function () {
   var pct = seekBar.value / 1000;
-  var t = pct * state.duration;
-  video.currentTime = t;
-  // Drive the armed-handle sync directly here rather than relying solely
-  // on the video's 'timeupdate' event below — for a paused, discrete seek
-  // (as opposed to continuous playback), browsers don't reliably fire
-  // 'timeupdate' for every rapid intermediate position during a drag, so
-  // depending on it alone meant dragging this bar could silently fail to
-  // move the trim handle until something else (like clicking In/Out)
-  // happened to trigger a sync some other way.
-  setHandleTime(state.activeHandle, t, true);
+  video.currentTime = pct * state.duration;
 });
 video.addEventListener('timeupdate', function () {
   if (state.duration) seekBar.value = (video.currentTime / state.duration) * 1000;
-
-  var t = video.currentTime;
-  // During unattended *playback* specifically (not deliberate scrubbing,
-  // which stays completely free — see setHandleTime), auto-pause right
-  // when the armed handle's forward drift would cross the other,
-  // already-meaningfully-set point, like a preview loop stopping at its
-  // boundary. Without this, In (the default-armed handle) just drifts
-  // forever past a real Out point during hands-off playback, leaving you
-  // to notice and manually walk it back afterward.
-  if (!video.paused && state.activeHandle === 'in' && state.outTime > state.inTime && t >= state.outTime) {
+  // The only automatic behavior left: don't let playback silently run
+  // past your marked Out point — a simple "preview stops at your out
+  // marker" convenience, independent of anything else. Everything else
+  // that used to happen here (whichever point was "armed" continuously
+  // reassigning itself to follow playback/scrubbing/frame-stepping) is
+  // gone — that coupling was the actual source of the trim bar feeling
+  // finicky, not the dragging itself. Marking is explicit now: see
+  // selIn/selOut above.
+  if (!video.paused && state.outTime > state.inTime && video.currentTime >= state.outTime) {
     video.pause();
-    setHandleTime('in', state.outTime, false);
-    return;
+    video.currentTime = state.outTime;
   }
-  if (!video.paused && state.activeHandle === 'out' && state.inTime < state.outTime && t <= state.inTime) {
-    video.pause();
-    setHandleTime('out', state.inTime, false);
-    return;
-  }
-
-  // Whichever handle is armed (In or Out) follows video.currentTime for
-  // any reason it changes — playback advancing, dragging the seek bar,
-  // frame-stepping, or dragging a trim handle. This is what makes
-  // pressing Play actually move the armed point instead of just playing
-  // disconnected from editing: press Play, watch, press Pause/Space
-  // right when you want that point, and it's already set.
-  setHandleTime(state.activeHandle, t, true);
 });
 
 // ---------- format / subtitle / mode toggles ----------

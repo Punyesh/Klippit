@@ -22,7 +22,7 @@
 
   <div id="seek-row">
     <button class="frame-btn" id="play-pause-btn" title="Play/Pause (Space)">&#9654;</button>
-    <button class="frame-btn" id="screenshot-btn" title="Screenshot at current position">&#128247;</button>
+    <button class="frame-btn" id="screenshot-btn" title="Screenshot at current position"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M4 8h3l1.5-2h7L17 8h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="14" r="3.5"/></svg></button>
     <button class="frame-btn" id="subs-preview-toggle" title="Show/hide subtitle preview (also affects screenshots)" aria-pressed="true">CC</button>
     <input id="seek-bar" type="range" min="0" max="1000" value="0"
            aria-label="Seek position" />
@@ -30,8 +30,8 @@
 
   <div class="frame-bar">
     <div class="handle-select" role="group" aria-label="Which point the frame controls adjust">
-      <button class="handle-btn" id="sel-in" aria-pressed="true">In</button>
-      <button class="handle-btn" id="sel-out" aria-pressed="false">Out</button>
+      <button class="handle-btn" id="sel-in" aria-pressed="true" title="Set In to current position (I)">Mark In</button>
+      <button class="handle-btn" id="sel-out" aria-pressed="false" title="Set Out to current position (O)">Mark Out</button>
     </div>
 
     <div id="trim-track">

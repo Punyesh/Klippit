@@ -217,6 +217,12 @@ html, body {
   transform: translateX(-50%);
 }
 .trim-handle:hover, .trim-handle:focus-visible { background: var(--red-dim); }
+/* Subtle shape distinction between In and Out — each handle's rounded
+   edge faces into the selected range, its flat edge faces outward, the
+   way trim handles are conventionally shaped in real editing software.
+   Meant to be noticed on close inspection, not shout for attention. */
+#handle-in { border-radius: 0 2px 2px 0; }
+#handle-out { border-radius: 2px 0 0 2px; }
 
 /* ---------- frame bar ---------- */
 .frame-bar { padding: 5px 10px; background: var(--panel2); border-top: 1px solid var(--line); flex-shrink: 0; }
@@ -225,6 +231,7 @@ html, body {
   background: var(--bg); border: 1px solid var(--line); color: var(--text);
   border-radius: 2px; padding: 2px 5px; font-size: 11px; cursor: pointer;
   font-family: var(--mono); line-height: 1.4; flex-shrink: 0; white-space: nowrap;
+  display: inline-flex; align-items: center; justify-content: center;
 }
 .frame-btn:hover { border-color: var(--red); color: var(--red); }
 .frame-btn:disabled { opacity: .35; cursor: default; }

@@ -219,6 +219,30 @@ Each of these was found from real console errors/screenshots, in order:
    (`position: absolute; inset: 0`) so it stretches to fill
    `#preview-wrap` without disturbing the video's layout.
 
+## Replaced the trim bar's interaction model: explicit Mark In/Mark Out
+
+The old model had whichever point ("In" or "Out") was currently "armed"
+continuously reassign itself to follow the playhead for any reason it
+changed — playback, scrubbing, frame-stepping. That coupling, not the
+handle-dragging itself, was the real source of the bar feeling finicky:
+scrub around to find your out point and you could easily be silently
+moving In instead without realizing which one was armed.
+
+Replaced with the Sakuga Enhancer pattern: scrubbing, playback, and
+frame-stepping are now pure navigation with zero side effects on In/Out.
+**Mark In** / **Mark Out** (or **I** / **O** on the keyboard) are
+explicit, deliberate actions — click one and wherever the playhead is
+*right now* becomes that point, full stop. Marking also arms that point
+for subsequent `,`/`.` frame-stepping, so the natural flow is: scrub
+roughly, mark, nudge precisely if needed, repeat for the other point.
+
+Dragging the ruler handles directly still works as a supplementary
+method (it already correctly arms the dragged handle too), just no
+longer the primary or only way to set points, and no longer entangled
+with general playback. The one remaining automatic behavior: playback
+still auto-pauses if it reaches your marked Out point, a simple "preview
+stops at your out marker" convenience, independent of anything else.
+
 ## Correct subtitle track selection (multiple tracks / external files)
 
 Previously, extraction always grabbed whichever subtitle stream appeared
