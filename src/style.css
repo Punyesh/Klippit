@@ -1,0 +1,247 @@
+/* Klippit — panel styling
+   Design tokens and component patterns ported directly from sakuga-enhancer.js
+   (amber-on-charcoal, monospace accents, same toggle/tab/frame-bar shapes)
+   so this feels like the same app family, just in a native window instead
+   of a page overlay. */
+
+:root {
+  --bg: #15130f;
+  --panel: #1c1a15;
+  --panel2: #242119;
+  --line: #3a3527;
+  --text: #eae4d3;
+  --dim: #9c9581;
+  --amber: #ffb020;
+  --amber-dim: #7a5a1e;
+  --red: #d9634a;
+  --link: #6db3f2;
+  --focus: #ffb020;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Neue Haas Grotesk", "Helvetica Neue", Arial, sans-serif;
+  font-size: 13px;
+  /* Native window, not a page overlay — no drag handle/resize corners needed,
+     the OS window chrome already provides that. */
+  user-select: none;
+}
+
+/* Visible, on-brand focus ring everywhere — this replaces the browser
+   default outline, it does not remove focus indication. Every interactive
+   element in this file relies on a real <button>/<input>, so this one rule
+   covers keyboard navigation for the whole panel. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* ---------- header ---------- */
+#head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel2);
+}
+#head .brand {
+  font-family: "Courier New", monospace;
+  font-size: 12px;
+  color: var(--dim);
+  letter-spacing: 1px;
+}
+#head .brand b { color: var(--amber); }
+#head .source-name {
+  font-size: 11px;
+  color: var(--dim);
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- video preview ---------- */
+#preview-wrap {
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
+}
+#preview { max-width: 100%; max-height: 100%; display: block; }
+
+/* Seek scrubber (whole-file position, distinct from the in/out trim range) */
+#seek-row {
+  padding: 8px 14px 4px;
+  background: var(--panel2);
+  border-top: 1px solid var(--line);
+}
+#seek-bar {
+  -webkit-appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line);
+  cursor: pointer;
+}
+#seek-bar::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  background: var(--amber);
+  cursor: pointer;
+  margin-top: -4px;
+}
+#seek-bar::-moz-range-thumb {
+  width: 12px; height: 12px; border: none; border-radius: 50%;
+  background: var(--amber); cursor: pointer;
+}
+
+/* Trim range track: full duration bar with in/out handles + shaded middle */
+#trim-track {
+  position: relative;
+  height: 20px;
+  margin: 6px 0 2px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+}
+#trim-range {
+  position: absolute;
+  top: 0; bottom: 0;
+  background: var(--amber-dim);
+  border-left: 1px solid var(--amber);
+  border-right: 1px solid var(--amber);
+}
+.trim-handle {
+  position: absolute;
+  top: -3px;
+  width: 10px; height: 26px;
+  background: var(--panel);
+  border: 1px solid var(--amber);
+  border-radius: 2px;
+  cursor: ew-resize;
+  transform: translateX(-50%);
+}
+.trim-handle:hover, .trim-handle:focus-visible { background: var(--amber-dim); }
+.trim-handle .lbl {
+  position: absolute; top: -18px; left: 50%; transform: translateX(-50%);
+  font-size: 9px; color: var(--dim); font-family: "Courier New", monospace;
+  white-space: nowrap;
+}
+
+/* ---------- frame bar (ported 1:1 from sk-frame-bar) ---------- */
+.frame-bar { padding: 8px 14px; background: var(--panel2); border-top: 1px solid var(--line); }
+.frame-row { display: flex; align-items: center; gap: 4px; }
+.frame-btn {
+  background: var(--bg); border: 1px solid var(--line); color: var(--text);
+  border-radius: 4px; padding: 6px 10px; font-size: 13px; cursor: pointer;
+  font-family: "Courier New", monospace;
+}
+.frame-btn:hover { border-color: var(--amber); color: var(--amber); }
+.frame-btn:disabled { opacity: .35; cursor: default; }
+.frame-count {
+  flex: 1; text-align: center; font-size: 13px; font-weight: bold;
+  color: var(--amber); font-family: "Courier New", monospace;
+}
+.frame-time { text-align: center; font-size: 11px; color: var(--dim); margin-top: 5px; }
+
+/* Which handle (In / Out) the frame bar currently nudges */
+.handle-select { display: flex; gap: 6px; margin-bottom: 8px; }
+.handle-btn {
+  flex: 1; padding: 6px 0; text-align: center; font-size: 11px;
+  letter-spacing: .04em; text-transform: uppercase; cursor: pointer;
+  color: var(--dim); background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+}
+.handle-btn[aria-pressed="true"] { color: var(--amber); border-color: var(--amber); background: var(--amber-dim); }
+
+/* ---------- body / options ---------- */
+#body { padding: 12px 14px; overflow-y: auto; }
+.section-label {
+  font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--dim); margin: 14px 0 8px; padding-top: 10px; border-top: 1px solid var(--line);
+}
+.section-label:first-child { margin-top: 0; padding-top: 0; border-top: none; }
+
+/* Segmented / toggle button groups (format, mode tabs, quality presets) —
+   real <button aria-pressed> elements, not styled divs, so they're
+   focusable and Space/Enter-operable with no extra wiring. */
+.seg-group { display: flex; gap: 6px; }
+.seg-btn {
+  flex: 1; padding: 8px 6px; text-align: center; font-size: 12px;
+  color: var(--dim); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 4px; cursor: pointer;
+}
+.seg-btn[aria-pressed="true"] { color: var(--amber); border-color: var(--amber); background: var(--amber-dim); }
+.seg-btn:hover:not([aria-pressed="true"]) { border-color: var(--amber); color: var(--text); }
+
+/* Real toggle switch — <button role="switch" aria-checked> underneath the
+   same visual skin as sk-toggle-switch, so it's keyboard-operable natively. */
+.toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; }
+.toggle-label { font-size: 12px; color: var(--text); }
+.toggle-switch {
+  position: relative; width: 32px; height: 17px; border-radius: 9px;
+  background: var(--line); border: none; cursor: pointer; padding: 0; flex-shrink: 0;
+}
+.toggle-switch[aria-checked="true"] { background: var(--amber-dim); }
+.toggle-knob {
+  position: absolute; top: 2px; left: 2px; width: 13px; height: 13px;
+  border-radius: 50%; background: var(--dim); transition: left .15s ease, background .15s ease;
+}
+.toggle-switch[aria-checked="true"] .toggle-knob { left: 17px; background: var(--amber); }
+
+.row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+.field { flex: 1; }
+.field label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 4px; }
+.input, select.input {
+  width: 100%; background: var(--bg); border: 1px solid var(--line); color: var(--text);
+  padding: 7px 9px; border-radius: 4px; font-size: 13px; outline: none;
+}
+.input:focus { border-color: var(--amber); }
+
+.preset-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.preset-btn {
+  background: var(--bg); border: 1px solid var(--line); color: var(--text);
+  padding: 6px 10px; border-radius: 20px; font-size: 11px; cursor: pointer;
+  font-family: "Courier New", monospace;
+}
+.preset-btn[aria-pressed="true"] { border-color: var(--amber); color: var(--amber); background: var(--amber-dim); }
+
+/* ---------- output + export ---------- */
+#output-row { display: flex; gap: 6px; align-items: center; }
+#output-path {
+  flex: 1; font-size: 11px; color: var(--dim); font-family: "Courier New", monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 7px 9px;
+}
+.btn {
+  background: var(--amber-dim); border: 1px solid var(--amber); color: var(--amber);
+  padding: 8px 14px; border-radius: 4px; font-size: 12px; cursor: pointer; font-weight: bold;
+}
+.btn:hover { background: var(--amber); color: #1a1509; }
+.btn:disabled { opacity: .4; cursor: default; }
+.btn.secondary { background: transparent; color: var(--dim); border-color: var(--line); font-weight: normal; }
+.btn.secondary:hover { border-color: var(--amber); color: var(--amber); background: transparent; }
+
+#export-row { display: flex; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--line); background: var(--panel2); }
+#export-btn { flex: 1; }
+
+#status { padding: 0 14px 10px; font-size: 11px; color: var(--dim); min-height: 14px; }
+#status.busy { color: var(--amber); }
+#status.error { color: var(--red); }
+#status.done { color: var(--text); }

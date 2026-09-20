@@ -1,0 +1,21 @@
+# Rust / Tauri
+/src-tauri/target/
+/src-tauri/gen/
+
+# Node (if you add a bundler/dev-server later)
+node_modules/
+dist/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Exported clips/screenshots if you ever test-export into the repo folder
+*.mp4
+*.gif
+*.png
+!docs/**/*.png
