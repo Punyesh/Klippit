@@ -8,21 +8,30 @@
     margin: 0; height: 100%; background: #0b0c0e;
     display: flex; align-items: center; justify-content: center;
   }
-  video {
+  video, img {
     max-width: 100%; max-height: 100%; display: block; background: #000;
   }
 </style>
 </head>
 <body>
-<video id="v" controls autoplay></video>
 <script>
   // Injected by main.rs's open_review_window command via
   // initialization_script, same mechanism as the main panel's
   // window.__KLIPPIT_INIT__ — guaranteed to exist before this script runs.
   var path = window.__KLIPPIT_REVIEW_PATH__;
-  var v = document.getElementById('v');
+  var isGif = /\.gif$/i.test(path || '');
+  // A <video> element cannot decode/play GIF files at all — GIF is an
+  // image format (even animated), not something the browser's video
+  // decoder understands, unlike MP4. This showed up as exactly the
+  // broken native "failed to load" video player appearance (0:00
+  // duration, gray placeholder) when reviewing a GIF export. <img>
+  // handles animated GIFs correctly and natively, looping automatically.
+  var el = document.createElement(isGif ? 'img' : 'video');
+  el.id = 'v';
+  if (!isGif) { el.controls = true; el.autoplay = true; }
+  document.body.appendChild(el);
   if (path && window.__TAURI__) {
-    v.src = window.__TAURI__.core.convertFileSrc(path);
+    el.src = window.__TAURI__.core.convertFileSrc(path);
   }
 </script>
 </body>

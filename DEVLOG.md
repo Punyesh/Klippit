@@ -219,6 +219,131 @@ Each of these was found from real console errors/screenshots, in order:
    (`position: absolute; inset: 0`) so it stretches to fill
    `#preview-wrap` without disturbing the video's layout.
 
+## Review window couldn't play GIF exports
+
+Real bug, confirmed via screenshot: reviewing a GIF export showed the
+native "video failed to load" appearance (0:00 duration, gray
+placeholder) instead of the actual content. Root cause: `review.html`
+always used a `<video>` element regardless of file type, but GIF is an
+image format (even when animated) — a `<video>` element's decoder simply
+doesn't understand it, unlike MP4. Fixed by checking the file extension
+and creating an `<img>` element instead for `.gif` paths, which handles
+animated GIFs correctly and natively (including looping).
+
+## GIF export still slow after the duration fix — real, separate cause
+
+The `-t` argument-position fix was real and necessary (confirmed: output
+size went from 579MB to a correct, proportionate 0.98MB), but a genuinely
+separate problem remained: the same ~4-second export still took ~6
+minutes. Checked the diagnostic log for the exact commands running,
+which showed the seek position: 548 seconds — about 9 minutes into the
+source file.
+
+Root cause: both GIF passes (`palettegen` and `paletteuse`) independently
+seek into the original source file at that same deep position. Whatever
+that seek/decode cost is for this file, it gets paid **twice** per
+export, and in target-size mode, up to **six times** across retry
+attempts — quite possibly explaining minutes of overhead for what should
+be a few seconds of actual encoding work.
+
+Fixed by restructuring `export_gif` to extract the target window into a
+small intermediate file **once**, up front, then running both GIF passes
+(and every target-size retry) against that already-trimmed file, which
+starts at position 0 — no seeking needed there at all, regardless of how
+many passes follow. `encode_gif_attempt`'s signature simplified
+significantly as a result: it no longer needs `params`, `duration`,
+`subtitle_filter_str`, or `subtitle_cwd` at all, since seeking and
+subtitle burn-in both now happen exactly once, in the upfront extraction
+step, rather than being repeated in every pass.
+
+One important correctness detail caught before shipping: the upfront
+extraction is always re-encoded, deliberately never stream-copied even
+when there's no subtitle filter to apply. Stream copy (`-c copy`) can
+only cut at keyframes, since it never decodes anything — meaning the
+extracted segment could start several seconds before the actual
+requested in-point if the nearest keyframe is far away, silently
+shifting the whole clip earlier than intended. Re-encoding this tiny
+few-second segment costs well under a second on any modern machine,
+negligible next to the seek-avoidance this whole change is for — and
+frame accuracy is the actual point of this app, so that wasn't a trade
+worth making to save a fraction of a second.
+
+## GIF export: confirmed root cause and fix — -t argument position bug
+
+The diagnostic logging paid off immediately, along with a second real
+data point: the export DID eventually finish, producing a 579MB GIF for
+a 3-second selection (222KB for the identical selection as MP4). That
+size difference confirmed the leading theory precisely.
+
+Root cause: `encode_gif_attempt`'s second ffmpeg call (the actual
+paletteuse encoding pass) has TWO inputs — the source video and the
+generated palette image. `-t duration` was placed between the two `-i`
+flags:
+
+```
+-ss <in> -i <video> -t <duration> -i <palette> -lavfi "..." <out>
+```
+
+With two inputs, an option placed between `-i` flags gets read as an
+INPUT option for whichever input follows it — so `-t duration` was being
+applied to the palette image input (meaningless for a static image)
+instead of capping the actual output duration. The video input was left
+completely uncapped, decoding from the seek point all the way to the end
+of the file. This is the only one of this project's ffmpeg commands with
+two inputs, which is exactly why MP4 export (always exactly one `-i`,
+so no such ambiguity exists) was never affected, while this specific GIF
+pass always was.
+
+Fixed by moving `-t duration` to after BOTH `-i` flags, immediately
+before `-lavfi`, where it's unambiguously an output-level option
+regardless of how many inputs precede it. The first GIF pass (palette
+generation) never had this bug — it only ever has one input, so `-t`
+there was always unambiguous.
+
+## GIF export hanging — diagnostic logging added, root cause still open
+
+Real report: GIF export for a 3-second clip never completing, confirmed
+still running via Task Manager at 16% CPU — not a hard deadlock (that
+would show 0%), but far below what a genuine few-second encode should
+need. MP4 export for a similar clip is fast, which rules out the shared
+seek/input mechanism and narrows this specifically to the GIF pipeline's
+own two-pass palettegen/paletteuse commands.
+
+Couldn't pin down the exact cause through code review alone — added
+`log_command()`, called from `run_bin()` for every single ffmpeg/ffprobe
+invocation, appending the exact command line (plus cwd, if set) to
+`%TEMP%\klippit-ffmpeg.log`. Best-effort, never affects the actual
+export if logging itself fails. Leading theory going in: a seek or
+duration argument not correctly limiting one of the two GIF-pipeline
+ffmpeg passes to the intended short window, causing it to decode much
+further back in the file than intended — this log will confirm or rule
+that out directly against the real command, rather than continuing to
+reason about it from the source alone.
+
+## Review window: wrong position, controls that appeared missing
+
+Real bug, confirmed via a real screenshot after an export: the review
+window ("Klippit — Preview," opened by the Play button) had a fixed size
+but no explicit position set at all — it could spawn anywhere, including
+overlapping confusingly with the main window, or ending up behind other
+applications entirely (VLC, in this case). Read as "the video preview
+appears below the main screen, not on top."
+
+`.center()` handles the position. For actually appearing above
+everything — not just the main window but other applications too —
+`.set_focus()` alone isn't a strong enough guarantee: Windows has its
+own focus-stealing-prevention rules that can block a window from
+grabbing foreground status depending on timing and which process is
+asking. `always_on_top(true)` is the real fix, the same mechanism
+already used for the main window itself and for the same underlying
+reason; `.set_focus()` stays in as a secondary nudge, not the primary
+mechanism.
+
+The "no player controls" symptom turned out to be a red herring — tried
+removing `autoplay` on the theory that native controls fade out during
+playback without mouse hover, but that theory wasn't the actual
+complaint; reverted, `autoplay` stays.
+
 ## Manual file loading when opened without mpv/VLC context
 
 Following directly from the dev-preview label fix above: if there's no

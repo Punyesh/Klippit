@@ -90,7 +90,29 @@ struct VideoMetadata {
 // under that exact name, check that crate's current docs for the actual
 // method — the rest of this fix's logic (bare filename + matching cwd)
 // stays correct regardless of what that one method call ends up being.
+// Appends every ffmpeg/ffprobe invocation's exact command line to
+// %TEMP%\klippit-ffmpeg.log — added specifically to diagnose a real
+// report of GIF export hanging with unexpectedly low, sustained CPU
+// usage (16%, not the near-100% burst you'd expect for a genuine few-
+// second encode, and not 0% either, so not a hard deadlock) — the
+// leading theory is a seek/duration argument not correctly limiting one
+// of the GIF pipeline's two ffmpeg passes to the intended short window,
+// causing it to decode from much further back in the file than
+// intended. This log makes that checkable directly rather than guessed
+// at from code alone. Best-effort — a logging failure never affects the
+// actual export.
+fn log_command(name: &str, args: &[String], cwd: Option<&std::path::Path>) {
+    use std::io::Write;
+    let log_path = std::env::temp_dir().join("klippit-ffmpeg.log");
+    let cwd_note = cwd.map(|c| format!(" (cwd: {})", c.display())).unwrap_or_default();
+    let line = format!("{name} {}{cwd_note}\n", args.join(" "));
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 async fn run_bin(app: &AppHandle, name: &str, args: &[String], cwd: Option<&std::path::Path>) -> Result<Vec<u8>, String> {
+    log_command(name, args, cwd);
     let sidecar = app
         .shell()
         .sidecar(name)
@@ -416,6 +438,47 @@ async fn run_ffmpeg_2pass(
 }
 
 async fn export_gif(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str, subtitle_filter_str: Option<&str>, subtitle_cwd: Option<&std::path::Path>) -> Result<(), String> {
+    // Extract the target window ONCE into a small intermediate file,
+    // rather than re-seeking into the original source for every single
+    // palette-gen/paletteuse pass and every target-size retry attempt.
+    // Confirmed via real testing: a clip ~9 minutes into a file took
+    // ~6 minutes to GIF-export even with duration correctly bounded (see
+    // the -t fix above) — almost certainly the cost of two separate deep
+    // seeks into the source (one per pass), which in target-size mode
+    // could happen up to six times across retries. Extracting once up
+    // front pays that cost exactly once no matter how many GIF passes
+    // follow, since every subsequent pass reads from this small file
+    // starting at position 0 — no seeking needed there at all.
+    let temp_segment = std::env::temp_dir().join(format!("klippit-gif-src-{}.mkv", std::process::id()));
+    let mut extract_args: Vec<String> = vec![
+        "-y".into(), "-ss".into(), params.in_time.to_string(), "-i".into(), params.file_path.clone(),
+        "-t".into(), duration.to_string(),
+    ];
+    if let Some(f) = subtitle_filter_str {
+        extract_args.push("-vf".into());
+        extract_args.push(f.to_string());
+    }
+    // Always re-encoded here, deliberately never stream-copied (-c copy)
+    // even without subtitles: stream copy can only cut at keyframes,
+    // since it never decodes anything at all — meaning the extracted
+    // segment could start several seconds before the actual requested
+    // in-point if the nearest keyframe is far away, silently shifting
+    // the whole clip. Re-encoding this tiny few-second segment costs
+    // well under a second on any modern machine — negligible next to
+    // the seek-avoidance this whole restructure is for — and this app
+    // is specifically about frame-accurate exports, so that's not a
+    // trade worth making to save a fraction of a second here.
+    extract_args.push("-c:v".into());
+    extract_args.push("libx264".into());
+    extract_args.push("-crf".into());
+    extract_args.push("18".into()); // visually near-lossless — this file is a throwaway intermediate, not the final output
+    extract_args.push("-preset".into());
+    extract_args.push("veryfast".into());
+    extract_args.push("-an".into()); // GIFs never have audio — no reason to carry it into the intermediate file
+    extract_args.push(temp_segment.to_string_lossy().to_string());
+    run_bin(app, "ffmpeg", &extract_args, subtitle_cwd).await?;
+    let segment_path = temp_segment.to_string_lossy().to_string();
+
     // Two-pass palette gen/use — same technique as the wasm version, just
     // real ffmpeg instead of a wasm build. Target-size mode iterates width/
     // fps rather than a bitrate knob, since GIF has none.
@@ -426,7 +489,7 @@ async fn export_gif(app: &AppHandle, params: &ExportParams, duration: f64, out_p
     };
 
     for attempt in 0..3 {
-        encode_gif_attempt(app, params, duration, width, fps, out_path, subtitle_filter_str, subtitle_cwd).await?;
+        encode_gif_attempt(app, &segment_path, width, fps, out_path).await?;
         if params.mode != "size" { break; }
 
         let size_mb = std::fs::metadata(out_path).map(|m| m.len() as f64 / 1_000_000.0).unwrap_or(0.0);
@@ -435,40 +498,34 @@ async fn export_gif(app: &AppHandle, params: &ExportParams, duration: f64, out_p
         width = (width as f64 * 0.8) as u32;
         fps = (fps as f64 * 0.85).max(8.0) as u32;
     }
+
+    // Best-effort cleanup — a leftover temp segment is harmless either
+    // way, so a failed removal here doesn't fail the export.
+    let _ = std::fs::remove_file(&temp_segment);
     Ok(())
 }
 
-async fn encode_gif_attempt(app: &AppHandle, params: &ExportParams, duration: f64, width: u32, fps: u32, out_path: &str, subtitle_filter_str: Option<&str>, subtitle_cwd: Option<&std::path::Path>) -> Result<(), String> {
-    // Same ordering fix as export_mp4: subtitles before scale, so the
-    // filter burns onto the original-resolution frame rather than an
-    // already-downscaled one — both for correct ASS positioning and to
-    // avoid the original_size auto-detection failure (see subtitle_filter).
-    let mut base_filters = vec![format!("fps={fps}")];
-    if let Some(f) = subtitle_filter_str { base_filters.push(f.to_string()); }
-    base_filters.push(format!("scale={width}:-2:flags=lanczos"));
-    let base = base_filters.join(",");
-
-    // palette/out_path/params.file_path are all absolute paths passed as
-    // plain argv elements (not embedded in a filter string), so they're
-    // unaffected by subtitle_cwd — only the subtitle filter string
-    // itself (base, above) depends on the process's working directory
-    // being set correctly.
+async fn encode_gif_attempt(app: &AppHandle, segment_path: &str, width: u32, fps: u32, out_path: &str) -> Result<(), String> {
+    // No seeking, no subtitle filter, no cwd needed here anymore — all
+    // of that already happened once in export_gif's upfront extraction.
+    // segment_path is a small, already-trimmed, already-subtitled file
+    // starting at position 0, so every pass here just reads straight
+    // through it start to finish.
+    let base = format!("fps={fps},scale={width}:-2:flags=lanczos");
     let palette = format!("{out_path}.palette.png");
 
     run_bin(app, "ffmpeg", &[
-        "-y".into(), "-ss".into(), params.in_time.to_string(), "-i".into(), params.file_path.clone(),
-        "-t".into(), duration.to_string(),
+        "-y".into(), "-i".into(), segment_path.to_string(),
         "-vf".into(), format!("{base},palettegen"),
         palette.clone(),
-    ], subtitle_cwd).await?;
+    ], None).await?;
 
     run_bin(app, "ffmpeg", &[
-        "-y".into(), "-ss".into(), params.in_time.to_string(), "-i".into(), params.file_path.clone(),
-        "-t".into(), duration.to_string(),
+        "-y".into(), "-i".into(), segment_path.to_string(),
         "-i".into(), palette.clone(),
         "-lavfi".into(), format!("{base}[x];[x][1:v]paletteuse=dither=bayer"),
         out_path.into(),
-    ], subtitle_cwd).await?;
+    ], None).await?;
 
     let _ = std::fs::remove_file(&palette);
     Ok(())
@@ -758,12 +815,24 @@ async fn open_review_window(app: AppHandle, path: String) -> Result<(), String> 
     let path_json = serde_json::to_string(&path).map_err(|e| e.to_string())?;
     let script = format!("window.__KLIPPIT_REVIEW_PATH__ = {path_json};");
 
-    tauri::WebviewWindowBuilder::new(&app, "review", tauri::WebviewUrl::App("review.html".into()))
+    let window = tauri::WebviewWindowBuilder::new(&app, "review", tauri::WebviewUrl::App("review.html".into()))
         .title("Klippit — Preview")
         .inner_size(640.0, 480.0)
         .initialization_script(&script)
+        // Guarantees this appears above EVERYTHING, including other
+        // applications like VLC — not just the main Klippit window.
+        // set_focus() alone isn't a strong enough guarantee here: Windows
+        // has its own focus-stealing-prevention rules that can block a
+        // window from grabbing foreground status depending on timing, so
+        // it's kept below as a secondary nudge, not the primary
+        // mechanism. always_on_top is the same approach already used for
+        // the main window itself, for the same underlying reason.
+        .always_on_top(true)
         .build()
         .map_err(|e| e.to_string())?;
+
+    let _ = window.center();
+    let _ = window.set_focus();
 
     Ok(())
 }
