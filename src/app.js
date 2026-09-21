@@ -7,15 +7,23 @@
 'use strict';
 
 // ---------- state ----------
-// mpv's handoff (see mpv-scripts/clip-trigger.lua) still needs to inject
-// window.__KLIPPIT_INIT__ before this script runs — that wiring (reading
-// --init on the Rust side, evaluating it into the webview pre-load) isn't
-// done yet, so init below still falls back to dev-preview values whether
-// or not you launched this from mpv. Metadata/export/dialog/close calls
-// below, on the other hand, are wired to the real Tauri backend.
+// The mpv/VLC handoff (see mpv-scripts/clip-trigger.lua and
+// vlc-scripts/klippit-extension.lua) has been fully wired and tested for
+// a long time now — window.__KLIPPIT_INIT__ gets set correctly when
+// launched that way. The fallback below only matters for two genuinely
+// different situations, both real: launching klippit.exe directly with
+// no file context at all (a real Tauri backend, just nothing to edit
+// yet), and actually opening this file in a plain browser tab with no
+// Tauri runtime present (true dev preview, used for iterating on the UI
+// without a full build each time). Worth keeping these worded
+// differently — confirmed confusing in practice when the first case
+// showed the second case's wording, reading as if something were
+// broken when it wasn't.
 var init = window.__KLIPPIT_INIT__ || {
   filePath: '',
-  fileName: '(no file — dev preview mode)',
+  fileName: window.__TAURI__
+    ? '(no file loaded — trigger from mpv or VLC)'
+    : '(no file — dev preview, no Tauri backend)',
   startTime: 12.0,
   subtitle: { available: false }
 };
@@ -587,11 +595,18 @@ function applyInit(newInit) {
   subsOnBtn.disabled = false;
   subsStatus.textContent = '';
 
+  var loadPrompt = document.getElementById('load-prompt');
   if (init.filePath) {
+    if (loadPrompt) loadPrompt.style.display = 'none';
     video.src = window.__TAURI__
       ? window.__TAURI__.core.convertFileSrc(init.filePath)
       : 'file://' + init.filePath; // browser dev-preview fallback only
     video.load();
+  } else if (loadPrompt) {
+    // Opened directly with no file context (no mpv/VLC trigger) — offer
+    // a way in rather than just sitting there empty. See load-browse-btn
+    // and the drag-drop handling below.
+    loadPrompt.style.display = 'flex';
   }
 
   loadMetadata();
@@ -600,6 +615,72 @@ function applyInit(newInit) {
 // Exposed globally so main.rs's single-instance handler can call this
 // directly on the already-open window via window.eval(...).
 window.applyInit = applyInit;
+
+// ---------- loading a file manually (Browse or drag-and-drop) ----------
+// Only relevant when Klippit is opened without mpv/VLC context — see the
+// load-prompt overlay in index.html, shown/hidden in applyInit() above
+// based on whether a real file is currently loaded. Builds the same
+// shape of object mpv/VLC's --init handoff produces and feeds it through
+// that exact same applyInit() path, rather than duplicating any of its
+// reset logic here.
+function loadFileManually(filePath) {
+  var fileName = filePath.split(/[\\/]/).pop();
+  applyInit({
+    filePath: filePath,
+    fileName: fileName,
+    startTime: 0,
+    // Real subtitle detection happens via ffprobe in loadMetadata(),
+    // same as every other trigger path — this initial guess is just the
+    // same safe default VLC's own trigger always starts with.
+    subtitle: { available: false }
+  });
+}
+
+var loadBrowseBtn = document.getElementById('load-browse-btn');
+if (loadBrowseBtn) {
+  loadBrowseBtn.onclick = function () {
+    if (!window.__TAURI__) {
+      setStatus('file picker needs the Tauri backend (not available in dev preview)', 'error');
+      return;
+    }
+    window.__TAURI__.dialog.open({
+      multiple: false,
+      filters: [{ name: 'Video', extensions: ['mp4', 'mkv', 'webm', 'avi', 'mov', 'm4v', 'flv', 'wmv', 'ts'] }]
+    }).then(function (selected) {
+      if (selected) loadFileManually(selected);
+    }).catch(function (err) {
+      setStatus('file picker failed: ' + err, 'error');
+    });
+  };
+}
+
+// UNVERIFIED: Tauri v2's dedicated drag-drop event API is new surface
+// area not exercised elsewhere in this project — the exact namespace/
+// method/payload shape here is my best understanding, not confirmed
+// against a real build. If dropping a file doesn't work, the Browse
+// button above is a fully reliable fallback regardless; this is a
+// bonus convenience layered on top, not the only way in.
+(function setUpDragDrop() {
+  if (!window.__TAURI__ || !window.__TAURI__.window) return;
+  try {
+    var win = window.__TAURI__.window.getCurrentWebviewWindow();
+    win.onDragDropEvent(function (event) {
+      var payload = event.payload || {};
+      var loadPrompt = document.getElementById('load-prompt');
+      if (payload.type === 'over') {
+        if (loadPrompt) loadPrompt.classList.add('dragover');
+      } else if (payload.type === 'drop' && payload.paths && payload.paths.length) {
+        if (loadPrompt) loadPrompt.classList.remove('dragover');
+        loadFileManually(payload.paths[0]);
+      } else {
+        if (loadPrompt) loadPrompt.classList.remove('dragover');
+      }
+    });
+  } catch (err) {
+    console.log('[klippit] drag-drop event API unavailable:', err);
+  }
+})();
+
 
 video.addEventListener('loadedmetadata', function () {
   state.duration = video.duration || 0;
