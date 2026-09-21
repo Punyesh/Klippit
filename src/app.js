@@ -25,7 +25,6 @@ var state = {
   fps: 24, // replaced with the real value once ffprobe reports it (see loadMetadata)
   inTime: init.startTime,
   outTime: init.startTime + 3,
-  activeHandle: 'in', // 'in' | 'out' — which one the frame bar and , / . keys nudge
   format: 'mp4', // 'mp4' | 'gif'
   burnSubs: false,
   mode: 'quality', // 'quality' | 'size'
@@ -36,7 +35,8 @@ var state = {
   outputDir: '~/Videos/Clips',
   outputFileName: '', // populated once we know the source filename — see updateDefaultFilename()
   sourceWidth: 0,
-  sourceHeight: 0
+  sourceHeight: 0,
+  muteAudio: false
 };
 
 var MED_STEP = 5;
@@ -44,7 +44,6 @@ var MED_STEP = 5;
 // ---------- dom ----------
 var video = document.getElementById('preview');
 var seekBar = document.getElementById('seek-bar');
-var trimTrack = document.getElementById('trim-track');
 var trimRange = document.getElementById('trim-range');
 var handleIn = document.getElementById('handle-in');
 var handleOut = document.getElementById('handle-out');
@@ -76,16 +75,19 @@ function render() {
   trimRange.style.left = inPct + '%';
   trimRange.style.width = Math.max(0, outPct - inPct) + '%';
 
-  var activeTime = state.activeHandle === 'in' ? state.inTime : state.outTime;
-  frameCount.textContent = frameOf(activeTime) + ' / ' + frameOf(dur) +
-    ' (' + state.activeHandle + ')';
+  updateFrameCounter();
   frameTime.textContent =
     'in ' + fmtTime(state.inTime) + '  \u2192  out ' + fmtTime(state.outTime) +
     '  (' + fmtTime(Math.max(0, state.outTime - state.inTime)) + ')';
 
-  selIn.setAttribute('aria-pressed', state.activeHandle === 'in');
-  selOut.setAttribute('aria-pressed', state.activeHandle === 'out');
   updateDefaultFilename();
+}
+// Reflects the video's current playhead position — not a marked point —
+// since frame-stepping is now pure navigation (see step() below). Called
+// on every timeupdate too, so it also tracks live during playback and
+// scrubbing, not just after a discrete frame-step click.
+function updateFrameCounter() {
+  frameCount.textContent = frameOf(video.currentTime) + ' / ' + frameOf(state.duration || 1);
 }
 
 // ---------- output filename ----------
@@ -113,12 +115,18 @@ document.getElementById('output-filename').addEventListener('input', function (e
   state.outputFileName = e.target.value;
 });
 
-// ---------- shared step function (mouse buttons AND keyboard both call this) ----------
+// ---------- frame-stepping: moves the PLAYHEAD, not a marked point ----------
+// Navigation is fully decoupled from marking now — ,/. and the «/‹/›/»
+// buttons step the video's current position frame by frame, same as
+// scrubbing or playback, not whichever point used to be "armed." Mark
+// In/Out (below) capture wherever this navigation lands you, which is
+// the actual point of the redesign: nudge to the exact frame first,
+// then mark it, rather than nudging an already-marked point directly.
 function step(deltaFrames) {
-  var key = state.activeHandle === 'in' ? 'inTime' : 'outTime';
-  var currentFrame = frameOf(state[key]);
+  var currentFrame = frameOf(video.currentTime);
   var next = clamp(currentFrame + deltaFrames, 0, frameOf(state.duration));
-  setHandleTime(state.activeHandle, timeOfFrame(next));
+  video.currentTime = timeOfFrame(next);
+  updateFrameCounter();
 }
 
 function setHandleTime(which, t, skipSeek) {
@@ -161,8 +169,8 @@ document.getElementById('fb-bigfwd').onclick = function () { step(Math.round(sta
 // the actual source of the bar feeling finicky to use, not the dragging
 // itself. Also arms that point for subsequent frame-stepping (,/.), so
 // you can mark roughly then nudge precisely right after, in one flow.
-selIn.onclick = function () { state.activeHandle = 'in'; setHandleTime('in', video.currentTime, true); };
-selOut.onclick = function () { state.activeHandle = 'out'; setHandleTime('out', video.currentTime, true); };
+selIn.onclick = function () { setHandleTime('in', video.currentTime, true); };
+selOut.onclick = function () { setHandleTime('out', video.currentTime, true); };
 
 // ---------- frame bar: keyboard ----------
 // Same , / . convention as sakuga-enhancer.js, so the muscle memory carries
@@ -177,8 +185,8 @@ window.addEventListener('keydown', function (e) {
 
   if (e.key === ',') { step(e.shiftKey ? -MED_STEP : -1); e.preventDefault(); }
   else if (e.key === '.') { step(e.shiftKey ? MED_STEP : 1); e.preventDefault(); }
-  else if (e.key === 'i' || e.key === 'I') { state.activeHandle = 'in'; setHandleTime('in', video.currentTime, true); e.preventDefault(); }
-  else if (e.key === 'o' || e.key === 'O') { state.activeHandle = 'out'; setHandleTime('out', video.currentTime, true); e.preventDefault(); }
+  else if (e.key === 'i' || e.key === 'I') { setHandleTime('in', video.currentTime, true); e.preventDefault(); }
+  else if (e.key === 'o' || e.key === 'O') { setHandleTime('out', video.currentTime, true); e.preventDefault(); }
   else if (e.key === 'Enter' && e.target.tagName !== 'BUTTON') { exportClip(); }
   else if (e.key === 'Escape') { closePanel(); }
   else if (e.key === ' ' && e.target.tagName !== 'BUTTON') { togglePlayback(); e.preventDefault(); }
@@ -254,33 +262,13 @@ screenshotBtn.onclick = function () {
   });
 };
 
-// ---------- draggable trim handles (mouse) ----------
-function makeDraggable(handle, which) {
-  handle.addEventListener('pointerdown', function (e) {
-    handle.setPointerCapture(e.pointerId);
-    state.activeHandle = which;
-    render();
-    function onMove(ev) {
-      var rect = trimTrack.getBoundingClientRect();
-      var pct = clamp((ev.clientX - rect.left) / rect.width, 0, 1);
-      setHandleTime(which, pct * state.duration);
-    }
-    function onUp() {
-      handle.removeEventListener('pointermove', onMove);
-      handle.removeEventListener('pointerup', onUp);
-    }
-    handle.addEventListener('pointermove', onMove);
-    handle.addEventListener('pointerup', onUp);
-  });
-  // Arrow-key nudging when a handle itself has focus, as an alternative to
-  // the , / . convention — both land on the same setHandleTime call.
-  handle.addEventListener('keydown', function (e) {
-    if (e.key === 'ArrowLeft') { state.activeHandle = which; step(-1); e.preventDefault(); }
-    else if (e.key === 'ArrowRight') { state.activeHandle = which; step(1); e.preventDefault(); }
-  });
-}
-makeDraggable(handleIn, 'in');
-makeDraggable(handleOut, 'out');
+// ---------- trim handles: purely visual now (see render()) ----------
+// Was previously draggable, both directly and as an alternative
+// keyboard-nudge path. Removed entirely: it made the ruler feel like an
+// interactive control competing with Mark In/Mark Out for the same job,
+// and the "just a visual, nothing more" ask this came from is a genuine
+// simplification, not a loss — the ruler still clearly shows where In
+// and Out currently are, it just no longer does anything itself.
 
 // ---------- seek bar (pure navigation — no side effects on In/Out) ----------
 seekBar.addEventListener('input', function () {
@@ -289,18 +277,13 @@ seekBar.addEventListener('input', function () {
 });
 video.addEventListener('timeupdate', function () {
   if (state.duration) seekBar.value = (video.currentTime / state.duration) * 1000;
-  // The only automatic behavior left: don't let playback silently run
-  // past your marked Out point — a simple "preview stops at your out
-  // marker" convenience, independent of anything else. Everything else
-  // that used to happen here (whichever point was "armed" continuously
-  // reassigning itself to follow playback/scrubbing/frame-stepping) is
-  // gone — that coupling was the actual source of the trim bar feeling
-  // finicky, not the dragging itself. Marking is explicit now: see
-  // selIn/selOut above.
-  if (!video.paused && state.outTime > state.inTime && video.currentTime >= state.outTime) {
-    video.pause();
-    video.currentTime = state.outTime;
-  }
+  updateFrameCounter(); // live frame count during playback/scrubbing, not just discrete frame-steps
+  // Playback and scrubbing are pure navigation — no side effects on
+  // In/Out, and nothing here stops or redirects playback either. An
+  // earlier "auto-pause at your Out marker" convenience got removed:
+  // it fired any time playback naturally passed an *old* Out point,
+  // including while just navigating toward a new mark, which
+  // contradicted the whole point of making navigation fully free.
 });
 
 // ---------- format / subtitle / mode toggles ----------
@@ -312,12 +295,18 @@ function bindSeg(idOn, idOff, onSelect) {
 bindSeg('fmt-mp4', 'fmt-gif', function (id) {
   state.format = id === 'fmt-mp4' ? 'mp4' : 'gif';
   document.getElementById('fps-field').style.display = state.format === 'gif' ? 'block' : 'none';
+  // GIFs never carry audio at all, so the mute toggle is meaningless
+  // there — hide it rather than leave a control with nothing to control.
+  document.getElementById('audio-field').style.display = state.format === 'gif' ? 'none' : 'block';
   updateOutputExt();
 });
 bindSeg('mode-quality', 'mode-size', function (id) {
   state.mode = id === 'mode-quality' ? 'quality' : 'size';
   document.getElementById('panel-quality').style.display = state.mode === 'quality' ? 'block' : 'none';
   document.getElementById('panel-size').style.display = state.mode === 'size' ? 'block' : 'none';
+});
+bindSeg('audio-keep', 'audio-mute', function (id) {
+  state.muteAudio = id === 'audio-mute';
 });
 
 bindSeg('subs-off', 'subs-on', function (id) {
@@ -508,7 +497,8 @@ function exportClip() {
     sourceWidth: state.sourceWidth,
     sourceHeight: state.sourceHeight,
     subtitleLang: currentSubtitleLang(),
-    subtitleExternalFile: currentSubtitleExternalFile()
+    subtitleExternalFile: currentSubtitleExternalFile(),
+    muteAudio: state.muteAudio
   };
   setStatus('exporting…', 'busy');
   statusActions.style.display = 'none';
@@ -580,7 +570,6 @@ function applyInit(newInit) {
   // whatever in/out/filename the previous file had.
   state.inTime = init.startTime;
   state.outTime = init.startTime + 3;
-  state.activeHandle = 'in';
   filenameManuallyEdited = false;
   lastExportedPath = null;
   state.sourceWidth = 0;
@@ -617,6 +606,24 @@ video.addEventListener('loadedmetadata', function () {
   video.currentTime = state.inTime;
   render();
 });
+
+// Called from main.rs's background setup check (env var + mpv/VLC script
+// install) via window.eval — only if something actually failed. Shows a
+// dismissible banner rather than a silent failure; a full log always
+// lives at %TEMP%\klippit-setup.log regardless of whether this fires.
+window.__klippitSetupWarning = function (message) {
+  var banner = document.getElementById('setup-warning');
+  var text = document.getElementById('setup-warning-text');
+  if (!banner || !text) return;
+  text.textContent = 'Setup check: ' + message;
+  banner.style.display = 'flex';
+};
+var setupWarningDismiss = document.getElementById('setup-warning-dismiss');
+if (setupWarningDismiss) {
+  setupWarningDismiss.onclick = function () {
+    document.getElementById('setup-warning').style.display = 'none';
+  };
+}
 
 updateOutputExt();
 applyInit(init);

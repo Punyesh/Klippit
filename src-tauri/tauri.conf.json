@@ -20,6 +20,15 @@
     "active": true,
     "targets": "all",
     "icon": ["icons/icon.ico"],
-    "externalBin": ["binaries/ffmpeg", "binaries/ffprobe"]
+    "externalBin": ["binaries/ffmpeg", "binaries/ffprobe"],
+    "resources": {
+      "../mpv-scripts/clip-trigger.lua": "mpv-scripts/clip-trigger.lua",
+      "../vlc-scripts/klippit-extension.lua": "vlc-scripts/klippit-extension.lua"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "installer-hooks.nsh"
+      }
+    }
   }
 }

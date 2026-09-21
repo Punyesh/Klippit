@@ -52,6 +52,10 @@ struct ExportParams {
                                              // externally-loaded subtitle file, not
                                              // embedded in the container) takes
                                              // priority over lang matching when set
+    #[serde(default)]
+    mute_audio: bool, // strip audio entirely (-an) rather than encoding it;
+                       // meaningless for GIF (never has audio), UI hides the
+                       // toggle in that case
 }
 
 #[derive(Debug, Serialize)]
@@ -323,12 +327,14 @@ async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_p
 
     if params.mode == "size" {
         // Target-size mode: compute bitrate from target_size / duration,
-        // reserve a fixed slice for audio, 2-pass encode to hit it reliably.
+        // reserve a fixed slice for audio, 2-pass encode to hit it
+        // reliably. Muted: skip that reservation entirely and give the
+        // whole bitrate budget to video instead.
         let target_bits = params.target_mb * 8_000_000.0;
-        let audio_kbps = 128.0;
+        let audio_kbps = if params.mute_audio { 0.0 } else { 128.0 };
         let video_kbps = ((target_bits / duration / 1000.0) - audio_kbps).max(200.0);
 
-        run_ffmpeg_2pass(app, &params.file_path, params.in_time, duration, vf.as_deref(), video_kbps, audio_kbps, out_path, subtitle_cwd).await
+        run_ffmpeg_2pass(app, &params.file_path, params.in_time, duration, vf.as_deref(), video_kbps, audio_kbps, out_path, subtitle_cwd, params.mute_audio).await
     } else {
         let mut args: Vec<String> = vec![
             "-y".into(),
@@ -337,8 +343,13 @@ async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_p
             "-t".into(), duration.to_string(),
             "-crf".into(), params.crf.to_string(),
             "-preset".into(), "medium".into(),
-            "-c:a".into(), "aac".into(), "-b:a".into(), "128k".into(),
         ];
+        if params.mute_audio {
+            args.push("-an".into());
+        } else {
+            args.push("-c:a".into()); args.push("aac".into());
+            args.push("-b:a".into()); args.push("128k".into());
+        }
         if let Some(f) = &vf { args.push("-vf".into()); args.push(f.clone()); }
         args.push(out_path.into());
         run_bin(app, "ffmpeg", &args, subtitle_cwd).await.map(|_| ())
@@ -348,6 +359,7 @@ async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_p
 async fn run_ffmpeg_2pass(
     app: &AppHandle, input: &str, start: f64, duration: f64, vf: Option<&str>,
     video_kbps: f64, audio_kbps: f64, out_path: &str, subtitle_cwd: Option<&std::path::Path>,
+    mute_audio: bool,
 ) -> Result<(), String> {
     let bitrate = format!("{}k", video_kbps as u64);
     let audio = format!("{}k", audio_kbps as u64);
@@ -384,8 +396,13 @@ async fn run_ffmpeg_2pass(
         "-t".into(), duration.to_string(),
         "-c:v".into(), "libx264".into(), "-b:v".into(), bitrate,
         "-pass".into(), "2".into(), "-passlogfile".into(), passlog_prefix.clone(),
-        "-c:a".into(), "aac".into(), "-b:a".into(), audio,
     ];
+    if mute_audio {
+        pass2.push("-an".into());
+    } else {
+        pass2.push("-c:a".into()); pass2.push("aac".into());
+        pass2.push("-b:a".into()); pass2.push(audio);
+    }
     if let Some(f) = vf { pass2.push("-vf".into()); pass2.push(f.into()); }
     pass2.push(out_path.into());
     let result = run_bin(app, "ffmpeg", &pass2, subtitle_cwd).await.map(|_| ());
@@ -769,7 +786,134 @@ fn read_init_arg() -> Option<String> {
     extract_init_arg(&args)
 }
 
+// ---------- setup: environment variable + companion script installation ----------
+// Runs two ways: once, headlessly, right after install (see
+// installer-hooks.nsh calling `klippit.exe --setup`), and again in the
+// background every time Klippit launches normally (see .setup() in
+// main() below) as a self-healing safety net — covers both "the
+// installer's assumed resource-folder layout doesn't quite match this
+// build" and "the person moved/reinstalled Klippit since the last
+// install." Always overwriting the copied scripts on every run is
+// deliberate, not wasteful: it also means an updated script shipped in
+// a newer Klippit version automatically reaches the person's mpv/VLC
+// config on their very next launch, rather than requiring a manual
+// re-copy — a real recurring friction point earlier in this project.
+struct SetupResult {
+    env_var: Result<(), String>,
+    mpv_script: Result<(), String>,
+    vlc_script: Result<(), String>,
+}
+
+impl SetupResult {
+    fn any_failed(&self) -> bool {
+        self.env_var.is_err() || self.mpv_script.is_err() || self.vlc_script.is_err()
+    }
+}
+
+fn fmt_result(label: &str, r: &Result<(), String>) -> String {
+    match r {
+        Ok(()) => format!("{label}: OK"),
+        Err(e) => format!("{label}: FAILED — {e}"),
+    }
+}
+
+// UNVERIFIED which of these Tauri's NSIS bundler actually uses for
+// `bundle.resources` — "resources" alongside the exe is the documented
+// convention as I understand it, but trying the exe's own directory too
+// costs nothing and covers a plausible alternate layout.
+fn resource_dir_candidates(exe_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    vec![exe_dir.join("resources"), exe_dir.to_path_buf()]
+}
+
+fn find_resource(exe_dir: &std::path::Path, rel_path: &str) -> Option<std::path::PathBuf> {
+    resource_dir_candidates(exe_dir)
+        .into_iter()
+        .map(|base| base.join(rel_path))
+        .find(|candidate| candidate.exists())
+}
+
+fn set_klippit_path_env(exe_path: &std::path::Path) -> Result<(), String> {
+    let exe_str = exe_path.to_string_lossy().to_string();
+    // setx over a registry-writing crate: no new dependency, and this is
+    // the exact same mechanism already documented and manually verified
+    // working throughout this project — high confidence, unlike most of
+    // what surrounds it here.
+    let mut cmd = std::process::Command::new("setx");
+    cmd.arg("KLIPPIT_PATH").arg(&exe_str);
+    // Without this, setx — a console application — pops open a visible
+    // console window, since klippit.exe itself is a GUI app with no
+    // console of its own to share. Confirmed as a real failure mode:
+    // closing that window before setx finished writing killed it
+    // mid-operation. No window at all means nothing for anyone to
+    // accidentally close.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to run setx: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(())
+}
+
+fn install_script(exe_dir: &std::path::Path, resource_rel: &str, dest_dir: std::path::PathBuf, dest_name: &str) -> Result<(), String> {
+    let src = find_resource(exe_dir, resource_rel)
+        .ok_or_else(|| format!("bundled resource not found: {resource_rel} (tried resources/ and the exe's own directory)"))?;
+    std::fs::create_dir_all(&dest_dir).map_err(|e| format!("couldn't create {}: {e}", dest_dir.display()))?;
+    let dest = dest_dir.join(dest_name);
+    std::fs::copy(&src, &dest).map_err(|e| format!("couldn't copy to {}: {e}", dest.display()))?;
+    Ok(())
+}
+
+fn run_setup() -> SetupResult {
+    let exe_path = std::env::current_exe().unwrap_or_default();
+    let exe_dir = exe_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+
+    let env_var = set_klippit_path_env(&exe_path);
+
+    let mpv_dest = std::path::PathBuf::from(&appdata).join("mpv").join("scripts");
+    let mpv_script = install_script(&exe_dir, "mpv-scripts/clip-trigger.lua", mpv_dest, "clip-trigger.lua");
+
+    let vlc_dest = std::path::PathBuf::from(&appdata).join("vlc").join("lua").join("extensions");
+    let vlc_script = install_script(&exe_dir, "vlc-scripts/klippit-extension.lua", vlc_dest, "klippit.lua");
+
+    SetupResult { env_var, mpv_script, vlc_script }
+}
+
+// Overwritten on every setup run (both the installer's one-shot --setup
+// call and the background check on every normal launch) — always shows
+// the latest status, not a growing history, since only "is it correct
+// right now" matters here.
+fn write_setup_log(result: &SetupResult) {
+    let lines = vec![
+        fmt_result("KLIPPIT_PATH env var", &result.env_var),
+        fmt_result("mpv script", &result.mpv_script),
+        fmt_result("VLC extension", &result.vlc_script),
+    ];
+    let log_path = std::env::temp_dir().join("klippit-setup.log");
+    let _ = std::fs::write(log_path, lines.join("\n"));
+}
+
 fn main() {
+    // Headless setup mode — invoked once by the installer right after
+    // install finishes (see installer-hooks.nsh). No window, no Tauri
+    // Builder at all: just do the work, log the outcome, exit. Kept
+    // deliberately independent of Tauri's own machinery (current_exe(),
+    // std::fs, std::process — nothing Tauri-specific) so this path works
+    // identically whether or not the NSIS hook wiring above it turns out
+    // to be exactly right.
+    if std::env::args().any(|a| a == "--setup") {
+        let result = run_setup();
+        write_setup_log(&result);
+        std::process::exit(0);
+    }
+
     let init_json = read_init_arg();
 
     tauri::Builder::default()
@@ -818,7 +962,34 @@ fn main() {
                 builder = builder.initialization_script(&script);
             }
 
-            builder.build()?;
+            let window = builder.build()?;
+
+            // Self-healing safety net: re-verify the same things the
+            // installer's --setup call already tried, every normal
+            // launch too — covers both "the installer hook's assumed
+            // resource layout wasn't quite right for this build" and
+            // "the person moved or reinstalled Klippit since the last
+            // install." Spawned after the window already exists so it
+            // adds no perceptible startup delay; only surfaces anything
+            // in-app if something actually failed, so a working setup
+            // stays invisible rather than nagging every launch.
+            tauri::async_runtime::spawn(async move {
+                let result = run_setup();
+                write_setup_log(&result);
+                if result.any_failed() {
+                    let msg = format!(
+                        "{}\n{}\n{}",
+                        fmt_result("KLIPPIT_PATH", &result.env_var),
+                        fmt_result("mpv script", &result.mpv_script),
+                        fmt_result("VLC extension", &result.vlc_script),
+                    );
+                    let _ = window.eval(&format!(
+                        "window.__klippitSetupWarning && window.__klippitSetupWarning({});",
+                        serde_json::to_string(&msg).unwrap_or_else(|_| "\"setup check failed\"".into())
+                    ));
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

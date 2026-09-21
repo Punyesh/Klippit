@@ -93,21 +93,9 @@ html, body {
   flex-shrink: 0;
 }
 #head .brand {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--text);
-  letter-spacing: 1.5px;
+  color: var(--red);
   display: flex;
   align-items: center;
-  gap: 6px;
-}
-#head .brand::before {
-  content: "";
-  width: 6px; height: 6px;
-  border-radius: 50%;
-  background: var(--red);
-  box-shadow: 0 0 3px var(--red);
-  flex-shrink: 0;
 }
 #head .source-name {
   font-family: var(--mono);
@@ -118,6 +106,30 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Shown only if the background setup check (env var + mpv/VLC script
+   install) actually failed at something — invisible otherwise, since a
+   working setup shouldn't nag every launch. See window.__klippitSetupWarning
+   in app.js and run_setup() in main.rs. */
+#setup-warning {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--red-dim);
+  border-bottom: 1px solid var(--red);
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text);
+  flex-shrink: 0;
+  white-space: pre-line;
+}
+#setup-warning-dismiss {
+  background: none; border: none; color: var(--dim); cursor: pointer;
+  font-size: 14px; line-height: 1; padding: 0 2px; flex-shrink: 0;
+}
+#setup-warning-dismiss:hover { color: var(--text); }
 
 /* ---------- video preview ---------- */
 #preview-wrap {
@@ -213,10 +225,10 @@ html, body {
   background: var(--panel);
   border: 1px solid var(--red);
   border-radius: 0;
-  cursor: ew-resize;
+  cursor: default; /* purely visual now — see app.js, no longer draggable */
   transform: translateX(-50%);
+  pointer-events: none; /* was needed for drag hit-testing; now just gets out of the way */
 }
-.trim-handle:hover, .trim-handle:focus-visible { background: var(--red-dim); }
 /* Subtle shape distinction between In and Out — each handle's rounded
    edge faces into the selected range, its flat edge faces outward, the
    way trim handles are conventionally shaped in real editing software.
@@ -246,18 +258,18 @@ html, body {
 /* Which handle (In / Out) the frame bar currently arms — a lit dot marks
    the armed one, echoing a tape deck's record-arm indicator. */
 .handle-select { display: flex; gap: 4px; margin-bottom: 4px; }
-.handle-btn {
+/* Mark In/Mark Out — plain, stateless one-click action buttons. No
+   pressed/armed indicator: clicking one does the thing immediately and
+   completely, nothing lingers to show afterward (that lingering "which
+   one is active" state was the old design, replaced with explicit
+   marking — see the redesign notes in app.js). */
+.mark-btn {
   flex: 1; padding: 4px 0; text-align: center; font-size: 10px;
   letter-spacing: .06em; cursor: pointer; font-family: var(--mono);
-  color: var(--dim); background: var(--bg); border: 1px solid var(--line); border-radius: 2px;
-  display: flex; align-items: center; justify-content: center; gap: 5px;
+  color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 2px;
 }
-.handle-btn::before {
-  content: ""; width: 5px; height: 5px; border-radius: 50%;
-  background: var(--line); flex-shrink: 0;
-}
-.handle-btn[aria-pressed="true"] { color: var(--text); border-color: var(--red); background: var(--red-dim); }
-.handle-btn[aria-pressed="true"]::before { background: var(--red); box-shadow: 0 0 3px var(--red); }
+.mark-btn:hover { border-color: var(--red); color: var(--red); }
+.mark-btn:active { background: var(--red-dim); border-color: var(--red); color: var(--text); }
 
 /* ---------- body / options ---------- */
 #body { padding: 8px 10px; overflow-y: auto; flex: 1 1 auto; min-height: 0; }

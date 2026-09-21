@@ -219,6 +219,112 @@ Each of these was found from real console errors/screenshots, in order:
    (`position: absolute; inset: 0`) so it stretches to fill
    `#preview-wrap` without disturbing the video's layout.
 
+## Automatic setup: env var, mpv script, VLC extension — no manual steps
+
+**Real failure confirmed on first actual install**: `KLIPPIT_PATH`
+failed to set while both scripts succeeded. Root cause: `setx` is a
+console application, and since `klippit.exe` is a GUI app with no
+console of its own, Windows opens a new visible console window for
+`setx` to run in — closing that window before `setx` finishes writing
+to the registry kills it mid-operation. Fixed with the `CREATE_NO_WINDOW`
+process creation flag on Windows, so `setx` now runs with no window at
+all — nothing left for anyone to accidentally close. The background
+self-healing check (see below) means this corrects itself automatically
+on the very next launch once rebuilt, no reinstall required.
+
+This whole session, every "did you re-copy the updated script" and
+"remember to set KLIPPIT_PATH" moment was manual friction. Replaced with
+an approach split across confidence levels, so the parts I'm sure about
+work regardless of whether the one uncertain part does:
+
+**High confidence — `run_setup()` in `main.rs`.** Pure Rust/std,
+no exotic APIs: sets `KLIPPIT_PATH` via `setx` (the exact mechanism
+already manually verified working earlier this session), and copies the
+bundled `clip-trigger.lua` / `klippit-extension.lua` into `%APPDATA%\mpv\
+scripts\` and `%APPDATA%\vlc\lua\extensions\`, creating those folders if
+needed. Always overwrites rather than checking first — deliberately, so
+a script updated in a newer Klippit build automatically reaches the
+person's mpv/VLC config on their very next launch, rather than needing
+another manual re-copy.
+
+This runs two ways:
+- **Once, headlessly**, via `klippit.exe --setup` — no window, no Tauri
+  Builder, just the setup logic and a log file, then exit. This is what
+  the installer calls (see below).
+- **In the background, every normal launch**, spawned right after the
+  window is built (so it adds no perceptible startup delay — the window
+  appears immediately either way) as a self-healing safety net. Covers
+  both "the installer's assumed resource-folder layout wasn't quite
+  right for this build" and "the person moved or reinstalled Klippit
+  since the last install."
+
+A log always lands at `%TEMP%\klippit-setup.log` regardless of which
+path ran, and if the background check finds a real failure, a
+dismissible banner appears in-app (`window.__klippitSetupWarning`) —
+a working setup stays invisible, a broken one doesn't fail silently.
+
+**Moderate confidence** — `tauri::async_runtime::spawn` for the
+background task, and capturing the window handle into it. A standard
+Tauri pattern for exactly this "something after setup, without blocking
+it" case, but a less-tested pattern in this codebase than the
+async-command-driven code that makes up most of it.
+
+**Unverified — `installer-hooks.nsh` and its `tauri.conf.json` wiring**
+(`bundle.windows.nsis.installerHooks`). This is genuinely just one line
+(`ExecWait '"$INSTDIR\klippit.exe" --setup'`) inside a
+`NSIS_HOOK_POSTINSTALL` macro — the actual setup logic lives entirely in
+the high-confidence Rust code above, this file's only job is triggering
+it during the install wizard instead of a moment after. If `cargo tauri
+build` fails specifically on this file or that config key, that's the
+exact thing to report back — the background self-healing check still
+covers everything correctly regardless, just a moment later than ideal
+rather than not at all.
+
+Also added: `bundle.resources` in `tauri.conf.json`, mapping both
+scripts into the installer output so they're available at runtime for
+`run_setup()` to find and copy.
+
+## Header: dropped the redundant "KLIPPIT" text
+
+The OS window title bar already shows the app name and icon; the app's
+own in-window header repeated it as text right below, which looked
+doubled in any view showing both together (e.g. a taskbar hover
+preview). Replaced the text brand with a small inline SVG version of the
+same K-mark used for the app icon — a quiet visual anchor instead of a
+redundant label.
+
+## Trim bar is now purely visual — dragging and auto-pause both removed
+
+Real, reported friction: playback would refuse to advance past an old
+Out marker even while just navigating toward a new mark, because of an
+"auto-pause at your Out point" convenience added during the Mark
+In/Mark Out redesign. That convenience directly contradicted the
+redesign's own premise — navigation is supposed to be completely free —
+so it's removed entirely, along with handle dragging (which was already
+downgraded to "supplementary" in that same redesign, and turned out not
+to be worth keeping once Mark In/Mark Out covered the actual job).
+
+The ruler and its two handles now do exactly one thing: show where In
+and Out currently are. `#handle-in`/`#handle-out` changed from
+`<button>` to plain `<div>` (no focus, no interaction at all), CSS
+cursor changed from `ew-resize` to `default`, and `pointer-events: none`
+keeps them fully out of the way of anything else on the page. Removed
+dead code this left behind: `makeDraggable()`, `stepHandle()`, and the
+now-unused `trimTrack` DOM reference.
+
+## Mute audio option + larger screenshot icon
+
+Added an Audio Keep/Mute segmented toggle (same visual pattern as
+Subtitles), hidden entirely for GIF output since GIFs never carry audio
+at all. Quality mode uses `-an` instead of encoding an AAC track when
+muted; target-size mode also skips reserving the usual 128kbps audio
+slice in that case, giving video the full bitrate budget instead of
+wasting part of it on a track that won't exist.
+
+Screenshot icon bumped from 12px to 16px (with a slightly lighter stroke
+width to match) — the camera shape wasn't reading clearly at the
+original size, confirmed by rendering both side by side.
+
 ## Replaced the trim bar's interaction model: explicit Mark In/Mark Out
 
 The old model had whichever point ("In" or "Out") was currently "armed"
@@ -228,20 +334,35 @@ handle-dragging itself, was the real source of the bar feeling finicky:
 scrub around to find your out point and you could easily be silently
 moving In instead without realizing which one was armed.
 
-Replaced with the Sakuga Enhancer pattern: scrubbing, playback, and
-frame-stepping are now pure navigation with zero side effects on In/Out.
-**Mark In** / **Mark Out** (or **I** / **O** on the keyboard) are
-explicit, deliberate actions — click one and wherever the playhead is
-*right now* becomes that point, full stop. Marking also arms that point
-for subsequent `,`/`.` frame-stepping, so the natural flow is: scrub
-roughly, mark, nudge precisely if needed, repeat for the other point.
+Replaced with the Sakuga Enhancer pattern, fully decoupled:
 
-Dragging the ruler handles directly still works as a supplementary
-method (it already correctly arms the dragged handle too), just no
-longer the primary or only way to set points, and no longer entangled
-with general playback. The one remaining automatic behavior: playback
-still auto-pauses if it reaches your marked Out point, a simple "preview
-stops at your out marker" convenience, independent of anything else.
+- **Playback, the seek bar, and `,`/`.` frame-stepping are pure
+  navigation** — they move the video's playhead and nothing else. No
+  side effects on In/Out at all anymore, including frame-stepping
+  itself: an initial version of this redesign still had `,`/`.` nudge
+  whichever point was armed directly, which didn't fit the new model —
+  since marking now captures wherever navigation lands you, the stepping
+  controls belong to the player, not to a marked point.
+- **Mark In / Mark Out** (buttons, or **I** / **O** on the keyboard) are
+  the only things that touch In/Out during normal use — explicit,
+  stateless, one-click actions. Click one and wherever the playhead is
+  *right now* becomes that point, immediately and completely. Nothing
+  lingers afterward to show "which one is active," since there's no
+  ongoing state left to track — a deliberate simplification from an
+  earlier version that kept a persistent "armed" indicator on these
+  buttons, which didn't fit "one click" either.
+- **The natural flow**: scrub or frame-step to the exact spot, click
+  Mark In, scrub/step to the other spot, click Mark Out. Frame-accurate
+  by construction, since you're navigating to the exact frame before
+  marking it, rather than nudging an already-placed point afterward.
+
+Dragging the ruler handles directly still works as a supplementary,
+deliberate method for direct handle manipulation (arrow keys nudge the
+specific focused handle, distinct from general frame-stepping), just no
+longer the primary way to set points, and no longer entangled with
+playback. The one remaining automatic behavior: playback still
+auto-pauses if it reaches your marked Out point, a simple "preview stops
+at your out marker" convenience, independent of everything else.
 
 ## Correct subtitle track selection (multiple tracks / external files)
 

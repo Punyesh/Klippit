@@ -9,8 +9,13 @@
 <div id="app">
 
   <div id="head">
-    <div class="brand">KLIPPIT</div>
+    <div class="brand"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><line x1="7" y1="4" x2="7" y2="20"/><line x1="7" y1="12" x2="18" y2="4"/><line x1="7" y1="12" x2="18" y2="20"/></svg></div>
     <div class="source-name" id="source-name" title="">no file loaded</div>
+  </div>
+
+  <div id="setup-warning" style="display:none">
+    <span id="setup-warning-text"></span>
+    <button id="setup-warning-dismiss" title="Dismiss">&times;</button>
   </div>
 
   <div id="body-row">
@@ -22,7 +27,7 @@
 
   <div id="seek-row">
     <button class="frame-btn" id="play-pause-btn" title="Play/Pause (Space)">&#9654;</button>
-    <button class="frame-btn" id="screenshot-btn" title="Screenshot at current position"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M4 8h3l1.5-2h7L17 8h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="14" r="3.5"/></svg></button>
+    <button class="frame-btn" id="screenshot-btn" title="Screenshot at current position"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M4 8h3l1.5-2h7L17 8h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="14" r="3.5"/></svg></button>
     <button class="frame-btn" id="subs-preview-toggle" title="Show/hide subtitle preview (also affects screenshots)" aria-pressed="true">CC</button>
     <input id="seek-bar" type="range" min="0" max="1000" value="0"
            aria-label="Seek position" />
@@ -30,16 +35,14 @@
 
   <div class="frame-bar">
     <div class="handle-select" role="group" aria-label="Which point the frame controls adjust">
-      <button class="handle-btn" id="sel-in" aria-pressed="true" title="Set In to current position (I)">Mark In</button>
-      <button class="handle-btn" id="sel-out" aria-pressed="false" title="Set Out to current position (O)">Mark Out</button>
+      <button class="mark-btn" id="sel-in" title="Set In to current position (I)">Mark In</button>
+      <button class="mark-btn" id="sel-out" title="Set Out to current position (O)">Mark Out</button>
     </div>
 
     <div id="trim-track">
       <div id="trim-range"></div>
-      <button class="trim-handle" id="handle-in" style="left:0%"
-              aria-label="In point" title="drag, or use the frame buttons below"></button>
-      <button class="trim-handle" id="handle-out" style="left:20%"
-              aria-label="Out point" title="drag, or use the frame buttons below"></button>
+      <div class="trim-handle" id="handle-in" style="left:0%" title="In point"></div>
+      <div class="trim-handle" id="handle-out" style="left:20%" title="Out point"></div>
     </div>
 
     <div class="frame-row">
@@ -71,6 +74,14 @@
       <button class="seg-btn" id="subs-on" aria-pressed="false">Burn in</button>
     </div>
     <div class="frame-time" id="subs-status" style="text-align:left;margin-top:4px"></div>
+
+    <div id="audio-field">
+      <div class="section-label">Audio</div>
+      <div class="seg-group" role="group" aria-label="Audio track">
+        <button class="seg-btn" id="audio-keep" aria-pressed="true">Keep</button>
+        <button class="seg-btn" id="audio-mute" aria-pressed="false">Mute</button>
+      </div>
+    </div>
 
     <div class="section-label">Optimization</div>
     <div class="seg-group" role="group" aria-label="Optimization mode">
