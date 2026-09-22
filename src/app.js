@@ -45,7 +45,16 @@ var state = {
   sourceWidth: 0,
   sourceHeight: 0,
   muteAudio: false,
-  useGpu: false
+  useGpu: false,
+  cropEnabled: false,
+  cropAspect: 'free', // 'free' | '16:9' | '9:16' | '1:1'
+  // Crop rectangle in SOURCE VIDEO PIXEL coordinates, not screen pixels —
+  // this is what actually gets sent to export, and stays correct
+  // regardless of window resizing or preview letterboxing changes.
+  cropX: 0,
+  cropY: 0,
+  cropWidth: 0,  // 0 = not yet initialized; set to the full frame when crop is first enabled
+  cropHeight: 0
 };
 
 var MED_STEP = 5;
@@ -61,6 +70,7 @@ var selOut = document.getElementById('sel-out');
 var frameCount = document.getElementById('frame-count');
 var frameTime = document.getElementById('frame-time');
 var statusEl = document.getElementById('status');
+var previewWrap = document.getElementById('preview-wrap');
 
 // ---------- helpers ----------
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
@@ -292,7 +302,11 @@ screenshotBtn.onclick = function () {
     sourceWidth: state.sourceWidth,
     sourceHeight: state.sourceHeight,
     subtitleLang: currentSubtitleLang(),
-    subtitleExternalFile: currentSubtitleExternalFile()
+    subtitleExternalFile: currentSubtitleExternalFile(),
+    cropX: state.cropEnabled ? Math.round(state.cropX) : null,
+    cropY: state.cropEnabled ? Math.round(state.cropY) : null,
+    cropWidth: state.cropEnabled ? Math.round(state.cropWidth) : null,
+    cropHeight: state.cropEnabled ? Math.round(state.cropHeight) : null
   }).then(function (path) {
     setStatus('screenshot saved — ' + path, 'done');
   }).catch(function (err) {
@@ -352,6 +366,265 @@ bindSeg('audio-keep', 'audio-mute', function (id) {
 });
 bindSeg('gpu-off', 'gpu-on', function (id) {
   state.useGpu = id === 'gpu-on';
+});
+
+// ---------- crop ----------
+// Static crop applied uniformly to the whole clip (the "actual video
+// editor" territory — pan/follow-style animated cropping — was
+// deliberately scoped out as a separate, much bigger feature). Crop
+// coordinates live in SOURCE VIDEO PIXEL space throughout state, never
+// screen pixels, converted to/from screen coordinates only at render
+// and drag time via getVideoDisplayRect() below — this keeps the stored
+// crop correct regardless of window size or preview letterboxing.
+var cropOverlay = document.getElementById('crop-overlay');
+var cropBox = document.getElementById('crop-box');
+var cropMaskHole = document.getElementById('crop-mask-hole');
+var cropDimensions = document.getElementById('crop-dimensions');
+var cropSizeReadout = document.getElementById('crop-size-readout');
+var ASPECT_RATIOS = { '16:9': 16 / 9, '9:16': 9 / 16, '1:1': 1 };
+
+// Generic N-button segmented group — bindSeg() above only handles
+// exactly two buttons, which the aspect-ratio row (four) doesn't fit.
+function bindSegGroup(ids, onSelect) {
+  var buttons = ids.map(function (id) { return document.getElementById(id); });
+  buttons.forEach(function (btn, i) {
+    btn.onclick = function () {
+      buttons.forEach(function (b) { b.setAttribute('aria-pressed', 'false'); });
+      btn.setAttribute('aria-pressed', 'true');
+      onSelect(ids[i]);
+    };
+  });
+}
+
+// The actual rendered video rectangle within #preview-wrap, accounting
+// for object-fit: contain's letterboxing/pillarboxing — the crop
+// overlay has to be positioned against this, not #preview-wrap's own
+// (generally differently-shaped) box, or the crop box would drift from
+// the real video content whenever the source aspect ratio doesn't
+// exactly match the preview area's shape.
+//
+// CROP_EDGE_MARGIN mirrors #preview-wrap.crop-active's CSS padding
+// exactly (kept as one value here rather than reading computed styles,
+// simpler and just as correct since this function is the only caller).
+// Real usability fix: without it, a full-frame crop's corner handles
+// sit right at the video's own edge, which can coincide with the actual
+// OS window edge — easy to grab the window's own resize handle by
+// mistake instead of a crop handle.
+var CROP_EDGE_MARGIN = 10;
+function getVideoDisplayRect() {
+  var margin = state.cropEnabled ? CROP_EDGE_MARGIN : 0;
+  var wrapW = previewWrap.clientWidth - margin * 2;
+  var wrapH = previewWrap.clientHeight - margin * 2;
+  var vw = state.sourceWidth || wrapW;
+  var vh = state.sourceHeight || wrapH;
+  if (!vw || !vh || !wrapW || !wrapH) return { left: margin, top: margin, width: wrapW, height: wrapH };
+  var videoAspect = vw / vh;
+  var wrapAspect = wrapW / wrapH;
+  var dispW, dispH;
+  if (videoAspect > wrapAspect) {
+    dispW = wrapW;
+    dispH = wrapW / videoAspect;
+  } else {
+    dispH = wrapH;
+    dispW = wrapH * videoAspect;
+  }
+  return { left: margin + (wrapW - dispW) / 2, top: margin + (wrapH - dispH) / 2, width: dispW, height: dispH };
+}
+
+function renderCropOverlay() {
+  previewWrap.classList.toggle('crop-active', state.cropEnabled);
+  if (!state.cropEnabled || !state.sourceWidth || !state.sourceHeight || !state.cropWidth || !state.cropHeight) {
+    cropOverlay.style.display = 'none';
+    return;
+  }
+  cropOverlay.style.display = 'block';
+  var disp = getVideoDisplayRect();
+  var scaleX = disp.width / state.sourceWidth;
+  var scaleY = disp.height / state.sourceHeight;
+
+  var boxLeft = disp.left + state.cropX * scaleX;
+  var boxTop = disp.top + state.cropY * scaleY;
+  var boxWidth = state.cropWidth * scaleX;
+  var boxHeight = state.cropHeight * scaleY;
+
+  cropBox.style.left = boxLeft + 'px';
+  cropBox.style.top = boxTop + 'px';
+  cropBox.style.width = boxWidth + 'px';
+  cropBox.style.height = boxHeight + 'px';
+
+  cropMaskHole.setAttribute('x', boxLeft);
+  cropMaskHole.setAttribute('y', boxTop);
+  cropMaskHole.setAttribute('width', boxWidth);
+  cropMaskHole.setAttribute('height', boxHeight);
+
+  var label = Math.round(state.cropWidth) + ' \u00d7 ' + Math.round(state.cropHeight);
+  cropDimensions.textContent = label;
+  cropSizeReadout.textContent = label;
+}
+window.addEventListener('resize', renderCropOverlay);
+
+// Back to the full source frame — the "undo" for crop isn't a history
+// stack (see the design discussion this came out of): since crop is
+// never destructive to the source, redefining the box or resetting it
+// entirely covers everything a real undo would, without this being the
+// one setting in the whole app with its own history tracking.
+function resetCrop() {
+  if (!state.sourceWidth || !state.sourceHeight) return;
+  state.cropX = 0;
+  state.cropY = 0;
+  state.cropWidth = state.sourceWidth;
+  state.cropHeight = state.sourceHeight;
+  renderCropOverlay();
+}
+
+function applyCropAspect(ratioKey) {
+  state.cropAspect = ratioKey;
+  if (ratioKey === 'free' || !state.sourceWidth || !state.cropWidth) return;
+  var ratio = ASPECT_RATIOS[ratioKey];
+  var centerX = state.cropX + state.cropWidth / 2;
+  var centerY = state.cropY + state.cropHeight / 2;
+  // Fit to the current crop height first, falling back to width if that
+  // would overflow the source frame — keeps the result as large as
+  // reasonable while always staying fully inside the source.
+  var newH = state.cropHeight;
+  var newW = newH * ratio;
+  if (newW > state.sourceWidth) { newW = state.sourceWidth; newH = newW / ratio; }
+  if (newH > state.sourceHeight) { newH = state.sourceHeight; newW = newH * ratio; }
+  state.cropWidth = newW;
+  state.cropHeight = newH;
+  state.cropX = clamp(centerX - newW / 2, 0, state.sourceWidth - newW);
+  state.cropY = clamp(centerY - newH / 2, 0, state.sourceHeight - newH);
+  renderCropOverlay();
+}
+
+document.getElementById('crop-reset-btn').onclick = function () {
+  state.cropAspect = 'free';
+  bindSegGroupReset();
+  resetCrop();
+};
+function bindSegGroupReset() {
+  ['crop-aspect-free', 'crop-aspect-169', 'crop-aspect-916', 'crop-aspect-11'].forEach(function (id) {
+    document.getElementById(id).setAttribute('aria-pressed', id === 'crop-aspect-free' ? 'true' : 'false');
+  });
+}
+bindSegGroup(['crop-aspect-free', 'crop-aspect-169', 'crop-aspect-916', 'crop-aspect-11'], function (id) {
+  applyCropAspect({ 'crop-aspect-free': 'free', 'crop-aspect-169': '16:9', 'crop-aspect-916': '9:16', 'crop-aspect-11': '1:1' }[id]);
+});
+
+bindSeg('crop-off', 'crop-on', function (id) {
+  state.cropEnabled = id === 'crop-on';
+  if (state.cropEnabled && !state.cropWidth) resetCrop();
+  document.getElementById('crop-controls').style.display = state.cropEnabled ? 'block' : 'none';
+  renderCropOverlay();
+});
+
+// Drag inside the box (not on a handle) to move it without resizing.
+cropBox.addEventListener('pointerdown', function (e) {
+  if (e.target.classList.contains('crop-handle')) return; // handles have their own listener below
+  var startX = e.clientX, startY = e.clientY;
+  var startCropX = state.cropX, startCropY = state.cropY;
+  var disp = getVideoDisplayRect();
+  var scaleX = disp.width / state.sourceWidth;
+  var scaleY = disp.height / state.sourceHeight;
+
+  function onMove(ev) {
+    var dxSource = (ev.clientX - startX) / scaleX;
+    var dySource = (ev.clientY - startY) / scaleY;
+    state.cropX = clamp(startCropX + dxSource, 0, state.sourceWidth - state.cropWidth);
+    state.cropY = clamp(startCropY + dySource, 0, state.sourceHeight - state.cropHeight);
+    renderCropOverlay();
+  }
+  function onUp() {
+    document.removeEventListener('pointermove', onMove);
+    document.removeEventListener('pointerup', onUp);
+  }
+  document.addEventListener('pointermove', onMove);
+  document.addEventListener('pointerup', onUp);
+});
+
+// Corner handles resize from that corner, anchoring the opposite one.
+// Edge handles resize along one axis only, anchoring the opposite edge
+// — except when an aspect ratio is locked, where there's no natural
+// single-edge anchor, so the box grows/shrinks symmetrically around its
+// own center on the other axis instead.
+['nw', 'ne', 'sw', 'se', 'n', 's', 'e', 'w'].forEach(function (handle) {
+  document.getElementById('crop-handle-' + handle).addEventListener('pointerdown', function (e) {
+    e.stopPropagation(); // don't also trigger the move-drag listener above
+    var startX = e.clientX, startY = e.clientY;
+    var startCrop = { x: state.cropX, y: state.cropY, w: state.cropWidth, h: state.cropHeight };
+    var disp = getVideoDisplayRect();
+    var scaleX = disp.width / state.sourceWidth;
+    var scaleY = disp.height / state.sourceHeight;
+
+    var hasW = handle.indexOf('w') !== -1;
+    var hasE = handle.indexOf('e') !== -1;
+    var hasN = handle.indexOf('n') !== -1;
+    var hasS = handle.indexOf('s') !== -1;
+    var hasHorizontal = hasW || hasE;
+    var hasVertical = hasN || hasS;
+
+    // Anchor per axis: the opposite edge for an axis this handle
+    // actually drags, or the box's own center for an axis it doesn't
+    // touch at all (only used if aspect ends up locked, since a locked
+    // ratio still needs both dimensions to move together even from a
+    // single-edge drag).
+    var anchorX = hasW ? startCrop.x + startCrop.w : (hasE ? startCrop.x : startCrop.x + startCrop.w / 2);
+    var anchorY = hasN ? startCrop.y + startCrop.h : (hasS ? startCrop.y : startCrop.y + startCrop.h / 2);
+
+    function onMove(ev) {
+      var dxSource = (ev.clientX - startX) / scaleX;
+      var dySource = (ev.clientY - startY) / scaleY;
+
+      var newW = startCrop.w, newH = startCrop.h;
+      var newX = startCrop.x, newY = startCrop.y;
+
+      if (hasHorizontal) {
+        var draggedX = clamp((hasW ? startCrop.x : startCrop.x + startCrop.w) + dxSource, 0, state.sourceWidth);
+        newW = Math.abs(draggedX - anchorX);
+        newX = hasW ? anchorX - newW : anchorX;
+      }
+      if (hasVertical) {
+        var draggedY = clamp((hasN ? startCrop.y : startCrop.y + startCrop.h) + dySource, 0, state.sourceHeight);
+        newH = Math.abs(draggedY - anchorY);
+        newY = hasN ? anchorY - newH : anchorY;
+      }
+
+      if (state.cropAspect !== 'free') {
+        var ratio = ASPECT_RATIOS[state.cropAspect];
+        if (hasHorizontal && !hasVertical) {
+          // Pure width drag (e/w edge) — derive height from the ratio,
+          // symmetric around the vertical center.
+          newH = newW / ratio;
+          newY = anchorY - newH / 2;
+        } else if (hasVertical && !hasHorizontal) {
+          // Pure height drag (n/s edge) — mirror of the above.
+          newW = newH * ratio;
+          newX = anchorX - newW / 2;
+        } else {
+          // Corner: horizontal movement drives the resize, same as a
+          // free-aspect corner drag, height just follows the ratio.
+          newH = newW / ratio;
+          newY = hasN ? anchorY - newH : anchorY;
+        }
+      }
+
+      state.cropWidth = newW;
+      state.cropHeight = newH;
+      // Re-clamp fully inside the source frame — aspect-locked resizing
+      // (or a symmetric edge-drag expansion) can otherwise push an edge
+      // past it.
+      state.cropX = clamp(newX, 0, state.sourceWidth - newW);
+      state.cropY = clamp(newY, 0, state.sourceHeight - newH);
+
+      renderCropOverlay();
+    }
+    function onUp() {
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+    }
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onUp);
+  });
 });
 
 bindSeg('subs-off', 'subs-on', function (id) {
@@ -417,6 +690,12 @@ function loadMetadata() {
     state.fps = meta.fps || state.fps;
     state.sourceWidth = meta.width || 0;
     state.sourceHeight = meta.height || 0;
+    // Edge case: crop was toggled on before metadata (and therefore
+    // source dimensions) finished loading — initialize it now rather
+    // than leaving the toggle showing "On" with no overlay ever
+    // appearing, since nothing else would otherwise re-check this once
+    // dimensions become known.
+    if (state.cropEnabled && !state.cropWidth) { resetCrop(); }
     if (!meta.hasSubtitles) {
       disableSubtitleControls(noSubtitleMessage());
       disposeSubtitleOverlay();
@@ -618,7 +897,11 @@ function exportClip() {
     subtitleLang: currentSubtitleLang(),
     subtitleExternalFile: currentSubtitleExternalFile(),
     muteAudio: state.muteAudio,
-    useGpu: state.useGpu
+    useGpu: state.useGpu,
+    cropX: state.cropEnabled ? Math.round(state.cropX) : null,
+    cropY: state.cropEnabled ? Math.round(state.cropY) : null,
+    cropWidth: state.cropEnabled ? Math.round(state.cropWidth) : null,
+    cropHeight: state.cropEnabled ? Math.round(state.cropHeight) : null
   };
   setStatus('exporting…', 'busy');
   statusActions.style.display = 'none';
@@ -714,6 +997,20 @@ function applyInit(newInit) {
   lastExportedPath = null;
   state.sourceWidth = 0;
   state.sourceHeight = 0;
+  // Crop coordinates are tied to this specific file's dimensions —
+  // reset per file, same as in/out. cropAspect (the "9:16" etc.
+  // preference) deliberately isn't reset here, since that's a user
+  // preference rather than file-specific data.
+  state.cropEnabled = false;
+  state.cropX = 0;
+  state.cropY = 0;
+  state.cropWidth = 0;
+  state.cropHeight = 0;
+  document.getElementById('crop-off').setAttribute('aria-pressed', 'true');
+  document.getElementById('crop-on').setAttribute('aria-pressed', 'false');
+  document.getElementById('crop-controls').style.display = 'none';
+  previewWrap.classList.remove('crop-active');
+  cropOverlay.style.display = 'none';
   statusActions.style.display = 'none';
   setStatus('', '');
   disposeSubtitleOverlay(); // old file's overlay shouldn't linger over the new video
@@ -835,6 +1132,7 @@ video.addEventListener('loadedmetadata', function () {
   state.duration = video.duration || 0;
   video.currentTime = state.inTime;
   render();
+  renderCropOverlay();
 });
 
 // Called from main.rs's background setup check (env var + mpv/VLC script

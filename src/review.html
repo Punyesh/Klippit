@@ -15,23 +15,39 @@
 </head>
 <body>
 <script>
-  // Injected by main.rs's open_review_window command via
-  // initialization_script, same mechanism as the main panel's
-  // window.__KLIPPIT_INIT__ — guaranteed to exist before this script runs.
-  var path = window.__KLIPPIT_REVIEW_PATH__;
-  var isGif = /\.gif$/i.test(path || '');
   // A <video> element cannot decode/play GIF files at all — GIF is an
   // image format (even animated), not something the browser's video
   // decoder understands, unlike MP4. This showed up as exactly the
   // broken native "failed to load" video player appearance (0:00
   // duration, gray placeholder) when reviewing a GIF export. <img>
   // handles animated GIFs correctly and natively, looping automatically.
-  var el = document.createElement(isGif ? 'img' : 'video');
-  el.id = 'v';
-  if (!isGif) { el.controls = true; el.autoplay = true; }
-  document.body.appendChild(el);
-  if (path && window.__TAURI__) {
-    el.src = window.__TAURI__.core.convertFileSrc(path);
+  //
+  // Exposed globally so main.rs's open_review_window command can call
+  // this directly on an already-open review window (via window.eval)
+  // instead of closing and recreating it for a second/third export in
+  // the same session — closing a window and immediately creating a new
+  // one with the same label is a real race: .close() doesn't wait for
+  // the old window to actually finish tearing down, so a fast
+  // recreation could fail with "a webview with label `review` already
+  // exists." Reusing the window sidesteps that race entirely.
+  window.applyReviewPath = function (path) {
+    var old = document.getElementById('v');
+    if (old) old.remove();
+    var isGif = /\.gif$/i.test(path || '');
+    var el = document.createElement(isGif ? 'img' : 'video');
+    el.id = 'v';
+    if (!isGif) { el.controls = true; el.autoplay = true; }
+    document.body.appendChild(el);
+    if (path && window.__TAURI__) {
+      el.src = window.__TAURI__.core.convertFileSrc(path);
+    }
+  };
+  // Injected by main.rs's open_review_window command via
+  // initialization_script, same mechanism as the main panel's
+  // window.__KLIPPIT_INIT__ — guaranteed to exist before this script
+  // runs, for the FIRST time this window is created in a session.
+  if (window.__KLIPPIT_REVIEW_PATH__) {
+    window.applyReviewPath(window.__KLIPPIT_REVIEW_PATH__);
   }
 </script>
 </body>

@@ -72,6 +72,17 @@ struct ExportParams {
                    // offered for Target-size mode (2-pass hardware support
                    // is far less consistent across encoders/drivers) or
                    // GIF (palette-based, no H.264 encoder involved at all)
+    // Static crop applied uniformly to the whole clip, in SOURCE VIDEO
+    // PIXEL coordinates. All four Some or all four None — the frontend
+    // only ever sends real numbers when crop is enabled, null otherwise.
+    #[serde(default)]
+    crop_x: Option<u32>,
+    #[serde(default)]
+    crop_y: Option<u32>,
+    #[serde(default)]
+    crop_width: Option<u32>,
+    #[serde(default)]
+    crop_height: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -196,8 +207,22 @@ async fn run_bin(app: &AppHandle, name: &str, args: &[String], cwd: Option<&std:
 
     while let Some(event) = rx.recv().await {
         match event {
-            CommandEvent::Stdout(line) => stdout.extend_from_slice(&line),
-            CommandEvent::Stderr(line) => stderr.extend_from_slice(&line),
+            // CommandEvent::Stdout/Stderr deliver data per line (the
+            // trailing newline stripped by the underlying line-reader),
+            // so a newline has to be reinserted between accumulated
+            // chunks here — otherwise multi-line output collapses into
+            // one run-on line with no separators at all. This was a
+            // real, confirmed regression from the .output()-to-.spawn()
+            // switch made for cancel_export: extract_subtitles_to's
+            // ffprobe stream-probing step parses run_bin's stdout with
+            // .lines() to find the subtitle stream index, and without
+            // this fix that parsing silently breaks — explaining
+            // subtitle burn-in failing across both MP4 and GIF,
+            // regardless of crop, exactly as reported. .output() never
+            // had this problem since it always returned the complete,
+            // untouched byte stream in one piece.
+            CommandEvent::Stdout(line) => { stdout.extend_from_slice(&line); stdout.push(b'\n'); }
+            CommandEvent::Stderr(line) => { stderr.extend_from_slice(&line); stderr.push(b'\n'); }
             CommandEvent::Terminated(payload) => {
                 exit_success = payload.code == Some(0);
             }
@@ -356,6 +381,16 @@ async fn export_clip(app: AppHandle, params: ExportParams) -> Result<ExportResul
     // Extracted once here (not per-attempt inside export_gif's retry
     // loop) since it's the same subtitle data regardless of how many
     // encode attempts target-size mode ends up needing.
+    //
+    // Subtitle original_size uses the CROPPED dimensions when crop is
+    // active, not the original source dimensions — subtitles are burned
+    // in after crop in the filter chain (see the crop_filter ordering
+    // below), so they need to be positioned/sized relative to the frame
+    // they're actually being drawn onto, not the pre-crop source.
+    let (effective_width, effective_height) = match (params.crop_width, params.crop_height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
+        _ => (params.source_width, params.source_height),
+    };
     let subtitle_filter_str: Option<String> = if params.burn_subs {
         let temp_dir = std::env::temp_dir().join(format!("klippit-burn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -363,7 +398,7 @@ async fn export_clip(app: AppHandle, params: ExportParams) -> Result<ExportResul
             &app, &params.file_path, &temp_dir, Some((params.in_time, duration)),
             params.subtitle_external_file.as_deref(), params.subtitle_lang.as_deref(),
         ).await?;
-        Some(subtitle_filter(&extracted, params.source_width, params.source_height))
+        Some(subtitle_filter(&extracted, effective_width, effective_height))
     } else {
         None
     };
@@ -394,6 +429,21 @@ fn scale_filter(resolution: u32) -> Option<String> {
     // Scale to target height, preserve aspect ratio, even dimensions
     // (required by most encoders).
     Some(format!("scale=-2:{resolution}"))
+}
+
+// Static crop applied uniformly to the whole clip. All four fields are
+// checked together — callers only ever pass all-Some or all-None, but
+// this stays defensive against a partial set rather than assuming that
+// invariant holds. Takes raw values rather than &ExportParams so it's
+// reusable from extract_frame (screenshots), which has its own
+// individual parameters rather than an ExportParams instance.
+fn crop_filter(x: Option<u32>, y: Option<u32>, w: Option<u32>, h: Option<u32>) -> Option<String> {
+    match (x, y, w, h) {
+        (Some(x), Some(y), Some(w), Some(h)) if w > 0 && h > 0 => {
+            Some(format!("crop={w}:{h}:{x}:{y}"))
+        }
+        _ => None,
+    }
 }
 
 // Builds the actual `subtitles=...` filter string from already-extracted,
@@ -447,6 +497,12 @@ fn subtitle_filter(extracted: &ExtractedSubtitles, source_width: u32, source_hei
 
 async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str, subtitle_filter_str: Option<&str>, subtitle_cwd: Option<&std::path::Path>) -> Result<String, String> {
     let mut filters: Vec<String> = vec![];
+    // Crop first: subtitles need to be burned onto the already-cropped
+    // frame (see the effective_width/height computation in export_clip,
+    // which points subtitle_filter's original_size at the cropped
+    // dimensions specifically so this ordering is self-consistent), and
+    // scale runs last of all, after both.
+    if let Some(f) = crop_filter(params.crop_x, params.crop_y, params.crop_width, params.crop_height) { filters.push(f); }
     // Subtitles before scale: burns onto the original-resolution frame,
     // matching the coordinates the ASS/SSA styling was authored against,
     // then scale runs afterward on the already-burned-in frame. Also
@@ -631,9 +687,17 @@ async fn export_gif(app: &AppHandle, params: &ExportParams, duration: f64, out_p
         "-y".into(), "-ss".into(), params.in_time.to_string(), "-i".into(), params.file_path.clone(),
         "-t".into(), duration.to_string(),
     ];
-    if let Some(f) = subtitle_filter_str {
+    // Crop before subtitles here too, same ordering and same reasoning
+    // as export_mp4 — subtitle_filter_str's original_size was already
+    // computed against the cropped dimensions in export_clip when crop
+    // is active, so it expects to be burning onto an already-cropped
+    // frame.
+    let mut gif_filters: Vec<String> = vec![];
+    if let Some(f) = crop_filter(params.crop_x, params.crop_y, params.crop_width, params.crop_height) { gif_filters.push(f); }
+    if let Some(f) = subtitle_filter_str { gif_filters.push(f.to_string()); }
+    if !gif_filters.is_empty() {
         extract_args.push("-vf".into());
-        extract_args.push(f.to_string());
+        extract_args.push(gif_filters.join(","));
     }
     // Always re-encoded here, deliberately never stream-copied (-c copy)
     // even without subtitles: stream copy can only cut at keyframes,
@@ -714,7 +778,7 @@ async fn encode_gif_attempt(app: &AppHandle, segment_path: &str, width: u32, fps
 // fallback for extracting a still via ffmpeg if a screenshot is ever
 // requested outside of an active mpv session.
 #[tauri::command]
-async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, out_path: String, source_width: u32, source_height: u32, subtitle_lang: Option<String>, subtitle_external_file: Option<String>) -> Result<String, String> {
+async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, out_path: String, source_width: u32, source_height: u32, subtitle_lang: Option<String>, subtitle_external_file: Option<String>, crop_x: Option<u32>, crop_y: Option<u32>, crop_width: Option<u32>, crop_height: Option<u32>) -> Result<String, String> {
     let out_path = expand_tilde(&out_path);
     if let Some(parent) = std::path::Path::new(&out_path).parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("couldn't create output folder: {e}"))?;
@@ -724,6 +788,18 @@ async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, o
         "-frames:v".into(), "1".into(),
     ];
     let mut cwd: Option<std::path::PathBuf> = None;
+    // Crop applies here too — a screenshot should match whatever the
+    // live preview is currently showing, and crop is a real, visible
+    // editing decision the same way subtitles-on/off already is.
+    let crop = crop_filter(crop_x, crop_y, crop_width, crop_height);
+    // original_size (if burning subtitles) uses the cropped dimensions
+    // when crop is active, same reasoning as the export path: subtitles
+    // are burned onto the already-cropped frame, so they need to be
+    // sized relative to that, not the pre-crop source.
+    let (effective_width, effective_height) = match (crop_width, crop_height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
+        _ => (source_width, source_height),
+    };
     if burn_subs {
         // Same clean-extracted-path approach as subtitle_filter() in the
         // export path, for the same reason: pointing the filter directly
@@ -736,9 +812,15 @@ async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, o
             &app, &path, &temp_dir, Some((at, 1.0)),
             subtitle_external_file.as_deref(), subtitle_lang.as_deref(),
         ).await?;
+        let mut shot_filters: Vec<String> = vec![];
+        if let Some(f) = &crop { shot_filters.push(f.clone()); }
+        shot_filters.push(subtitle_filter(&extracted, effective_width, effective_height));
         args.push("-vf".into());
-        args.push(subtitle_filter(&extracted, source_width, source_height));
+        args.push(shot_filters.join(","));
         cwd = Some(temp_dir);
+    } else if let Some(f) = &crop {
+        args.push("-vf".into());
+        args.push(f.clone());
     }
     args.push(out_path.clone());
     run_bin(&app, "ffmpeg", &args, cwd.as_deref()).await?;
@@ -1012,13 +1094,26 @@ async fn extract_subtitles_for_preview(app: AppHandle, path: String, subtitle_la
 // Klippit rather than handing off to the OS default media player.
 #[tauri::command]
 async fn open_review_window(app: AppHandle, path: String) -> Result<(), String> {
-    // If a review window is already open (e.g. Play clicked twice), close
-    // it first rather than erroring on a duplicate window label.
+    let path_json = serde_json::to_string(&path).map_err(|e| e.to_string())?;
+
+    // Reuse an existing review window rather than closing and
+    // recreating one — confirmed as a real race: .close() doesn't wait
+    // for the old window to actually finish tearing down before
+    // returning, so a fast second export + Play could try creating a
+    // new window with the same label while the old one was still
+    // technically registered, failing with "a webview with label
+    // `review` already exists." Reusing sidesteps that race entirely
+    // rather than trying to work around it with a wait/retry loop.
     if let Some(existing) = app.get_webview_window("review") {
-        let _ = existing.close();
+        let script = format!("window.applyReviewPath({path_json});");
+        existing.eval(&script).map_err(|e| e.to_string())?;
+        let _ = existing.center();
+        let _ = existing.set_always_on_top(true);
+        let _ = existing.set_always_on_top(false);
+        let _ = existing.set_focus();
+        return Ok(());
     }
 
-    let path_json = serde_json::to_string(&path).map_err(|e| e.to_string())?;
     let script = format!("window.__KLIPPIT_REVIEW_PATH__ = {path_json};");
 
     let window = tauri::WebviewWindowBuilder::new(&app, "review", tauri::WebviewUrl::App("review.html".into()))

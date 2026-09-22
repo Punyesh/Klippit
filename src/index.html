@@ -47,6 +47,32 @@
 
   <div id="preview-wrap">
     <video id="preview" muted preload="auto"></video>
+    <div id="crop-overlay" style="display:none">
+      <svg id="crop-mask-svg" width="100%" height="100%">
+        <defs>
+          <mask id="crop-mask">
+            <rect x="0" y="0" width="100%" height="100%" fill="white"/>
+            <rect id="crop-mask-hole" x="0" y="0" width="0" height="0" fill="black"/>
+          </mask>
+        </defs>
+        <rect x="0" y="0" width="100%" height="100%" fill="rgba(0,0,0,0.62)" mask="url(#crop-mask)"/>
+      </svg>
+      <div id="crop-box">
+        <div class="crop-grid-line" id="crop-grid-v1"></div>
+        <div class="crop-grid-line" id="crop-grid-v2"></div>
+        <div class="crop-grid-line crop-grid-h" id="crop-grid-h1"></div>
+        <div class="crop-grid-line crop-grid-h" id="crop-grid-h2"></div>
+        <div class="crop-handle crop-handle-corner" id="crop-handle-nw" data-handle="nw"></div>
+        <div class="crop-handle crop-handle-corner" id="crop-handle-ne" data-handle="ne"></div>
+        <div class="crop-handle crop-handle-corner" id="crop-handle-sw" data-handle="sw"></div>
+        <div class="crop-handle crop-handle-corner" id="crop-handle-se" data-handle="se"></div>
+        <div class="crop-handle crop-handle-edge-h" id="crop-handle-n" data-handle="n"></div>
+        <div class="crop-handle crop-handle-edge-h" id="crop-handle-s" data-handle="s"></div>
+        <div class="crop-handle crop-handle-edge-v" id="crop-handle-e" data-handle="e"></div>
+        <div class="crop-handle crop-handle-edge-v" id="crop-handle-w" data-handle="w"></div>
+        <div id="crop-dimensions"></div>
+      </div>
+    </div>
     <div id="load-prompt" style="display:none">
       <div id="load-prompt-text">Drop a video file here</div>
       <button id="load-browse-btn">Browse for a file&hellip;</button>
@@ -110,6 +136,24 @@
       <div class="seg-group" role="group" aria-label="Audio track">
         <button class="seg-btn" id="audio-keep" aria-pressed="true">Keep</button>
         <button class="seg-btn" id="audio-mute" aria-pressed="false">Mute</button>
+      </div>
+    </div>
+
+    <div class="section-label">Crop</div>
+    <div class="seg-group" role="group" aria-label="Crop">
+      <button class="seg-btn" id="crop-off" aria-pressed="true">Off</button>
+      <button class="seg-btn" id="crop-on" aria-pressed="false">On</button>
+    </div>
+    <div id="crop-controls" style="display:none">
+      <div class="seg-group" role="group" aria-label="Crop aspect ratio" style="margin-top:6px">
+        <button class="seg-btn" id="crop-aspect-free" aria-pressed="true" style="flex:1">Free</button>
+        <button class="seg-btn" id="crop-aspect-169" style="flex:1">16:9</button>
+        <button class="seg-btn" id="crop-aspect-916" style="flex:1">9:16</button>
+        <button class="seg-btn" id="crop-aspect-11" style="flex:1">1:1</button>
+      </div>
+      <div id="crop-reset-row">
+        <span id="crop-size-readout"></span>
+        <button id="crop-reset-btn">Reset</button>
       </div>
     </div>
 

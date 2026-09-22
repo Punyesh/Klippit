@@ -230,6 +230,169 @@ doesn't understand it, unlike MP4. Fixed by checking the file extension
 and creating an `<img>` element instead for `.gif` paths, which handles
 animated GIFs correctly and natively (including looping).
 
+## v1.2.0: critical subtitle burn-in regression — root cause found
+
+Reported as broken across the board: MP4 and GIF, cropped and
+uncropped. That pattern (affects everything, no correlation with crop)
+pointed away from anything in the crop work itself and toward something
+shared by every export path — and subtitle burn-in specifically depends
+on one thing nothing else does: `extract_subtitles_to`'s ffprobe
+stream-probing step parses `run_bin`'s returned stdout line-by-line
+(`.lines()`) to find which stream index has the subtitle track.
+
+Root cause: the `run_bin` rewrite done for cancel_export (switching from
+`.output()`, which returns the complete untouched byte stream in one
+piece, to `.spawn()` with a streamed `CommandEvent` sequence) accumulated
+`CommandEvent::Stdout`/`Stderr` chunks with plain `extend_from_slice`,
+with no newline reinserted between them. Those events deliver data per
+line with the trailing newline already stripped by the underlying
+line-reader — so multi-chunk output collapsed into one run-on line with
+no separators at all, silently breaking `.lines()`-based parsing
+anywhere it was used. Fixed by pushing a `b'\n'` after each accumulated
+chunk. Checked every other `run_bin` call site before landing this:
+everything else either discards the returned stdout entirely (just
+`?` for error-checking) or parses it as text (ffprobe JSON/CSV), where
+an extra trailing newline is harmless — nothing anywhere treats this as
+byte-exact binary data that the fix could corrupt.
+
+Also worth answering directly, since it was asked: burn-in with crop
+works exactly as designed, once this bug is fixed — crop runs first in
+the filter chain, subtitles burn onto the already-cropped frame
+(`original_size` is computed against the cropped dimensions
+specifically, not the pre-crop source, so text is sized/positioned
+relative to the frame it's actually drawn onto), and scale runs last.
+This part of the implementation was never the problem here — the whole
+pipeline was failing upstream, before crop or subtitles ever got a
+chance to run.
+
+## Three fixes from real testing feedback
+
+**1. "failed to open preview: a webview with label `review` already
+exists"** — a genuine race condition, not intermittent bad luck. Export
+twice, press Play each time: `open_review_window` was calling
+`.close()` on the existing review window, then immediately trying to
+create a new one with the same label — but `.close()` doesn't wait for
+the old window to actually finish tearing down before returning, so a
+fast second call could hit Tauri's internal registry while the old
+window was still technically registered. Fixed by reusing the existing
+window instead of closing and recreating it: `review.html` now exposes
+`window.applyReviewPath(path)` (mirrors the main panel's `applyInit`
+pattern), and `open_review_window` calls that via `window.eval(...)`
+when a review window is already open, re-centering and re-raising it,
+rather than ever closing and recreating within the same session. This
+sidesteps the race entirely instead of trying to work around it with a
+wait/retry loop.
+
+**2. Crop handles overlapping the window's own edge.** Real usability
+issue: a full-frame crop's corner handles sit right at the video's own
+displayed edge, which — with nothing else providing separation — can
+coincide with the actual OS window edge (specifically the left side;
+top/right/bottom already have the header/sidebar/frame-bar in the way).
+Easy to grab the window's own resize handle by mistake instead of a
+crop handle. Fixed with a 10px safety margin, active only while crop
+mode is on (`#preview-wrap.crop-active`) — `getVideoDisplayRect()` was
+updated to account for this same margin value when computing where the
+video is actually displayed, so the crop overlay still lines up
+correctly with the (now slightly smaller) visible video area rather
+than drifting out of sync with it.
+
+**3. Edge (width/height-only) handles added, 4 + 4 = 8 total.** The
+existing corner-resize logic already computed an anchor (opposite
+corner) and a "goes left/up" direction from the handle name's letters,
+so this generalized naturally to single-letter edge names (n/s/e/w)
+rather than needing separate logic: `hasHorizontal`/`hasVertical` flags
+derived from the handle name decide which axis actually changes for a
+free-aspect drag. The one genuinely new case is an edge handle with a
+LOCKED aspect ratio — dragging just the right edge, say, with 16:9
+selected, has no natural opposite-edge anchor for the vertical axis
+that has to move to preserve the ratio, so that axis grows/shrinks
+symmetrically around the box's own center instead. Corner drags with a
+locked ratio are unaffected — still anchored at the opposite corner,
+exactly as before.
+
+Verified by actually executing `app.js` (not a static mockup) through
+`wkhtmltoimage` again, extending the same approach from the crop
+feature's original verification: all 8 handles render at their correct
+positions, and the safety-margin gap between the video display area and
+`#preview-wrap`'s own edge is visibly present once crop mode is active.
+
+## Crop feature — designed, mocked up, built, and actually verified running
+
+Static crop applied uniformly to the whole clip (the animated/keyframed
+pan-and-follow version was explicitly scoped out as genuinely bigger,
+better suited to a real video editor). Designed first as a real mockup
+using Klippit's own CSS rendered through wkhtmltoimage, rather than a
+generic wireframe — dimmed exterior showing what gets cut away, a bright
+undimmed crop window with rule-of-thirds grid and corner handles, live
+pixel-dimension readout, matching the app's existing "pair every visual
+control with a numeric readout" pattern.
+
+**Design decision made before building**: dropped a planned seek-row
+toggle button in favor of a single sidebar Off/On control. Mute and CC
+live in the seek-row because they're about the live preview experience;
+crop is fundamentally an export setting (like Burn-in subtitles) that
+happens to need an interactive overlay — two controls for the same state
+would have been confusing, not extra convenience.
+
+**Implementation**: crop coordinates live in state as SOURCE VIDEO PIXEL
+values throughout, never screen pixels — converted to/from screen
+coordinates only at render and drag time via `getVideoDisplayRect()`,
+which computes the actual displayed video rectangle accounting for
+`object-fit: contain` letterboxing/pillarboxing. This keeps the stored
+crop correct regardless of window resizing or preview letterboxing
+changes, and was flagged as a real implementation detail during the
+design discussion before any code was written.
+
+Backend: `crop_filter()` takes raw x/y/w/h values (not `&ExportParams`
+directly) specifically so it's reusable from `extract_frame`
+(screenshots) too — a screenshot should match whatever crop the live
+preview is currently showing, same "screenshot shows what you're
+currently seeing" principle already established for subtitles. Crop
+runs first in the filter chain, before subtitles and scale — subtitle
+`original_size` is computed against the CROPPED dimensions when crop is
+active (not the original source), since subtitles burn onto the
+already-cropped frame and need to be sized/positioned relative to that.
+
+**Verification — a real testing-tool discovery along the way**: initial
+attempts to visually verify the actual (not mocked) implementation
+showed `app.js` apparently never executing at all inside
+`wkhtmltoimage` — every top-level variable (`video`, `previewWrap`, etc.)
+came back `undefined` with no error. Root cause: `wkhtmltoimage` blocks a
+local HTML file from loading other local files (like an external
+`<script src="app.js">`) unless `--enable-local-file-access` is passed —
+a security default in that tool, unrelated to anything in the app code.
+Every prior visual check in this project had sidestepped this entirely
+by stripping `<script src="app.js">` out before rendering (testing
+static HTML/CSS only) — this was the first time actually executing the
+full app logic through this tool, so the limitation had never surfaced
+before. With that flag, `app.js` runs correctly and every crop function
+is properly defined.
+
+With execution confirmed working: toggling crop on, applying a 9:16
+preset against a simulated 1280×720 source correctly produced
+`cropX=438 cropWidth=405 cropHeight=720` — exactly right (405/720 =
+9/16) — with the overlay rendering visibly, correctly positioned and
+sized, sidebar readout matching the on-video label. The core, most
+novel logic (state management, letterboxing-aware positioning math,
+aspect-ratio calculations) is genuinely confirmed working, not just
+assumed.
+
+**What's still unverified**: the actual mouse-driven drag interactions
+(move the box, resize from a corner). Attempting to simulate these via
+synthetic `PointerEvent` construction failed silently — `wkhtmltoimage`'s
+underlying engine (a pre-2016-era WebKit build) doesn't support the
+`PointerEvent` constructor at all, which is the exact API these
+listeners use (`addEventListener('pointerdown', ...)`). This is a
+limitation of the decade-old test engine, not the app — the real
+Klippit runs in a modern, fully Pointer-Events-compliant WebView2
+context — and the drag code itself follows the same well-established
+pointerdown-on-element / pointermove-and-pointerup-on-document pattern
+already proven working for this app's original trim handles earlier in
+the project. But this specific piece — does dragging the box actually
+feel right, does corner-resize with a locked aspect ratio behave as
+expected — needs real mouse input in the actual running app to fully
+confirm.
+
 ## Volume slider — the mute toggle needed one
 
 Fair, immediate follow-up to the mute/unmute toggle: turning audio on

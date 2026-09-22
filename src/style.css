@@ -198,6 +198,19 @@ html, body {
   min-height: 70px;
   position: relative;
 }
+/* Active only while crop mode is on. Confirmed real usability issue:
+   a full-frame crop box's corner handles sit right at the video's own
+   edge, which — with no gap otherwise — can coincide with the actual
+   OS window's edge (specifically the left side; top/right/bottom
+   already have the header/sidebar/frame-bar for separation), making it
+   easy to grab the window's own resize handle by mistake instead of a
+   crop handle. getVideoDisplayRect() in app.js accounts for this same
+   margin value when computing where the video is actually displayed,
+   so the crop overlay still lines up correctly with the (now slightly
+   smaller) visible video area. */
+#preview-wrap.crop-active {
+  padding: 10px;
+}
 /* Shown only when no file is loaded — see applyInit() toggling this
    based on init.filePath. Sits over the (empty, black) video area
    rather than replacing it, so nothing else in the layout has to shift
@@ -259,6 +272,95 @@ html, body {
   display: block;
   background: #000;
 }
+
+/* ---------- crop overlay ---------- */
+/* Positioned in JS relative to the actual displayed video rectangle
+   (accounting for object-fit: contain letterboxing/pillarboxing), not
+   just #preview-wrap's own box — see getVideoDisplayRect() in app.js.
+   Sits above the subtitle overlay's canvas-parent div (z-index) since
+   editing a crop while checking subtitle position is a reasonable thing
+   to want to see, but the crop box itself should stay on top. */
+#crop-overlay {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 5;
+  pointer-events: none;
+}
+#crop-mask-svg { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+#crop-box {
+  position: absolute;
+  border: 1px solid var(--red);
+  pointer-events: auto;
+  cursor: move;
+}
+.crop-grid-line {
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 1px;
+  background: rgba(224, 52, 44, 0.35);
+  pointer-events: none;
+}
+.crop-grid-line.crop-grid-h {
+  top: auto; bottom: auto; left: 0; right: 0;
+  width: auto; height: 1px;
+}
+#crop-grid-v1 { left: 33.333%; }
+#crop-grid-v2 { left: 66.666%; }
+#crop-grid-h1 { top: 33.333%; }
+#crop-grid-h2 { top: 66.666%; }
+.crop-handle {
+  position: absolute;
+  width: 9px; height: 9px;
+  background: var(--panel);
+  border: 1px solid var(--red);
+  pointer-events: auto;
+}
+#crop-handle-nw { left: -5px; top: -5px; cursor: nwse-resize; }
+#crop-handle-ne { right: -5px; top: -5px; cursor: nesw-resize; }
+#crop-handle-sw { left: -5px; bottom: -5px; cursor: nesw-resize; }
+#crop-handle-se { right: -5px; bottom: -5px; cursor: nwse-resize; }
+/* Edge (width/height-only) handles, midpoint of each side — wider along
+   their draggable axis than the corner squares so they're easy to
+   distinguish and grab without being visually heavier than the corners. */
+.crop-handle-edge-h { left: 50%; margin-left: -9px; width: 18px; height: 7px; cursor: ns-resize; }
+.crop-handle-edge-v { top: 50%; margin-top: -9px; width: 7px; height: 18px; cursor: ew-resize; }
+#crop-handle-n { top: -4px; }
+#crop-handle-s { bottom: -4px; }
+#crop-handle-e { right: -4px; }
+#crop-handle-w { left: -4px; }
+#crop-dimensions {
+  position: absolute;
+  left: 4px; top: 4px;
+  background: rgba(11, 12, 14, 0.85);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 2px 5px;
+  border: 1px solid var(--line);
+  pointer-events: none;
+  white-space: nowrap;
+}
+#crop-controls { margin-top: 6px; }
+#crop-reset-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--dim);
+}
+#crop-reset-btn {
+  background: none;
+  border: 1px solid var(--line);
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 3px 10px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+#crop-reset-btn:hover { border-color: var(--red); color: var(--red); }
 
 /* Seek scrubber */
 #seek-row {
