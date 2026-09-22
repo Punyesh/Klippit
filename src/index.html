@@ -11,6 +11,30 @@
   <div id="head">
     <div class="brand"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><line x1="7" y1="4" x2="7" y2="20"/><line x1="7" y1="12" x2="18" y2="4"/><line x1="7" y1="12" x2="18" y2="20"/></svg></div>
     <div class="source-name" id="source-name" title="">no file loaded</div>
+    <button id="settings-btn" title="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+  </div>
+
+  <div id="settings-modal" style="display:none">
+    <div id="settings-panel">
+      <div id="settings-title">Settings</div>
+
+      <div class="field">
+        <label for="settings-mpv-keybind">mpv keybind</label>
+        <input class="input" type="text" id="settings-mpv-keybind" maxlength="16" placeholder="c" />
+      </div>
+
+      <div class="field">
+        <label for="settings-mpv-dir">mpv config folder (for portable_config setups)</label>
+        <input class="input" type="text" id="settings-mpv-dir" placeholder="Default: %APPDATA%\mpv" />
+      </div>
+
+      <div id="settings-status"></div>
+
+      <div id="settings-actions">
+        <button id="settings-close-btn" class="mark-btn">Close</button>
+        <button id="settings-save-btn" class="mark-btn" style="border-color:var(--red);color:var(--text)">Save &amp; Reinstall</button>
+      </div>
+    </div>
   </div>
 
   <div id="setup-warning" style="display:none">
@@ -31,6 +55,8 @@
 
   <div id="seek-row">
     <button class="frame-btn" id="play-pause-btn" title="Play/Pause (Space)">&#9654;</button>
+    <button class="frame-btn" id="mute-toggle-btn" title="Unmute preview audio (off by default \u2014 avoids echo if your original player is still open)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block"><polygon points="4,9 8,9 12,5 12,19 8,15 4,15"/><line id="mute-toggle-x1" x1="17" y1="9" x2="22" y2="14"/><line id="mute-toggle-x2" x1="22" y1="9" x2="17" y2="14"/></svg></button>
+    <input type="range" id="volume-slider" min="0" max="100" value="100" title="Volume" style="display:none" aria-label="Preview volume" />
     <button class="frame-btn" id="screenshot-btn" title="Screenshot at current position"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M4 8h3l1.5-2h7L17 8h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="14" r="3.5"/></svg></button>
     <button class="frame-btn" id="subs-preview-toggle" title="Show/hide subtitle preview (also affects screenshots)" aria-pressed="true">CC</button>
     <input id="seek-bar" type="range" min="0" max="1000" value="0"
@@ -99,6 +125,13 @@
         <div class="field">
           <label for="crf">Quality (CRF, lower = better)</label>
           <input class="input" type="range" id="crf" min="15" max="35" value="23" />
+        </div>
+      </div>
+      <div id="gpu-field">
+        <div class="section-label">Encoding</div>
+        <div class="seg-group" role="group" aria-label="Encoder">
+          <button class="seg-btn" id="gpu-off" aria-pressed="true">CPU</button>
+          <button class="seg-btn" id="gpu-on" aria-pressed="false" title="Tries GPU hardware encoding, automatically falls back to CPU if unavailable">Try GPU</button>
         </div>
       </div>
       <div class="row">
@@ -175,7 +208,6 @@
 
 </div>
 
-<script src="lib/subtitles-octopus/subtitles-octopus.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

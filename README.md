@@ -66,6 +66,20 @@ Screenshots: the camera button captures a still at the current frame,
 matching whatever the subtitle preview toggle (the "CC" button) is
 currently showing.
 
+## Settings
+
+The gear icon in the header opens a small settings panel with two
+options:
+
+- **mpv keybind** — change which key triggers Klippit from mpv (default
+  `c`) without ever editing `clip-trigger.lua` by hand.
+- **mpv config folder** — override the default `%APPDATA%\mpv` if your
+  mpv uses `portable_config` (a folder next to `mpv.exe` itself) or any
+  other nonstandard location.
+
+Click **Save & Reinstall** and both take effect immediately — no restart
+needed.
+
 ## Known limitations
 
 - VLC's subtitle-language detection and its extension trigger are less

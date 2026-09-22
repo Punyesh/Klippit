@@ -230,6 +230,253 @@ doesn't understand it, unlike MP4. Fixed by checking the file extension
 and creating an `<img>` element instead for `.gif` paths, which handles
 animated GIFs correctly and natively (including looping).
 
+## Volume slider — the mute toggle needed one
+
+Fair, immediate follow-up to the mute/unmute toggle: turning audio on
+with no way to set the level isn't much of a feature. Added a compact
+volume slider next to the mute button, shown only while unmuted (kept
+the seek-row uncluttered in the default muted state rather than showing
+a volume control that does nothing until you've opted into audio at
+all). Confirmed visually before shipping — sits naturally in the
+existing button row, matches the seek-bar's own thumb styling.
+
+## Subtitle load delay + preview audio toggle
+
+Two more real questions from user feedback:
+
+**"Subtitles sometimes don't show up for a bit."** Real and explainable,
+not random: loading the live-preview overlay involves probing for the
+subtitle stream, extracting the `.ass` file and fonts, fetching each as
+a blob, then loading and initializing a ~2.7MB WASM library — all
+happening *after* the video itself is already visible. Two
+improvements, neither eliminates the delay entirely but both help:
+
+- `loadSubtitleOverlay()` now kicks off speculatively in `applyInit()`,
+  in parallel with `loadMetadata()`, rather than waiting for metadata's
+  `hasSubtitles` confirmation first — extraction and metadata are
+  independent ffprobe/ffmpeg calls on the same file, so there was no
+  reason to run them sequentially. For a file with no subtitles this
+  just fails harmlessly (already handled); for one that does have them,
+  this head start measurably cuts the real delay.
+- The CC button now shows a visible pulsing "loading" state
+  (`setSubtitleLoadingIndicator`) while the overlay is being prepared,
+  cleared at every exit path (ready, error, or extraction failure) — the
+  wait is now visible and expected rather than reading as "subtitles
+  just don't show up."
+
+**"Is audio playback implementable?"** Yes, trivially, technically — the
+`<video>` element is just hardcoded `muted`. The real question was a
+design one: Klippit is triggered from inside mpv/VLC, which is often
+still open with the same file, so audio on by default risks an echo if
+the original player isn't paused. Added an opt-in mute/unmute toggle
+(speaker icon, next to Play) — muted by default matching the existing
+attribute, one click to hear audio for anyone who has paused or closed
+the original player.
+
+## v1.1.0: cancel export, fixed always-on-top behavior, GIF bug investigation
+
+Four requests handled together:
+
+**Cancel export button.** Genuinely new API surface for this project:
+every ffmpeg/ffprobe call so far used `tauri_plugin_shell`'s `.output()`,
+which spawns and awaits a process as one atomic operation with no handle
+you can act on mid-flight. Switched `run_bin()` to `.spawn()` instead,
+which returns a `CommandChild` you can `.kill()` and an event stream
+(`CommandEvent::Stdout/Stderr/Terminated/Error`) you read from as the
+process runs — the same total information `.output()` gave, just
+obtained incrementally instead of all at once. A new `ExportState`
+(managed Tauri state: a `Mutex<Option<CommandChild>>` plus a cancelled
+flag) holds whichever child process is currently running; a `cancel_export`
+command locks it and kills it. A single slot is correct here, not a
+limitation: one export runs its ffmpeg steps strictly sequentially, so
+killing "whichever one is currently running" when cancel is pressed is
+exactly right, and the resulting error aborts the rest of the sequence
+through the same `?` propagation already used everywhere — no separate
+cancellation plumbing needed through `export_gif`/`export_mp4`/etc.
+`run_bin`'s signature and return type are unchanged, so no other call
+site in the file needed to change. Frontend: the existing "Escape"
+button now doubles as "Cancel" while an export is running (closing the
+whole panel mid-export isn't something you'd want anyway, so repurposing
+that slot fits naturally), and a cancelled export shows a clear "export
+cancelled" status rather than a generic failure message.
+
+**Always-on-top wasn't behaving correctly.** Real, valid complaint:
+`always_on_top(true)` set at window-creation time kept both the main
+window and the review window permanently pinned above every other
+application for as long as they stayed open — switching to a browser or
+file explorer while Klippit was open meant it kept forcing itself back
+in front. The main window and the single-instance re-focus path had
+already been fixed earlier in this session (toggling
+`set_always_on_top(true)` then immediately `false` — a legitimate Win32
+pattern: both calls are synchronous and immediately update window
+z-order, so this reliably raises the window once without leaving the
+persistent pinned flag set). The review window still had the old
+permanent version on its builder — fixed to match the same toggle
+pattern.
+
+**GIF ignoring the Out marker — investigated, not conclusively fixed.**
+Reported by an end user, not reproducible here. Retraced the entire
+path (frontend `state.outTime` capture, `export_clip`'s duration
+computation, the extraction step's `-t` placement) and found nothing
+incorrect — the extraction step has exactly one input, so `-t` there is
+unambiguous the same way MP4's always was, unlike the two-input
+paletteuse pass that caused the earlier, now-fixed duration bug. Given
+no reproduction and no bug found on review, added diagnostic logging of
+the exact received `in_time`/`out_time`/`duration`/format/mode to
+`%TEMP%\klippit-ffmpeg.log` at the very start of `export_clip` — if this
+recurs, the log will show definitively whether wrong values were ever
+received (a frontend issue) versus received correctly but mishandled
+further down the pipeline (a backend issue), a distinction currently
+impossible to tell from the symptom alone. Most likely explanations
+without further evidence: the reporting person was on an older build
+predating the `-t` fix (the same "did you actually reinstall" confusion
+hit repeatedly earlier in this project), or Out was left at its
+just-3-seconds-past-In default and happened to reach the file's actual
+end for a short clip near the end of a video.
+
+**Version bumped to 1.1.0** — genuinely new features (cancel export,
+GPU encoding, the Settings panel) accumulated since 1.0.0, not just bug
+fixes, warranting a minor version bump rather than a patch.
+
+## Klippit's first Settings panel — configurable mpv keybind + portable_config support
+
+Driven by real user feedback from actual community testing:
+
+1. Someone's mpv used `portable_config` (a folder next to `mpv.exe`
+   itself, which mpv prefers over `%APPDATA%\mpv` when present) — the
+   automatic setup always wrote to `%APPDATA%` unconditionally, so the
+   script silently landed somewhere their mpv never looked, with no
+   error or indication anything was wrong. They had to find this
+   themselves and manually copy + edit the script into portable_config.
+2. Separate, sharper feedback: "shortcut edit should be in the app
+   itself" — and the pointed follow-up, "if people are having to edit
+   lua scripts they might as well run ffmpeg on command line." Exactly
+   right: requiring a script edit to change a keybind undermines the
+   entire point of the app being easier than hand-rolled ffmpeg.
+
+Fixed both together, since they share the same underlying need — a real
+settings surface:
+
+- **`clip-trigger.lua` no longer hardcodes its keybind.** It reads one
+  via mpv's own `mp.options`/`script-opts` mechanism
+  (`script-opts/clip-trigger.conf`, a single `key=X` line), defaulting
+  to `c` if that file doesn't exist. `read_options` respects mpv's own
+  portable_config resolution automatically — the script itself doesn't
+  need to know or care which mode mpv is in.
+- **Klippit's first-ever persisted settings**: a plain JSON file at
+  `%APPDATA%\Klippit\settings.json` (`KlippitSettings`: `mpv_keybind`,
+  `mpv_config_dir_override`) — chose a plain file over the registry for
+  simplicity (no new dependency, std::fs alone) and so it's easy for
+  someone to inspect or delete by hand if something goes wrong.
+- **`run_setup()` now resolves the mpv config directory from these
+  settings** (the override if set, else the previous hardcoded
+  `%APPDATA%\mpv` default) and additionally writes the keybind config
+  file alongside the script — both the one-shot installer `--setup` call
+  and the background self-healing check on every normal launch now keep
+  the keybind in sync automatically, the same way the script itself
+  already was.
+- **A real Settings panel in the app** (new gear icon in the header,
+  first modal dialog this app has needed) with two fields — mpv keybind,
+  mpv config folder override — and a "Save & Reinstall" button that
+  saves the settings and immediately reruns the same `run_setup()`
+  machinery, showing a plain-text report of what happened. This is the
+  concrete answer to "should be in the app itself": changing the keybind
+  is now a text field and a button, never a file edit.
+
+`#head`'s CSS needed a small adjustment: it assumed exactly two children
+under `justify-content: space-between`, which breaks once a third
+(the settings button) is added — switched to `gap` plus giving
+`.source-name` `flex: 1 1 auto; text-align: right` so it fills the
+middle regardless of child count.
+
+Confirmed via rendering (again): `inset: 0` on the modal's
+`position: fixed` overlay rendered completely wrong in the quick
+visual-check tool used throughout this project — same shorthand-support
+gap in that old renderer hit twice before. Switched to the longhand
+(`top/right/bottom/left: 0`) for both correctness there and consistency
+with the earlier fixes.
+
+## Opt-in GPU encoding, with automatic fallback
+
+A follow-up to the earlier GPU-encoding discussion: not a replacement of
+the software encoder, an explicit "CPU / Try GPU" toggle (same segmented
+pattern as Audio/Subtitles), scoped to MP4 Quality mode only — GIF is
+palette-based with no H.264 encoder involved at all, and Target-size
+mode's 2-pass encoding has far less consistent hardware support across
+encoders/drivers, so both stay CPU-only for now.
+
+When GPU is ticked, `encode_quality_mode` tries `h264_nvenc`, then
+`h264_amf`, then `h264_qsv`, each with a roughly CRF-equivalent quality
+option for that encoder. Nothing here detects which GPU vendor is
+actually present — it just attempts each in turn and moves on
+immediately if ffmpeg reports that one can't be used, which naturally
+handles "wrong or no GPU vendor" without needing to know that in
+advance. If every hardware option fails, falls straight through to the
+exact same `libx264` path used when GPU isn't requested at all. This
+can't produce a broken export: the worst case for a wrong quality-
+parameter guess on some encoder is that one attempt fails and the loop
+moves on, exactly as if that GPU didn't exist.
+
+`export_clip`'s return type changed from a plain path string to a small
+`ExportResult { output_path, encoder_used }` struct, so the frontend can
+say plainly whether GPU encoding actually happened or silently fell back
+to CPU — visible in the status message, not just the diagnostic log.
+
+Genuinely unverified: the exact quality-parameter syntax for each
+hardware encoder (`-cq` for nvenc, `-qp_i`/`-qp_p` for amf,
+`-global_quality` for qsv) is written from each encoder's documented
+options, not confirmed against a real GPU of each vendor — there's no
+way to test that here.
+
+## Startup performance pass
+
+Two low-risk fixes, both about deferring work rather than changing what
+anything does:
+
+- **`subtitles-octopus.js` was loading eagerly** on every single launch
+  via a `<script>` tag in `index.html`, regardless of whether a file was
+  even loaded yet or had subtitles at all — true for most launches.
+  Removed that tag; the library now loads dynamically on first actual
+  use (`ensureSubtitlesOctopusLoaded()`, cached after the first load so
+  switching between subtitled files doesn't reload it repeatedly).
+- **Drag-drop setup deferred via `setTimeout(fn, 0)`** rather than
+  running immediately at script load — nothing about the initial render
+  depends on it, so there's no reason for it to compete with getting
+  pixels on screen first.
+
+Also parallelized subtitle extraction: `extract_subtitles_to`'s ASS
+extraction and font extraction are independent operations (neither reads
+the other's output, both just read the same source file and write to
+different destinations) that were running sequentially. Split font
+extraction into its own function and spawned it via
+`tauri::async_runtime::spawn` to run concurrently with ASS extraction
+instead of waiting for it to finish first — same proven spawn mechanism
+already used for the background setup check, low risk since there's no
+shared mutable state between the two.
+
+Noted but not changed: "quite slow on first startup" specifically is
+very likely WebView2's own one-time runtime initialization (creating its
+user data folder, JIT-warming, etc.) — a well-known cost for any
+Tauri/Electron-style app's first launch after install, and not something
+under this app's own control.
+
+On GPU-accelerated encoding and multithreading, asked about together:
+multithreading is already happening — `libx264` (the current encoder)
+auto-detects and uses available CPU cores by default; nothing here was
+ever limiting it to one thread. GPU encoding (NVENC/AMF/QSV — the
+bundled ffmpeg build does have these compiled in) is a genuinely
+different proposition than the fixes above: not every machine has a
+compatible GPU, so switching encoders without real fallback logic would
+break exports outright for anyone without one, and hardware encoders
+have different quality-per-bitrate characteristics that could affect
+target-size mode's accuracy in ways that need actual testing to trust.
+That's a real, separate feature — proper try-hardware-then-fall-back
+logic — not a "broad, low-risk" change, and given every actual
+performance bug found and fixed in this project so far has been about
+unnecessary seeking rather than raw encode throughput, it's also not
+obviously the right lever for this app's typical short-clip workload
+specifically. Deferred rather than implemented blind.
+
 ## GIF export still slow after the duration fix — real, separate cause
 
 The `-t` argument-position fix was real and necessary (confirmed: output

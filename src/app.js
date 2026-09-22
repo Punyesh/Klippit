@@ -44,7 +44,8 @@ var state = {
   outputFileName: '', // populated once we know the source filename — see updateDefaultFilename()
   sourceWidth: 0,
   sourceHeight: 0,
-  muteAudio: false
+  muteAudio: false,
+  useGpu: false
 };
 
 var MED_STEP = 5;
@@ -244,6 +245,35 @@ function currentSubtitleExternalFile() {
 // setting — "with or without subtitles" for a screenshot is answered by
 // whatever you're currently seeing on screen, independent of whatever
 // you've decided for the full clip's export.
+// ---------- preview audio (opt-in, muted by default) ----------
+// Klippit is triggered from inside mpv/VLC, which is often still open
+// with the same file — if this played audio by default and someone
+// hadn't paused the original player, they'd get an echo. Muted by
+// default (matching the <video> element's own attribute), one click to
+// hear audio while editing if the original player is paused or closed.
+var muteToggleBtn = document.getElementById('mute-toggle-btn');
+var muteToggleX1 = document.getElementById('mute-toggle-x1');
+var muteToggleX2 = document.getElementById('mute-toggle-x2');
+var volumeSlider = document.getElementById('volume-slider');
+muteToggleBtn.onclick = function () {
+  video.muted = !video.muted;
+  muteToggleBtn.setAttribute('aria-pressed', String(!video.muted));
+  muteToggleBtn.title = video.muted
+    ? 'Unmute preview audio (off by default — avoids echo if your original player is still open)'
+    : 'Mute preview audio';
+  // Plain speaker shape when unmuted, speaker-with-X when muted — kept
+  // deliberately simple (just showing/hiding the X) rather than
+  // swapping in animated sound-wave arcs for the unmuted state.
+  muteToggleX1.style.display = video.muted ? '' : 'none';
+  muteToggleX2.style.display = video.muted ? '' : 'none';
+  // Only shown once unmuted — no point cluttering the seek-row with a
+  // volume control in the default (muted) state.
+  volumeSlider.style.display = video.muted ? 'none' : 'block';
+};
+volumeSlider.oninput = function () {
+  video.volume = volumeSlider.value / 100;
+};
+
 var screenshotBtn = document.getElementById('screenshot-btn');
 screenshotBtn.onclick = function () {
   if (!init.filePath || !window.__TAURI__) {
@@ -306,6 +336,10 @@ bindSeg('fmt-mp4', 'fmt-gif', function (id) {
   // GIFs never carry audio at all, so the mute toggle is meaningless
   // there — hide it rather than leave a control with nothing to control.
   document.getElementById('audio-field').style.display = state.format === 'gif' ? 'none' : 'block';
+  // GIF is palette-based, not H.264 — no GPU encoder involved at all.
+  // gpu-field also sits inside panel-quality, so target-size mode
+  // already hides it for free without needing a separate check here.
+  document.getElementById('gpu-field').style.display = state.format === 'gif' ? 'none' : 'block';
   updateOutputExt();
 });
 bindSeg('mode-quality', 'mode-size', function (id) {
@@ -315,6 +349,9 @@ bindSeg('mode-quality', 'mode-size', function (id) {
 });
 bindSeg('audio-keep', 'audio-mute', function (id) {
   state.muteAudio = id === 'audio-mute';
+});
+bindSeg('gpu-off', 'gpu-on', function (id) {
+  state.useGpu = id === 'gpu-on';
 });
 
 bindSeg('subs-off', 'subs-on', function (id) {
@@ -388,10 +425,13 @@ function loadMetadata() {
       // regardless of what mpv/VLC's active-track state guessed earlier
       // in applyInit(), since that only reflects whether a track was
       // actively selected in the player, not whether the file has one.
+      // loadSubtitleOverlay() itself is NOT called here anymore — it's
+      // already been kicked off speculatively in applyInit(), in
+      // parallel with this metadata call, rather than waiting for this
+      // confirmation first (see the comment there for why).
       subsOffBtn.disabled = false;
       subsOnBtn.disabled = false;
       subsStatus.textContent = '';
-      loadSubtitleOverlay();
     }
     render();
   }).catch(function (err) {
@@ -415,8 +455,51 @@ function disposeSubtitleOverlay() {
     octopusInstance = null;
   }
 }
+// Lazy-loads subtitles-octopus.js on first actual use rather than eagerly
+// on every app startup via a <script> tag (removed from index.html) —
+// this library was being parsed/executed on every single launch even
+// when no file was loaded yet or the loaded file had no subtitles at
+// all, which is most launches. Cached after the first load so switching
+// between multiple subtitled files doesn't reload it repeatedly.
+var subtitlesOctopusLoadPromise = null;
+function ensureSubtitlesOctopusLoaded() {
+  if (subtitlesOctopusLoadPromise) return subtitlesOctopusLoadPromise;
+  subtitlesOctopusLoadPromise = new Promise(function (resolve, reject) {
+    var script = document.createElement('script');
+    script.src = 'lib/subtitles-octopus/subtitles-octopus.js';
+    script.onload = resolve;
+    script.onerror = function () { subtitlesOctopusLoadPromise = null; reject(new Error('failed to load subtitles-octopus.js')); };
+    document.head.appendChild(script);
+  });
+  return subtitlesOctopusLoadPromise;
+}
+
+// Visible "loading" state on the CC button — the delay between a file
+// with subtitles loading and text actually appearing is real and
+// somewhat unavoidable given the current pipeline (extract .ass + fonts,
+// fetch each as a blob, then load/initialize a ~2.7MB WASM library
+// before anything can render), not a bug — confirmed real user
+// confusion that it read as "subtitles just don't show up" rather than
+// "still loading." This doesn't make it faster, just makes the wait
+// visible instead of looking broken.
+function setSubtitleLoadingIndicator(loading) {
+  subsPreviewToggleBtn.classList.toggle('loading', loading);
+  subsPreviewToggleBtn.title = loading
+    ? 'Loading subtitles…'
+    : 'Show/hide subtitle preview (also affects screenshots)';
+}
+
 function loadSubtitleOverlay() {
   disposeSubtitleOverlay();
+  setSubtitleLoadingIndicator(true);
+  ensureSubtitlesOctopusLoaded().then(function () {
+    startSubtitleOverlayExtraction();
+  }).catch(function (err) {
+    setSubtitleLoadingIndicator(false);
+    console.log('[klippit] failed to load subtitle overlay library:', err);
+  });
+}
+function startSubtitleOverlayExtraction() {
   window.__TAURI__.core.invoke('extract_subtitles_for_preview', {
     path: init.filePath,
     subtitleLang: currentSubtitleLang(),
@@ -454,18 +537,22 @@ function loadSubtitleOverlay() {
           // used rather than assuming canvas exists immediately after
           // construction, since the library's setup may finish async.
           applySubsPreviewVisibility();
+          setSubtitleLoadingIndicator(false);
         },
         onError: function (err) {
+          setSubtitleLoadingIndicator(false);
           console.log('[klippit] subtitle overlay error:', err);
         }
       });
       applySubsPreviewVisibility(); // harmless if canvas isn't ready yet — onReady above covers that case
     }).catch(function (err) {
+      setSubtitleLoadingIndicator(false);
       console.log('[klippit] failed to prepare subtitle blob URLs:', err);
     });
   }).catch(function (err) {
     // Non-fatal — editing still works fine without the subtitle overlay,
     // this just means you won't see dialogue timing while trimming.
+    setSubtitleLoadingIndicator(false);
     console.log('[klippit] subtitle preview extraction failed:', err);
   });
 }
@@ -482,9 +569,33 @@ var revealBtn = document.getElementById('reveal-btn');
 var playBtn = document.getElementById('play-btn');
 var lastExportedPath = null;
 
+var cancelBtn = document.getElementById('cancel-btn');
+
 function setBusy(busy) {
   exportBtn.disabled = busy;
   spinnerEl.style.display = busy ? 'inline-block' : 'none';
+  // While exporting, this button's job changes from "close the whole
+  // panel" to "cancel the export in progress" — closing the panel
+  // outright while ffmpeg is still running isn't something you'd want
+  // anyway, so repurposing this slot fits naturally rather than adding
+  // a second button just for the busy window.
+  if (busy) {
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = cancelExport;
+  } else {
+    cancelBtn.textContent = 'Escape';
+    cancelBtn.onclick = closePanel;
+  }
+}
+
+function cancelExport() {
+  if (!window.__TAURI__) return;
+  cancelBtn.disabled = true;
+  window.__TAURI__.core.invoke('cancel_export').catch(function (err) {
+    console.log('[klippit] cancel_export failed:', err);
+  }).then(function () {
+    cancelBtn.disabled = false;
+  });
 }
 
 // ---------- export ----------
@@ -506,7 +617,8 @@ function exportClip() {
     sourceHeight: state.sourceHeight,
     subtitleLang: currentSubtitleLang(),
     subtitleExternalFile: currentSubtitleExternalFile(),
-    muteAudio: state.muteAudio
+    muteAudio: state.muteAudio,
+    useGpu: state.useGpu
   };
   setStatus('exporting…', 'busy');
   statusActions.style.display = 'none';
@@ -522,18 +634,38 @@ function exportClip() {
     return;
   }
 
-  window.__TAURI__.core.invoke('export_clip', { params: params }).then(function (path) {
-    setStatus('done — ' + path, 'done');
+  window.__TAURI__.core.invoke('export_clip', { params: params }).then(function (result) {
+    var path = result.outputPath;
+    var encoderLabels = { h264_nvenc: 'NVIDIA GPU', h264_amf: 'AMD GPU', h264_qsv: 'Intel GPU' };
+    var note = '';
+    if (state.useGpu && result.encoderUsed === 'libx264') {
+      // GPU was requested but every hardware option failed or wasn't
+      // available — fell back to the regular CPU encoder automatically,
+      // which is the whole point of asking for this to fail safely. Say
+      // so plainly rather than silently using CPU without mentioning it.
+      note = ' (GPU unavailable, used CPU instead)';
+    } else if (encoderLabels[result.encoderUsed]) {
+      note = ' (' + encoderLabels[result.encoderUsed] + ' encoding)';
+    }
+    setStatus('done' + note + ' — ' + path, 'done');
     lastExportedPath = path;
     statusActions.style.display = 'flex';
   }).catch(function (err) {
-    setStatus('export failed: ' + err, 'error');
+    // The Rust side returns the plain string "cancelled" specifically
+    // for this case (see run_bin/cancel_export) — distinct from a
+    // genuine ffmpeg failure, worth a clearer message than "export
+    // failed: cancelled" would read as.
+    if (err === 'cancelled') {
+      setStatus('export cancelled', 'error');
+    } else {
+      setStatus('export failed: ' + err, 'error');
+    }
   }).then(function () {
     setBusy(false);
   });
 }
 document.getElementById('export-btn').onclick = exportClip;
-document.getElementById('cancel-btn').onclick = closePanel;
+setBusy(false); // establishes the initial "Escape" label/behavior on cancel-btn
 
 revealBtn.onclick = function () {
   if (!lastExportedPath || !window.__TAURI__) return;
@@ -602,6 +734,17 @@ function applyInit(newInit) {
       ? window.__TAURI__.core.convertFileSrc(init.filePath)
       : 'file://' + init.filePath; // browser dev-preview fallback only
     video.load();
+    // Kicked off speculatively here, in parallel with loadMetadata()
+    // below, rather than waiting for its hasSubtitles confirmation
+    // first — extraction and metadata are independent ffprobe/ffmpeg
+    // calls on the same file, so there's no reason to run them one after
+    // another. For a file with no subtitles this just fails harmlessly
+    // (already handled gracefully), but for one that does have them,
+    // this head start measurably reduces the real, somewhat unavoidable
+    // delay before subtitle text actually appears — confirmed user
+    // confusion that this delay read as "subtitles don't show up"
+    // rather than "still loading."
+    if (window.__TAURI__) loadSubtitleOverlay();
   } else if (loadPrompt) {
     // Opened directly with no file context (no mpv/VLC trigger) — offer
     // a way in rather than just sitting there empty. See load-browse-btn
@@ -660,7 +803,13 @@ if (loadBrowseBtn) {
 // against a real build. If dropping a file doesn't work, the Browse
 // button above is a fully reliable fallback regardless; this is a
 // bonus convenience layered on top, not the only way in.
-(function setUpDragDrop() {
+//
+// Deferred via setTimeout rather than run immediately at script load —
+// this isn't needed for the initial render at all (nothing visible
+// depends on it), so there's no reason for it to compete with getting
+// pixels on screen first. The delay is imperceptible to a person but
+// keeps this off the critical startup path.
+setTimeout(function setUpDragDrop() {
   if (!window.__TAURI__ || !window.__TAURI__.window) return;
   try {
     var win = window.__TAURI__.window.getCurrentWebviewWindow();
@@ -679,7 +828,7 @@ if (loadBrowseBtn) {
   } catch (err) {
     console.log('[klippit] drag-drop event API unavailable:', err);
   }
-})();
+}, 0);
 
 
 video.addEventListener('loadedmetadata', function () {
@@ -705,6 +854,58 @@ if (setupWarningDismiss) {
     document.getElementById('setup-warning').style.display = 'none';
   };
 }
+
+// ---------- settings panel ----------
+// Klippit's first settings surface — lets the mpv keybind and mpv config
+// folder (for portable_config setups) be changed from inside the app,
+// rather than requiring anyone to edit clip-trigger.lua or input.conf by
+// hand. Real feedback drove both fields: someone's mpv used
+// portable_config so the script landed somewhere mpv never looked, and
+// a separate person pointed out that requiring a script edit just to
+// change a keybind defeats the point of the app being easier than
+// hand-rolled ffmpeg.
+var settingsModal = document.getElementById('settings-modal');
+var settingsBtn = document.getElementById('settings-btn');
+var settingsStatus = document.getElementById('settings-status');
+var settingsKeybindInput = document.getElementById('settings-mpv-keybind');
+var settingsMpvDirInput = document.getElementById('settings-mpv-dir');
+
+function openSettings() {
+  settingsStatus.textContent = '';
+  if (window.__TAURI__) {
+    window.__TAURI__.core.invoke('get_settings').then(function (settings) {
+      settingsKeybindInput.value = settings.mpvKeybind || 'c';
+      settingsMpvDirInput.value = settings.mpvConfigDirOverride || '';
+    }).catch(function (err) {
+      settingsStatus.textContent = 'Could not load current settings: ' + err;
+    });
+  }
+  settingsModal.style.display = 'flex';
+}
+function closeSettings() {
+  settingsModal.style.display = 'none';
+}
+if (settingsBtn) settingsBtn.onclick = openSettings;
+document.getElementById('settings-close-btn').onclick = closeSettings;
+document.getElementById('settings-save-btn').onclick = function () {
+  if (!window.__TAURI__) {
+    settingsStatus.textContent = 'Settings need the Tauri backend (not available in dev preview).';
+    return;
+  }
+  settingsStatus.textContent = 'Saving and reinstalling…';
+  window.__TAURI__.core.invoke('save_settings_and_reinstall', {
+    mpvKeybind: settingsKeybindInput.value,
+    mpvConfigDirOverride: settingsMpvDirInput.value || null
+  }).then(function (report) {
+    settingsStatus.textContent = report;
+  }).catch(function (err) {
+    settingsStatus.textContent = 'Failed: ' + err;
+  });
+};
+// Click-outside-to-close, same convention as most modal dialogs.
+settingsModal.addEventListener('mousedown', function (e) {
+  if (e.target === settingsModal) closeSettings();
+});
 
 updateOutputExt();
 applyInit(init);

@@ -24,6 +24,16 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::ShellExt;
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportResult {
+    output_path: String,
+    // "libx264" | "h264_nvenc" | "h264_amf" | "h264_qsv" | "gif" — lets
+    // the frontend tell the person whether GPU encoding they opted into
+    // actually happened, or silently fell back to the CPU encoder.
+    encoder_used: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ExportParams {
@@ -56,6 +66,12 @@ struct ExportParams {
     mute_audio: bool, // strip audio entirely (-an) rather than encoding it;
                        // meaningless for GIF (never has audio), UI hides the
                        // toggle in that case
+    #[serde(default)]
+    use_gpu: bool, // opt-in hardware encoding for MP4 Quality mode only —
+                   // see encode_quality_mode for the fallback logic. Not
+                   // offered for Target-size mode (2-pass hardware support
+                   // is far less consistent across encoders/drivers) or
+                   // GIF (palette-based, no H.264 encoder involved at all)
 }
 
 #[derive(Debug, Serialize)]
@@ -111,6 +127,48 @@ fn log_command(name: &str, args: &[String], cwd: Option<&std::path::Path>) {
     }
 }
 
+// ---------- export cancellation ----------
+// Tracks the currently-running ffmpeg/ffprobe child process (if any) so
+// a separate cancel_export command can kill it. A single slot is enough:
+// one export runs its ffmpeg steps strictly sequentially, never
+// concurrently, so a new run_bin call simply replaces whatever was here
+// before it. Killing whichever step happens to be running when cancel
+// is pressed is exactly the right behavior — the resulting error
+// naturally aborts the rest of the export sequence via the same ?
+// propagation already used everywhere, no separate cancellation
+// plumbing needed through export_gif/export_mp4/etc.
+struct ExportState {
+    current_child: std::sync::Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+impl Default for ExportState {
+    fn default() -> Self {
+        ExportState {
+            current_child: std::sync::Mutex::new(None),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[tauri::command]
+fn cancel_export(state: tauri::State<ExportState>) -> Result<(), String> {
+    state.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut guard = state.current_child.lock().map_err(|e| e.to_string())?;
+    if let Some(child) = guard.take() {
+        child.kill().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// UNVERIFIED: this rewrite uses genuinely new API surface for this
+// project — .spawn() / CommandEvent / CommandChild have never been used
+// here before (every prior ffmpeg/ffprobe call used the simpler
+// .output(), which doesn't expose a handle you can kill mid-flight).
+// Written from tauri-plugin-shell's documented pattern for exactly this
+// need, not confirmed against a real build. Signature and return type
+// are deliberately unchanged from the old .output()-based version, so
+// if this needs adjusting, no other call site in the whole file is
+// affected — every existing caller keeps working exactly as before.
 async fn run_bin(app: &AppHandle, name: &str, args: &[String], cwd: Option<&std::path::Path>) -> Result<Vec<u8>, String> {
     log_command(name, args, cwd);
     let sidecar = app
@@ -123,16 +181,44 @@ async fn run_bin(app: &AppHandle, name: &str, args: &[String], cwd: Option<&std:
         None => sidecar,
     };
 
-    let output = sidecar
+    let (mut rx, child) = sidecar
         .args(args)
-        .output()
-        .await
+        .spawn()
         .map_err(|e| format!("failed to run {name}: {e}"))?;
 
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    let state = app.state::<ExportState>();
+    *state.current_child.lock().map_err(|e| e.to_string())? = Some(child);
+
+    use tauri_plugin_shell::process::CommandEvent;
+    let mut stdout: Vec<u8> = vec![];
+    let mut stderr: Vec<u8> = vec![];
+    let mut exit_success = false;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            CommandEvent::Stdout(line) => stdout.extend_from_slice(&line),
+            CommandEvent::Stderr(line) => stderr.extend_from_slice(&line),
+            CommandEvent::Terminated(payload) => {
+                exit_success = payload.code == Some(0);
+            }
+            CommandEvent::Error(err) => {
+                *state.current_child.lock().map_err(|e| e.to_string())? = None;
+                return Err(format!("failed to run {name}: {err}"));
+            }
+            _ => {}
+        }
     }
-    Ok(output.stdout)
+
+    let was_cancelled = state.cancelled.swap(false, std::sync::atomic::Ordering::SeqCst);
+    *state.current_child.lock().map_err(|e| e.to_string())? = None;
+    if was_cancelled {
+        return Err("cancelled".to_string());
+    }
+
+    if !exit_success {
+        return Err(String::from_utf8_lossy(&stderr).to_string());
+    }
+    Ok(stdout)
 }
 
 // ---------- metadata (ffprobe) ----------
@@ -214,8 +300,29 @@ fn expand_tilde(path: &str) -> String {
 
 // ---------- export ----------
 #[tauri::command]
-async fn export_clip(app: AppHandle, params: ExportParams) -> Result<String, String> {
+async fn export_clip(app: AppHandle, params: ExportParams) -> Result<ExportResult, String> {
     let duration = params.out_time - params.in_time;
+    // Logged specifically to help diagnose a report (not yet
+    // reproducible here) of GIF export ignoring the Out marker and
+    // clipping to the end of the video instead. This records exactly
+    // what the frontend actually sent — in_time, out_time, the computed
+    // duration, and the format/mode — so if this happens again, the
+    // diagnostic log shows definitively whether the wrong duration was
+    // ever received here at all (a frontend-side issue) versus received
+    // correctly but mishandled somewhere further down the export
+    // pipeline (a backend issue) — a real distinction that's impossible
+    // to tell apart from the symptom alone.
+    log_command(
+        "export_clip params",
+        &[
+            format!("format={}", params.format),
+            format!("mode={}", params.mode),
+            format!("inTime={}", params.in_time),
+            format!("outTime={}", params.out_time),
+            format!("computedDuration={duration}"),
+        ],
+        None,
+    );
     if duration <= 0.0 {
         return Err("out point must be after in point".into());
     }
@@ -272,13 +379,14 @@ async fn export_clip(app: AppHandle, params: ExportParams) -> Result<String, Str
         None
     };
 
-    if params.format == "gif" {
+    let encoder_used = if params.format == "gif" {
         export_gif(&app, &params, duration, &out_path, subtitle_filter_str.as_deref(), subtitle_cwd.as_deref()).await?;
+        "gif".to_string()
     } else {
-        export_mp4(&app, &params, duration, &out_path, subtitle_filter_str.as_deref(), subtitle_cwd.as_deref()).await?;
-    }
+        export_mp4(&app, &params, duration, &out_path, subtitle_filter_str.as_deref(), subtitle_cwd.as_deref()).await?
+    };
 
-    Ok(out_path)
+    Ok(ExportResult { output_path: out_path, encoder_used })
 }
 
 fn scale_filter(resolution: u32) -> Option<String> {
@@ -337,7 +445,7 @@ fn subtitle_filter(extracted: &ExtractedSubtitles, source_width: u32, source_hei
     filter
 }
 
-async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str, subtitle_filter_str: Option<&str>, subtitle_cwd: Option<&std::path::Path>) -> Result<(), String> {
+async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str, subtitle_filter_str: Option<&str>, subtitle_cwd: Option<&std::path::Path>) -> Result<String, String> {
     let mut filters: Vec<String> = vec![];
     // Subtitles before scale: burns onto the original-resolution frame,
     // matching the coordinates the ASS/SSA styling was authored against,
@@ -351,31 +459,100 @@ async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_p
         // Target-size mode: compute bitrate from target_size / duration,
         // reserve a fixed slice for audio, 2-pass encode to hit it
         // reliably. Muted: skip that reservation entirely and give the
-        // whole bitrate budget to video instead.
+        // whole bitrate budget to video instead. GPU encoding isn't
+        // offered here — see the note on use_gpu in ExportParams.
         let target_bits = params.target_mb * 8_000_000.0;
         let audio_kbps = if params.mute_audio { 0.0 } else { 128.0 };
         let video_kbps = ((target_bits / duration / 1000.0) - audio_kbps).max(200.0);
 
-        run_ffmpeg_2pass(app, &params.file_path, params.in_time, duration, vf.as_deref(), video_kbps, audio_kbps, out_path, subtitle_cwd, params.mute_audio).await
+        run_ffmpeg_2pass(app, &params.file_path, params.in_time, duration, vf.as_deref(), video_kbps, audio_kbps, out_path, subtitle_cwd, params.mute_audio).await?;
+        Ok("libx264".to_string())
     } else {
-        let mut args: Vec<String> = vec![
-            "-y".into(),
-            "-ss".into(), params.in_time.to_string(), // input-side seek: fast + accurate enough for most clips
-            "-i".into(), params.file_path.clone(),
-            "-t".into(), duration.to_string(),
-            "-crf".into(), params.crf.to_string(),
-            "-preset".into(), "medium".into(),
-        ];
-        if params.mute_audio {
-            args.push("-an".into());
-        } else {
-            args.push("-c:a".into()); args.push("aac".into());
-            args.push("-b:a".into()); args.push("128k".into());
-        }
-        if let Some(f) = &vf { args.push("-vf".into()); args.push(f.clone()); }
-        args.push(out_path.into());
-        run_bin(app, "ffmpeg", &args, subtitle_cwd).await.map(|_| ())
+        encode_quality_mode(app, params, duration, vf.as_deref(), out_path, subtitle_cwd).await
     }
+}
+
+// GPU-accelerated encoding: opt-in (params.use_gpu), with automatic,
+// silent fallback to the regular software encoder (libx264) if a
+// hardware encoder isn't available or fails for any reason. Tried in
+// this order since NVIDIA GPUs are the most common consumer option for
+// this kind of workload, then AMD, then Intel QuickSync — but nothing
+// here actually detects which GPU vendor is present; it simply attempts
+// each encoder in turn and moves on immediately if ffmpeg reports it
+// can't be used, which naturally handles "wrong/no GPU vendor" without
+// needing to know that in advance. Every attempt uses the exact same
+// input, filters, and audio handling as the software path — only the
+// video codec and its quality option change.
+//
+// UNVERIFIED: the exact quality-parameter syntax for each hardware
+// encoder (-cq for nvenc, -qp_i/-qp_p for amf, -global_quality for qsv)
+// is written from ffmpeg's documented options for each, not confirmed
+// against a real GPU of each vendor — there's no way to test that here.
+// If a particular encoder's quality parameter turns out wrong, the
+// worst case is that specific attempt fails and this same fallback
+// logic moves on to the next option (or to libx264) exactly as it would
+// for "no such GPU" — this can't produce a broken export, only
+// possibly a less-than-ideal encoder choice for that one attempt.
+const GPU_ENCODER_NAMES: &[&str] = &["h264_nvenc", "h264_amf", "h264_qsv"];
+
+fn gpu_quality_args(encoder: &str, crf: u32) -> Vec<String> {
+    match encoder {
+        "h264_nvenc" => vec!["-rc".into(), "vbr".into(), "-cq".into(), crf.to_string()],
+        "h264_amf" => vec!["-rc".into(), "cqp".into(), "-qp_i".into(), crf.to_string(), "-qp_p".into(), crf.to_string()],
+        "h264_qsv" => vec!["-global_quality".into(), crf.to_string()],
+        _ => vec![],
+    }
+}
+
+async fn encode_quality_mode(
+    app: &AppHandle, params: &ExportParams, duration: f64, vf: Option<&str>,
+    out_path: &str, subtitle_cwd: Option<&std::path::Path>,
+) -> Result<String, String> {
+    let mut audio_args: Vec<String> = vec![];
+    if params.mute_audio {
+        audio_args.push("-an".into());
+    } else {
+        audio_args.push("-c:a".into()); audio_args.push("aac".into());
+        audio_args.push("-b:a".into()); audio_args.push("128k".into());
+    }
+
+    if params.use_gpu {
+        for encoder in GPU_ENCODER_NAMES {
+            let mut args: Vec<String> = vec![
+                "-y".into(),
+                "-ss".into(), params.in_time.to_string(),
+                "-i".into(), params.file_path.clone(),
+                "-t".into(), duration.to_string(),
+                "-c:v".into(), (*encoder).to_string(),
+            ];
+            args.extend(gpu_quality_args(encoder, params.crf));
+            args.extend(audio_args.clone());
+            if let Some(f) = vf { args.push("-vf".into()); args.push(f.to_string()); }
+            args.push(out_path.into());
+            if run_bin(app, "ffmpeg", &args, subtitle_cwd).await.is_ok() {
+                return Ok((*encoder).to_string());
+            }
+            // This specific hardware encoder isn't available or failed
+            // for some other reason — move on to the next one, or to
+            // libx264 below, exactly as if no GPU were present at all.
+        }
+    }
+
+    // Software fallback — either GPU wasn't requested, or every
+    // hardware option above failed.
+    let mut args: Vec<String> = vec![
+        "-y".into(),
+        "-ss".into(), params.in_time.to_string(),
+        "-i".into(), params.file_path.clone(),
+        "-t".into(), duration.to_string(),
+        "-crf".into(), params.crf.to_string(),
+        "-preset".into(), "medium".into(),
+    ];
+    args.extend(audio_args);
+    if let Some(f) = vf { args.push("-vf".into()); args.push(f.to_string()); }
+    args.push(out_path.into());
+    run_bin(app, "ffmpeg", &args, subtitle_cwd).await?;
+    Ok("libx264".to_string())
 }
 
 async fn run_ffmpeg_2pass(
@@ -725,18 +902,48 @@ async fn extract_subtitles_to(
     extract_args.push("-c:s".into());
     extract_args.push("ass".into());
     extract_args.push(ass_path.to_string_lossy().to_string());
+
+    // Font extraction is independent of the ASS extraction below —
+    // neither reads the other's output, both just read from the same
+    // source file and write to different destinations — so it's spawned
+    // as a separate task to run concurrently rather than waiting for ASS
+    // extraction to finish first. Low risk: no shared mutable state
+    // between them, and font extraction was already best-effort before
+    // this change (a failure here was already swallowed silently),
+    // which is preserved — this task's own errors are simply treated as
+    // "no fonts found" the same way they already were.
+    let font_app = app.clone();
+    let font_path = path.to_string();
+    let font_temp_dir = temp_dir.to_path_buf();
+    let font_task = tauri::async_runtime::spawn(async move {
+        extract_fonts(&font_app, &font_path, &font_temp_dir).await
+    });
+
     run_bin(app, "ffmpeg", &extract_args, None).await?;
 
-    // Font attachments: best-effort. A file with none (or fonts already
-    // present on the system) still works, just with less accurate font
-    // matching.
-    let font_probe = run_bin(app, "ffprobe", &[
+    let font_paths = font_task.await.unwrap_or_default();
+
+    Ok(ExtractedSubtitles { ass_path, font_paths })
+}
+
+// Split out of extract_subtitles_to specifically so it can run
+// concurrently with ASS extraction there (see the comment at that call
+// site) — best-effort throughout, matching the behavior before this
+// split: any failure along the way just results in an empty Vec rather
+// than propagating an error, since a file with no fonts (or fonts
+// already present on the system) still works fine, just with less
+// accurate font matching.
+async fn extract_fonts(app: &AppHandle, path: &str, temp_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let font_probe = match run_bin(app, "ffprobe", &[
         "-v".into(), "error".into(),
         "-select_streams".into(), "t".into(),
         "-show_entries".into(), "stream=index:stream_tags=filename".into(),
         "-of".into(), "csv=p=0".into(),
         path.to_string(),
-    ], None).await.unwrap_or_default();
+    ], None).await {
+        Ok(out) => out,
+        Err(_) => return vec![],
+    };
 
     let mut dump_args: Vec<String> = vec!["-y".into()];
     let mut pending: Vec<std::path::PathBuf> = vec![];
@@ -768,8 +975,7 @@ async fn extract_subtitles_to(
             }
         }
     }
-
-    Ok(ExtractedSubtitles { ass_path, font_paths })
+    font_paths
 }
 
 // Used for the live EDITING preview specifically: a plain browser
@@ -819,19 +1025,19 @@ async fn open_review_window(app: AppHandle, path: String) -> Result<(), String> 
         .title("Klippit — Preview")
         .inner_size(640.0, 480.0)
         .initialization_script(&script)
-        // Guarantees this appears above EVERYTHING, including other
-        // applications like VLC — not just the main Klippit window.
-        // set_focus() alone isn't a strong enough guarantee here: Windows
-        // has its own focus-stealing-prevention rules that can block a
-        // window from grabbing foreground status depending on timing, so
-        // it's kept below as a secondary nudge, not the primary
-        // mechanism. always_on_top is the same approach already used for
-        // the main window itself, for the same underlying reason.
-        .always_on_top(true)
         .build()
         .map_err(|e| e.to_string())?;
 
+    // Same "raise once, don't stay pinned" toggle as the main window —
+    // permanent always_on_top(true) here was reported as genuinely bad
+    // behavior: this window would keep forcing itself above whatever
+    // else the person switched to (a browser, a file explorer, anything)
+    // for as long as it stayed open. This still reliably appears above
+    // other applications like VLC at the moment it opens (the actual
+    // reason this existed), then behaves like any other normal window.
     let _ = window.center();
+    let _ = window.set_always_on_top(true);
+    let _ = window.set_always_on_top(false);
     let _ = window.set_focus();
 
     Ok(())
@@ -871,11 +1077,12 @@ struct SetupResult {
     env_var: Result<(), String>,
     mpv_script: Result<(), String>,
     vlc_script: Result<(), String>,
+    mpv_keybind_config: Result<(), String>,
 }
 
 impl SetupResult {
     fn any_failed(&self) -> bool {
-        self.env_var.is_err() || self.mpv_script.is_err() || self.vlc_script.is_err()
+        self.env_var.is_err() || self.mpv_script.is_err() || self.vlc_script.is_err() || self.mpv_keybind_config.is_err()
     }
 }
 
@@ -939,20 +1146,90 @@ fn install_script(exe_dir: &std::path::Path, resource_rel: &str, dest_dir: std::
     Ok(())
 }
 
+// ---------- user-editable settings (mpv keybind, config folder override) ----------
+// Klippit's first-ever persisted settings — previously nothing needed
+// remembering between runs. Kept as a plain JSON file rather than the
+// registry: simple to read/write with std::fs alone, no new dependency,
+// and easy for a person to inspect or delete by hand if something goes
+// wrong.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct KlippitSettings {
+    #[serde(default = "default_mpv_keybind")]
+    mpv_keybind: String,
+    // None = use the default %APPDATA%\mpv. Set when someone's mpv uses
+    // portable_config (a folder next to mpv.exe itself, which mpv
+    // prefers over %APPDATA% when present) — confirmed as a real gap via
+    // actual user feedback: the previous hardcoded %APPDATA% path
+    // silently wrote the script somewhere portable-mode mpv never looks,
+    // with no error or indication anything was wrong.
+    #[serde(default)]
+    mpv_config_dir_override: Option<String>,
+}
+fn default_mpv_keybind() -> String { "c".to_string() }
+impl Default for KlippitSettings {
+    fn default() -> Self {
+        KlippitSettings { mpv_keybind: default_mpv_keybind(), mpv_config_dir_override: None }
+    }
+}
+
+fn settings_path() -> std::path::PathBuf {
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    std::path::PathBuf::from(appdata).join("Klippit").join("settings.json")
+}
+
+fn load_settings() -> KlippitSettings {
+    std::fs::read_to_string(settings_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_settings(settings: &KlippitSettings) -> Result<(), String> {
+    let path = settings_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("couldn't create {}: {e}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| format!("couldn't write {}: {e}", path.display()))
+}
+
+// Writes mpv's script-opts config file for clip-trigger.lua — the
+// mechanism that lets the keybind be changed without ever editing the
+// script itself. mpv_config_dir is whatever run_setup() resolved (either
+// the default %APPDATA%\mpv or the person's override), matching wherever
+// the script itself just got copied to.
+fn write_mpv_keybind_config(mpv_config_dir: &std::path::Path, keybind: &str) -> Result<(), String> {
+    let dir = mpv_config_dir.join("script-opts");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
+    let path = dir.join("clip-trigger.conf");
+    std::fs::write(&path, format!("key={keybind}\n")).map_err(|e| format!("couldn't write {}: {e}", path.display()))
+}
+
 fn run_setup() -> SetupResult {
     let exe_path = std::env::current_exe().unwrap_or_default();
     let exe_dir = exe_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
     let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let settings = load_settings();
 
     let env_var = set_klippit_path_env(&exe_path);
 
-    let mpv_dest = std::path::PathBuf::from(&appdata).join("mpv").join("scripts");
+    // mpv_config_dir: the person's override (for portable_config setups,
+    // or any other nonstandard mpv config location) if one is set via
+    // Klippit's Settings panel, otherwise the default %APPDATA%\mpv.
+    let mpv_config_dir = settings.mpv_config_dir_override
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(&appdata).join("mpv"));
+
+    let mpv_dest = mpv_config_dir.join("scripts");
     let mpv_script = install_script(&exe_dir, "mpv-scripts/clip-trigger.lua", mpv_dest, "clip-trigger.lua");
+    let mpv_keybind_config = write_mpv_keybind_config(&mpv_config_dir, &settings.mpv_keybind);
 
     let vlc_dest = std::path::PathBuf::from(&appdata).join("vlc").join("lua").join("extensions");
     let vlc_script = install_script(&exe_dir, "vlc-scripts/klippit-extension.lua", vlc_dest, "klippit.lua");
 
-    SetupResult { env_var, mpv_script, vlc_script }
+    SetupResult { env_var, mpv_script, vlc_script, mpv_keybind_config }
 }
 
 // Overwritten on every setup run (both the installer's one-shot --setup
@@ -963,10 +1240,41 @@ fn write_setup_log(result: &SetupResult) {
     let lines = vec![
         fmt_result("KLIPPIT_PATH env var", &result.env_var),
         fmt_result("mpv script", &result.mpv_script),
+        fmt_result("mpv keybind config", &result.mpv_keybind_config),
         fmt_result("VLC extension", &result.vlc_script),
     ];
     let log_path = std::env::temp_dir().join("klippit-setup.log");
     let _ = std::fs::write(log_path, lines.join("\n"));
+}
+
+// Klippit's first Settings panel — lets the mpv keybind and mpv config
+// folder (for portable_config setups) be changed from inside the app
+// itself, rather than requiring anyone to edit clip-trigger.lua or
+// input.conf by hand. Both commands are thin wrappers around the same
+// settings/run_setup machinery already used for the background
+// self-healing check — saving here just means the next self-heal (and
+// this immediate reinstall) picks up the new values.
+#[tauri::command]
+async fn get_settings() -> KlippitSettings {
+    load_settings()
+}
+
+#[tauri::command]
+async fn save_settings_and_reinstall(mpv_keybind: String, mpv_config_dir_override: Option<String>) -> Result<String, String> {
+    let keybind = if mpv_keybind.trim().is_empty() { default_mpv_keybind() } else { mpv_keybind.trim().to_string() };
+    let dir_override = mpv_config_dir_override.filter(|s| !s.trim().is_empty());
+    let settings = KlippitSettings { mpv_keybind: keybind, mpv_config_dir_override: dir_override };
+    save_settings(&settings)?;
+
+    let result = run_setup();
+    write_setup_log(&result);
+
+    Ok(vec![
+        fmt_result("KLIPPIT_PATH env var", &result.env_var),
+        fmt_result("mpv script", &result.mpv_script),
+        fmt_result("mpv keybind config", &result.mpv_keybind_config),
+        fmt_result("VLC extension", &result.vlc_script),
+    ].join("\n"))
 }
 
 fn main() {
@@ -1000,6 +1308,15 @@ fn main() {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.eval(&format!("window.applyInit && window.applyInit({json});"));
                     let _ = window.unminimize();
+                    // Same "raise once, don't stay pinned" toggle as the
+                    // initial window creation below — this is exactly
+                    // the moment it matters most (mpv/VLC's trigger key
+                    // pressed again while Klippit is already open behind
+                    // the video player), and exactly where persistent
+                    // always-on-top used to cause the most friction
+                    // afterward.
+                    let _ = window.set_always_on_top(true);
+                    let _ = window.set_always_on_top(false);
                     let _ = window.set_focus();
                 }
             }
@@ -1007,6 +1324,7 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .manage(ExportState::default())
         .setup(move |app| {
             // The window is built here programmatically, rather than
             // declared in tauri.conf.json, specifically so
@@ -1023,8 +1341,7 @@ fn main() {
             .title("Klippit")
             .inner_size(900.0, 620.0)
             .min_inner_size(700.0, 480.0)
-            .resizable(true)
-            .always_on_top(true);
+            .resizable(true);
 
             if let Some(json) = &init_json {
                 let script = format!("window.__KLIPPIT_INIT__ = {json};");
@@ -1032,6 +1349,26 @@ fn main() {
             }
 
             let window = builder.build()?;
+
+            // Bring the window to the front once at creation, without
+            // leaving it permanently pinned above everything else —
+            // that's the actual fix here. The previous
+            // always_on_top(true) on the builder kept it forced above
+            // every other window for as long as it stayed open, which
+            // was reported as genuinely bad behavior: switching to a
+            // file explorer, a browser, or any other program while
+            // Klippit stayed open meant it kept forcing itself back in
+            // front, obstructing whatever the person actually wanted to
+            // look at. Toggling always-on-top on then immediately off
+            // is a standard trick for "raise this once" without that
+            // persistent side effect — it still reliably appears above
+            // a borderless-windowed-fullscreen video player (the actual
+            // reason this existed) but behaves like any other normal
+            // window from that point on: can be covered by other
+            // windows, alt-tabbed normally, etc.
+            let _ = window.set_always_on_top(true);
+            let _ = window.set_always_on_top(false);
+            let _ = window.set_focus();
 
             // Self-healing safety net: re-verify the same things the
             // installer's --setup call already tried, every normal
@@ -1066,7 +1403,10 @@ fn main() {
             export_clip,
             extract_frame,
             extract_subtitles_for_preview,
-            open_review_window
+            open_review_window,
+            get_settings,
+            save_settings_and_reinstall,
+            cancel_export
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

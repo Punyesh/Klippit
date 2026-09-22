@@ -1,12 +1,23 @@
 -- Klippit — mpv trigger
 --
--- Bound to a key (default: c). Grabs the current file path, timestamp, and
--- active subtitle info from mpv, then launches (or messages, if already
--- running) the Tauri clip panel with that context. This script does no
--- video processing itself — it's pure handoff, matching the split we
--- settled on: mpv owns playback + capture, the panel owns the UI + export.
+-- Bound to a key (default: c, configurable — see below). Grabs the
+-- current file path, timestamp, and active subtitle info from mpv, then
+-- launches (or messages, if already running) the Tauri clip panel with
+-- that context. This script does no video processing itself — it's pure
+-- handoff, matching the split we settled on: mpv owns playback +
+-- capture, the panel owns the UI + export.
 
 local utils = require 'mp.utils'
+local options = require 'mp.options'
+
+-- Configurable via %APPDATA%\mpv\script-opts\clip-trigger.conf (or the
+-- equivalent path under portable_config) — a single line like "key=F5".
+-- Klippit's own Settings panel writes this file directly, so changing
+-- the keybind never requires editing this script by hand. read_options
+-- respects mpv's own portable_config resolution automatically — this
+-- script doesn't need to know or care whether that's active.
+local opts = { key = "c" }
+options.read_options(opts, "clip-trigger")
 
 -- Reads the app's location from a KLIPPIT_PATH environment variable if
 -- set, falling back to the literal path below otherwise. This means
@@ -76,4 +87,4 @@ local function open_clip_tool()
     mp.osd_message("klippit: opening at " .. string.format("%.2fs", payload.startTime))
 end
 
-mp.add_key_binding("c", "open-klippit", open_clip_tool)
+mp.add_key_binding(opts.key, "open-klippit", open_clip_tool)

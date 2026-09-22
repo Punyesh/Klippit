@@ -1,6 +1,6 @@
 [package]
 name = "klippit"
-version = "1.0.0"
+version = "1.1.1"
 description = "Frame-accurate clip/GIF/screenshot export panel, triggered from mpv"
 edition = "2021"
 
