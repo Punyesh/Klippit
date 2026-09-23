@@ -1,4 +1,4 @@
-/* Klippit — panel styling
+<html><head><style>/* Klippit — panel styling
    "Tape deck / broadcast monitor" identity: true video-black, one tally-
    red accent (the record-light color, tying directly to marking in/out
    points), monospace timecodes, system UI font for labels so it reads as
@@ -11,35 +11,23 @@
    control should feel like a compact instrument reading, not a tap
    target sized for a touchscreen. */
 
-:root {
-  --bg: #0b0c0e;
-  --panel: #16171a;
-  --panel2: #1c1e22;
-  --line: #2b2e33;
-  --text: #e7e9ec;
-  --dim: #7d828a;
-  --red: #e0342c;
-  --red-dim: #401512;
-  --focus: #e0342c;
-  --mono: "JetBrains Mono", "SFMono-Regular", Consolas, Menlo, monospace;
-  --sans: "Segoe UI", system-ui, -apple-system, sans-serif;
-}
+
 
 * { box-sizing: border-box; }
 
 html, body {
   height: 100%;
   margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--sans);
+  background: #0b0c0e;
+  color: #e7e9ec;
+  font-family: "Segoe UI", sans-serif;
   font-size: 12px;
   user-select: none;
   overflow-x: hidden;
 }
 
 :focus-visible {
-  outline: 2px solid var(--focus);
+  outline: 2px solid #e0342c;
   outline-offset: 1px;
   border-radius: 2px;
 }
@@ -47,7 +35,7 @@ html, body {
 /* Thin, theme-matched scrollbars instead of the OS default */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb { background: #2b2e33; border-radius: 4px; border: 2px solid transparent; background-clip: padding-box; }
 ::-webkit-scrollbar-thumb:hover { background: #3a3d44; background-clip: padding-box; }
 
 #app {
@@ -77,8 +65,8 @@ html, body {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  background: var(--panel2);
-  border-left: 1px solid var(--line);
+  background: #1c1e22;
+  border-left: 1px solid #2b2e33;
   min-height: 0;
 }
 
@@ -87,20 +75,20 @@ html, body {
   display: flex;
   align-items: center;
   padding: 6px 10px;
-  border-bottom: 1px solid var(--line);
-  background: var(--panel2);
+  border-bottom: 1px solid #2b2e33;
+  background: #1c1e22;
   flex-shrink: 0;
   gap: 8px;
 }
 #head .brand {
-  color: var(--red);
+  color: #e0342c;
   display: flex;
   align-items: center;
 }
 #head .source-name {
-  font-family: var(--mono);
+  font-family: "Consolas", monospace;
   font-size: 10px;
-  color: var(--dim);
+  color: #7d828a;
   flex: 1 1 auto;
   min-width: 0;
   text-align: right;
@@ -109,11 +97,11 @@ html, body {
   white-space: nowrap;
 }
 #settings-btn {
-  background: none; border: none; color: var(--dim); cursor: pointer;
+  background: none; border: none; color: #7d828a; cursor: pointer;
   display: inline-flex; align-items: center; justify-content: center;
   padding: 3px; flex-shrink: 0; border-radius: 2px;
 }
-#settings-btn:hover { color: var(--red); background: var(--red-dim); }
+#settings-btn:hover { color: #e0342c; background: #401512; }
 
 /* Shown only if the background setup check (env var + mpv/VLC script
    install) actually failed at something — invisible otherwise, since a
@@ -125,19 +113,19 @@ html, body {
   justify-content: space-between;
   gap: 8px;
   padding: 6px 10px;
-  background: var(--red-dim);
-  border-bottom: 1px solid var(--red);
-  font-family: var(--mono);
+  background: #401512;
+  border-bottom: 1px solid #e0342c;
+  font-family: "Consolas", monospace;
   font-size: 10px;
-  color: var(--text);
+  color: #e7e9ec;
   flex-shrink: 0;
   white-space: pre-line;
 }
 #setup-warning-dismiss {
-  background: none; border: none; color: var(--dim); cursor: pointer;
+  background: none; border: none; color: #7d828a; cursor: pointer;
   font-size: 14px; line-height: 1; padding: 0 2px; flex-shrink: 0;
 }
-#setup-warning-dismiss:hover { color: var(--text); }
+#setup-warning-dismiss:hover { color: #e7e9ec; }
 
 /* ---------- settings modal ---------- */
 #settings-modal {
@@ -150,8 +138,8 @@ html, body {
   z-index: 100;
 }
 #settings-panel {
-  background: var(--panel2);
-  border: 1px solid var(--line);
+  background: #1c1e22;
+  border: 1px solid #2b2e33;
   border-radius: 4px;
   padding: 16px;
   width: 340px;
@@ -161,22 +149,22 @@ html, body {
   gap: 12px;
 }
 #settings-title {
-  font-family: var(--mono);
+  font-family: "Consolas", monospace;
   font-size: 12px;
   letter-spacing: .08em;
-  color: var(--text);
+  color: #e7e9ec;
   text-transform: uppercase;
 }
 #settings-panel .field label {
   font-size: 10px;
-  color: var(--dim);
+  color: #7d828a;
   display: block;
   margin-bottom: 4px;
 }
 #settings-status {
-  font-family: var(--mono);
+  font-family: "Consolas", monospace;
   font-size: 10px;
-  color: var(--dim);
+  color: #7d828a;
   white-space: pre-line;
   max-height: 90px;
   overflow-y: auto;
@@ -223,34 +211,34 @@ html, body {
   align-items: center;
   justify-content: center;
   gap: 12px;
-  border: 1px dashed var(--line);
+  border: 1px dashed #2b2e33;
   margin: 12px;
   border-radius: 4px;
   transition: border-color .15s, background .15s;
 }
 #load-prompt.dragover {
-  border-color: var(--red);
-  background: var(--red-dim);
+  border-color: #e0342c;
+  background: #401512;
 }
 #load-prompt-text {
-  font-family: var(--mono);
+  font-family: "Consolas", monospace;
   font-size: 11px;
-  color: var(--dim);
+  color: #7d828a;
   letter-spacing: .04em;
 }
 #load-browse-btn {
-  font-family: var(--mono);
+  font-family: "Consolas", monospace;
   font-size: 11px;
   letter-spacing: .04em;
   padding: 6px 14px;
-  color: var(--text);
-  background: var(--bg);
-  border: 1px solid var(--line);
+  color: #e7e9ec;
+  background: #0b0c0e;
+  border: 1px solid #2b2e33;
   border-radius: 2px;
   cursor: pointer;
 }
-#load-browse-btn:hover { border-color: var(--red); color: var(--red); }
-#load-browse-btn:active { background: var(--red-dim); border-color: var(--red); }
+#load-browse-btn:hover { border-color: #e0342c; color: #e0342c; }
+#load-browse-btn:active { background: #401512; border-color: #e0342c; }
 /* subtitles-octopus.js injects this div as a sibling of <video> to hold
    its subtitle canvas. Left alone, it becomes a second flex item inside
    #preview-wrap (which has no explicit flex-direction, so it's a row by
@@ -289,7 +277,7 @@ html, body {
 #crop-mask-svg { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
 #crop-box {
   position: absolute;
-  border: 1px solid var(--red);
+  border: 1px solid #e0342c;
   pointer-events: auto;
   cursor: move;
 }
@@ -311,8 +299,8 @@ html, body {
 .crop-handle {
   position: absolute;
   width: 9px; height: 9px;
-  background: var(--panel);
-  border: 1px solid var(--red);
+  background: #16171a;
+  border: 1px solid #e0342c;
   pointer-events: auto;
 }
 #crop-handle-nw { left: -5px; top: -5px; cursor: nwse-resize; }
@@ -332,11 +320,11 @@ html, body {
   position: absolute;
   left: 4px; top: 4px;
   background: rgba(11, 12, 14, 0.85);
-  color: var(--text);
-  font-family: var(--mono);
+  color: #e7e9ec;
+  font-family: "Consolas", monospace;
   font-size: 10px;
   padding: 2px 5px;
-  border: 1px solid var(--line);
+  border: 1px solid #2b2e33;
   pointer-events: none;
   white-space: nowrap;
 }
@@ -346,27 +334,27 @@ html, body {
   align-items: center;
   justify-content: space-between;
   margin-top: 8px;
-  font-family: var(--mono);
+  font-family: "Consolas", monospace;
   font-size: 10px;
-  color: var(--dim);
+  color: #7d828a;
 }
 #crop-reset-btn {
   background: none;
-  border: 1px solid var(--line);
-  color: var(--dim);
-  font-family: var(--mono);
+  border: 1px solid #2b2e33;
+  color: #7d828a;
+  font-family: "Consolas", monospace;
   font-size: 10px;
   padding: 3px 10px;
   border-radius: 2px;
   cursor: pointer;
 }
-#crop-reset-btn:hover { border-color: var(--red); color: var(--red); }
+#crop-reset-btn:hover { border-color: #e0342c; color: #e0342c; }
 
 /* Seek scrubber */
 #seek-row {
   padding: 5px 10px 3px;
-  background: var(--panel2);
-  border-top: 1px solid var(--line);
+  background: #1c1e22;
+  border-top: 1px solid #2b2e33;
   flex-shrink: 0;
   display: flex;
   align-items: center;
@@ -382,28 +370,28 @@ html, body {
   width: 56px;
   height: 3px;
   border-radius: 0;
-  background: var(--line);
+  background: #2b2e33;
   cursor: pointer;
-  accent-color: var(--red);
+  accent-color: #e0342c;
 }
 #volume-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   width: 8px; height: 10px;
   border-radius: 1px;
-  background: var(--text);
+  background: #e7e9ec;
   cursor: pointer;
   margin-top: -3.5px;
 }
 #volume-slider::-moz-range-thumb {
   width: 8px; height: 10px; border: none; border-radius: 1px;
-  background: var(--text); cursor: pointer;
+  background: #e7e9ec; cursor: pointer;
 }
 #seek-bar {
   -webkit-appearance: none;
   flex: 1;
   height: 3px;
   border-radius: 0;
-  background: var(--line);
+  background: #2b2e33;
   cursor: pointer;
   display: block;
 }
@@ -411,13 +399,13 @@ html, body {
   -webkit-appearance: none;
   width: 9px; height: 12px;
   border-radius: 1px;
-  background: var(--text);
+  background: #e7e9ec;
   cursor: pointer;
   margin-top: -4.5px;
 }
 #seek-bar::-moz-range-thumb {
   width: 9px; height: 12px; border: none; border-radius: 1px;
-  background: var(--text); cursor: pointer;
+  background: #e7e9ec; cursor: pointer;
 }
 
 /* Trim range track — tape counter/ruler ticks along the bottom edge */
@@ -425,10 +413,10 @@ html, body {
   position: relative;
   height: 16px;
   margin: 4px 0 1px;
-  background: var(--bg);
-  border: 1px solid var(--line);
+  background: #0b0c0e;
+  border: 1px solid #2b2e33;
   background-image: repeating-linear-gradient(
-    to right, var(--line) 0, var(--line) 1px, transparent 1px, transparent 12.5%
+    to right, #2b2e33 0, #2b2e33 1px, transparent 1px, transparent 12.5%
   );
   background-position: 0 bottom;
   background-size: 100% 4px;
@@ -438,16 +426,16 @@ html, body {
 #trim-range {
   position: absolute;
   top: 0; bottom: 0;
-  background: var(--red-dim);
-  border-left: 1px solid var(--red);
-  border-right: 1px solid var(--red);
+  background: #401512;
+  border-left: 1px solid #e0342c;
+  border-right: 1px solid #e0342c;
 }
 .trim-handle {
   position: absolute;
   top: -2px;
   width: 7px; height: 20px;
-  background: var(--panel);
-  border: 1px solid var(--red);
+  background: #16171a;
+  border: 1px solid #e0342c;
   border-radius: 0;
   cursor: default; /* purely visual now — see app.js, no longer draggable */
   transform: translateX(-50%);
@@ -477,36 +465,35 @@ html, body {
 /* List of committed sections — only shown once at least one exists (see
    renderSectionsUI), so this adds no clutter for the common single-clip
    case that never touches "+ Add Section" at all. */
-#sections-list { margin-top: 6px; font-family: var(--mono); font-size: 10px; }
+#sections-list { margin-top: 6px; font-family: "Consolas", monospace; font-size: 10px; }
 .sections-list-row {
-  display: flex; align-items: center; gap: 6px;
-  padding: 3px 6px; background: var(--bg); border: 1px solid var(--line);
-  border-radius: 2px; margin-bottom: 3px; color: var(--dim);
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 3px 6px; background: #0b0c0e; border: 1px solid #2b2e33;
+  border-radius: 2px; margin-bottom: 3px; color: #7d828a;
 }
-.sections-list-row .sect-label { color: var(--text); flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sections-list-row .sect-label { color: #e7e9ec; }
 .sections-list-remove {
-  background: none; border: none; color: var(--dim); cursor: pointer;
-  font-size: 13px; line-height: 1; padding: 0 2px; flex-shrink: 0;
+  background: none; border: none; color: #7d828a; cursor: pointer;
+  font-size: 13px; line-height: 1; padding: 0 2px;
 }
-.sections-list-remove:hover { color: var(--red); }
+.sections-list-remove:hover { color: #e0342c; }
 #sections-total {
-  text-align: left; font-size: 10px; color: var(--text); margin-top: 4px;
-  padding: 2px 6px;
+  text-align: center; font-size: 10px; color: #7d828a; margin-top: 4px;
+  padding: 4px 6px; line-height: 1.4;
 }
-.sections-hint { color: var(--dim); }
 
 /* ---------- frame bar ---------- */
-.frame-bar { padding: 5px 10px; background: var(--panel2); border-top: 1px solid var(--line); flex-shrink: 0; }
+.frame-bar { padding: 5px 10px; background: #1c1e22; border-top: 1px solid #2b2e33; flex-shrink: 0; }
 .frame-row { display: flex; align-items: center; gap: 2px; flex-wrap: nowrap; }
 .frame-btn {
-  background: var(--bg); border: 1px solid var(--line); color: var(--text);
+  background: #0b0c0e; border: 1px solid #2b2e33; color: #e7e9ec;
   border-radius: 2px; padding: 2px 5px; font-size: 11px; cursor: pointer;
-  font-family: var(--mono); line-height: 1.4; flex-shrink: 0; white-space: nowrap;
+  font-family: "Consolas", monospace; line-height: 1.4; flex-shrink: 0; white-space: nowrap;
   display: inline-flex; align-items: center; justify-content: center;
 }
-.frame-btn:hover { border-color: var(--red); color: var(--red); }
+.frame-btn:hover { border-color: #e0342c; color: #e0342c; }
 .frame-btn:disabled { opacity: .35; cursor: default; }
-.frame-btn[aria-pressed="true"] { color: var(--text); border-color: var(--red); background: var(--red-dim); }
+.frame-btn[aria-pressed="true"] { color: #e7e9ec; border-color: #e0342c; background: #401512; }
 /* Visible while the subtitle overlay is being prepared — see
    setSubtitleLoadingIndicator() in app.js. A subtle pulse rather than
    anything attention-grabbing, since this is an expected wait, not a
@@ -518,38 +505,10 @@ html, body {
 }
 .frame-count {
   flex: 1 1 auto; min-width: 0; text-align: center; font-size: 11px; font-weight: 600;
-  color: var(--text); font-family: var(--mono); letter-spacing: .2px;
+  color: #e7e9ec; font-family: "Consolas", monospace; letter-spacing: .2px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.frame-time { text-align: center; font-size: 10px; color: var(--dim); margin-top: 3px; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.frame-time-row {
-  display: flex; align-items: center; justify-content: center; gap: 10px;
-}
-.frame-time-row .frame-time { margin-top: 0; flex: 0 1 auto; }
-/* Speed control — one consistent component used both for the current
-   in-progress section (here) and every row in the sections list below.
-   Clock+arrow icon rather than a plain "x" suffix: "x" sitting right
-   next to a row's "×" remove button read as a confusing visual echo of
-   the same character, and this icon is the established convention for
-   "rate of time" in video-editing tools generally. */
-.speed-pill {
-  display: inline-flex; align-items: center; flex-shrink: 0; gap: 3px;
-  background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
-  padding: 1px 3px; color: var(--dim);
-}
-.speed-pill:focus-within { border-color: var(--red); }
-.speed-pill-input {
-  background: none; border: none; color: var(--text); font-family: var(--mono);
-  font-size: 10px; width: 20px; padding: 0; text-align: center; -moz-appearance: textfield;
-}
-.speed-pill-input::-webkit-inner-spin-button, .speed-pill-input::-webkit-outer-spin-button {
-  -webkit-appearance: none; margin: 0;
-}
-.speed-step {
-  background: none; border: none; color: var(--dim); font-family: var(--mono);
-  font-size: 12px; width: 13px; height: 16px; cursor: pointer; padding: 0; line-height: 1;
-}
-.speed-step:hover { color: var(--red); }
+.frame-time { text-align: center; font-size: 10px; color: #7d828a; margin-top: 3px; font-family: "Consolas", monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Which handle (In / Out) the frame bar currently arms — a lit dot marks
    the armed one, echoing a tape deck's record-arm indicator. */
@@ -561,24 +520,24 @@ html, body {
    marking — see the redesign notes in app.js). */
 .mark-btn {
   flex: 1; padding: 4px 0; text-align: center; font-size: 10px;
-  letter-spacing: .06em; cursor: pointer; font-family: var(--mono);
-  color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 2px;
+  letter-spacing: .06em; cursor: pointer; font-family: "Consolas", monospace;
+  color: #e7e9ec; background: #0b0c0e; border: 1px solid #2b2e33; border-radius: 2px;
 }
-.mark-btn:hover { border-color: var(--red); color: var(--red); }
+.mark-btn:hover { border-color: #e0342c; color: #e0342c; }
 /* Deliberately smaller than Mark In/Mark Out — this is a special-case
    action (most exports are a single range and never touch it), not a
    primary control that should visually compete equally with the two
    buttons everyone uses on every export. */
-#add-section-btn { flex: 0.6; color: var(--dim); font-size: 9px; }
-#add-section-btn:hover { color: var(--red); }
-.mark-btn:active { background: var(--red-dim); border-color: var(--red); color: var(--text); }
+#add-section-btn { flex: 0.6; color: #7d828a; font-size: 9px; }
+#add-section-btn:hover { color: #e0342c; }
+.mark-btn:active { background: #401512; border-color: #e0342c; color: #e7e9ec; }
 
 /* ---------- body / options ---------- */
 #body { padding: 8px 10px; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
 .section-label {
   font-size: 9px; letter-spacing: .09em; text-transform: uppercase;
-  color: var(--dim); margin: 9px 0 5px; padding-top: 7px; border-top: 1px solid var(--line);
-  font-family: var(--mono);
+  color: #7d828a; margin: 9px 0 5px; padding-top: 7px; border-top: 1px solid #2b2e33;
+  font-family: "Consolas", monospace;
 }
 .section-label:first-child { margin-top: 0; padding-top: 0; border-top: none; }
 /* Audio and Crop are both simple two-button toggles, so they share a
@@ -598,7 +557,7 @@ html, body {
    read ambiguously as one combined section rather than two separate
    ones sharing a row purely for space reasons. */
 .compact-toggles-grid > div:nth-child(2) {
-  border-left: 1px solid var(--line);
+  border-left: 1px solid #2b2e33;
   padding-left: 14px;
 }
 
@@ -609,55 +568,55 @@ html, body {
 .seg-group { display: flex; gap: 4px; }
 .seg-btn {
   flex: 1; padding: 4px 6px; text-align: center; font-size: 11px;
-  color: var(--dim); background: var(--bg); border: 1px solid var(--line);
-  border-radius: 2px; cursor: pointer; font-family: var(--sans);
+  color: #7d828a; background: #0b0c0e; border: 1px solid #2b2e33;
+  border-radius: 2px; cursor: pointer; font-family: "Segoe UI", sans-serif;
 }
-.seg-btn[aria-pressed="true"] { color: var(--text); border-color: var(--red); background: var(--red-dim); }
-.seg-btn:hover:not([aria-pressed="true"]) { border-color: var(--dim); color: var(--text); }
+.seg-btn[aria-pressed="true"] { color: #e7e9ec; border-color: #e0342c; background: #401512; }
+.seg-btn:hover:not([aria-pressed="true"]) { border-color: #7d828a; color: #e7e9ec; }
 
 .row { display: flex; gap: 6px; margin-bottom: 5px; align-items: center; }
 .field { flex: 1; }
-.field label { display: block; font-size: 10px; color: var(--dim); margin-bottom: 2px; }
+.field label { display: block; font-size: 10px; color: #7d828a; margin-bottom: 2px; }
 .input, select.input {
-  width: 100%; background: var(--bg); border: 1px solid var(--line); color: var(--text);
-  padding: 4px 6px; border-radius: 2px; font-size: 11px; outline: none; font-family: var(--sans);
+  width: 100%; background: #0b0c0e; border: 1px solid #2b2e33; color: #e7e9ec;
+  padding: 4px 6px; border-radius: 2px; font-size: 11px; outline: none; font-family: "Segoe UI", sans-serif;
 }
-.input:focus { border-color: var(--red); }
-input[type="range"].input, input[type="range"]#seek-bar { accent-color: var(--red); }
+.input:focus { border-color: #e0342c; }
+input[type="range"].input, input[type="range"]#seek-bar { accent-color: #e0342c; }
 
 .preset-row { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 5px; }
 .preset-btn {
-  background: var(--bg); border: 1px solid var(--line); color: var(--text);
+  background: #0b0c0e; border: 1px solid #2b2e33; color: #e7e9ec;
   padding: 3px 8px; border-radius: 2px; font-size: 10px; cursor: pointer;
-  font-family: var(--mono);
+  font-family: "Consolas", monospace;
 }
-.preset-btn[aria-pressed="true"] { border-color: var(--red); color: var(--text); background: var(--red-dim); }
+.preset-btn[aria-pressed="true"] { border-color: #e0342c; color: #e7e9ec; background: #401512; }
 
 /* ---------- output + export ---------- */
 #output-row { display: flex; gap: 5px; align-items: center; }
 #output-path {
-  flex: 1; font-size: 10px; color: var(--dim); font-family: var(--mono);
+  flex: 1; font-size: 10px; color: #7d828a; font-family: "Consolas", monospace;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  background: var(--bg); border: 1px solid var(--line); border-radius: 2px; padding: 4px 6px;
+  background: #0b0c0e; border: 1px solid #2b2e33; border-radius: 2px; padding: 4px 6px;
 }
 .btn {
-  background: var(--red-dim); border: 1px solid var(--red); color: var(--text);
+  background: #401512; border: 1px solid #e0342c; color: #e7e9ec;
   padding: 5px 10px; border-radius: 2px; font-size: 11px; cursor: pointer; font-weight: 600;
-  font-family: var(--sans);
+  font-family: "Segoe UI", sans-serif;
 }
-.btn:hover { background: var(--red); color: #0b0c0e; }
+.btn:hover { background: #e0342c; color: #0b0c0e; }
 .btn:disabled { opacity: .4; cursor: default; }
-.btn.secondary { background: transparent; color: var(--dim); border-color: var(--line); font-weight: normal; }
-.btn.secondary:hover { border-color: var(--dim); color: var(--text); background: transparent; }
+.btn.secondary { background: transparent; color: #7d828a; border-color: #2b2e33; font-weight: normal; }
+.btn.secondary:hover { border-color: #7d828a; color: #e7e9ec; background: transparent; }
 
-#export-row { display: flex; gap: 6px; padding: 7px 10px; border-top: 1px solid var(--line); background: var(--panel2); flex-shrink: 0; }
+#export-row { display: flex; gap: 6px; padding: 7px 10px; border-top: 1px solid #2b2e33; background: #1c1e22; flex-shrink: 0; }
 #export-btn { flex: 1; }
 
 #status-row { display: flex; align-items: center; justify-content: space-between; padding: 0 10px 6px; gap: 8px; flex-shrink: 0; }
-#status { font-size: 10px; color: var(--dim); min-height: 12px; font-family: var(--mono); word-break: break-word; flex: 1; user-select: text; cursor: text; }
-#status.busy { color: var(--red); }
-#status.error { color: var(--red); }
-#status.done { color: var(--text); }
+#status { font-size: 10px; color: #7d828a; min-height: 12px; font-family: "Consolas", monospace; word-break: break-word; flex: 1; user-select: text; cursor: text; }
+#status.busy { color: #e0342c; }
+#status.error { color: #e0342c; }
+#status.done { color: #e7e9ec; }
 #status-actions { display: flex; gap: 6px; flex-shrink: 0; }
 #status-actions .btn { padding: 3px 8px; font-size: 10px; }
 
@@ -668,10 +627,32 @@ input[type="range"].input, input[type="range"]#seek-bar { accent-color: var(--re
   display: inline-block;
   width: 11px; height: 11px;
   border: 2px solid rgba(255,255,255,.3);
-  border-top-color: var(--text);
+  border-top-color: #e7e9ec;
   border-radius: 50%;
   animation: spin .7s linear infinite;
   vertical-align: -2px;
   margin-right: 6px;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+ body{background:#16171a; padding:20px;}</style></head>
+<body><div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+      <span style="display:inline-flex; align-items:center; background:#0b0c0e; border:1px solid #2b2e33; border-radius:10px; padding:3px 8px; gap:4px;">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#e7e9ec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M21 3v5h-5"/><path d="M12 8v4l3 2"/></svg><span style="color:#e7e9ec; font-family:Consolas,monospace; font-size:10px;">1.5</span>
+      </span>
+      <span style="color:#7d828a; font-family:Consolas,monospace; font-size:11px;">13px icon</span>
+    </div><div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+      <span style="display:inline-flex; align-items:center; background:#0b0c0e; border:1px solid #2b2e33; border-radius:10px; padding:3px 8px; gap:4px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#e7e9ec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M21 3v5h-5"/><path d="M12 8v4l3 2"/></svg><span style="color:#e7e9ec; font-family:Consolas,monospace; font-size:10px;">1.5</span>
+      </span>
+      <span style="color:#7d828a; font-family:Consolas,monospace; font-size:11px;">16px icon</span>
+    </div><div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+      <span style="display:inline-flex; align-items:center; background:#0b0c0e; border:1px solid #2b2e33; border-radius:10px; padding:3px 8px; gap:4px;">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#e7e9ec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M21 3v5h-5"/><path d="M12 8v4l3 2"/></svg><span style="color:#e7e9ec; font-family:Consolas,monospace; font-size:10px;">1.5</span>
+      </span>
+      <span style="color:#7d828a; font-family:Consolas,monospace; font-size:11px;">18px icon</span>
+    </div><div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+      <span style="display:inline-flex; align-items:center; background:#0b0c0e; border:1px solid #2b2e33; border-radius:10px; padding:3px 8px; gap:4px;">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#e7e9ec" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M21 3v5h-5"/><path d="M12 8v4l3 2"/></svg><span style="color:#e7e9ec; font-family:Consolas,monospace; font-size:10px;">1.5</span>
+      </span>
+      <span style="color:#7d828a; font-family:Consolas,monospace; font-size:11px;">22px icon</span>
+    </div></body></html>

@@ -39,7 +39,10 @@ struct ExportResult {
 struct SectionParam {
     in_time: f64,
     out_time: f64,
+    #[serde(default = "default_speed")]
+    speed: f64,
 }
+fn default_speed() -> f64 { 1.0 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -350,7 +353,12 @@ async fn export_clip(app: AppHandle, params: ExportParams) -> Result<ExportResul
             return Err("out point must be after in point".into());
         }
     }
-    let duration: f64 = params.sections.iter().map(|s| s.out_time - s.in_time).sum();
+    // Each section's contribution to the final combined duration is its
+    // raw range divided by its own speed — a 5s section at 2x plays back
+    // in 2.5s, so it only contributes 2.5s toward the total the rest of
+    // the pipeline (encoding decisions, the UI's own duration readout)
+    // needs to reason about.
+    let duration: f64 = params.sections.iter().map(|s| (s.out_time - s.in_time) / s.speed).sum();
 
     // Logged specifically to help diagnose a report (not yet
     // reproducible here) of GIF export ignoring the Out marker and
@@ -368,7 +376,7 @@ async fn export_clip(app: AppHandle, params: ExportParams) -> Result<ExportResul
         format!("totalDuration={duration}"),
     ];
     for (i, s) in params.sections.iter().enumerate() {
-        log_fields.push(format!("section[{i}]=({}, {})", s.in_time, s.out_time));
+        log_fields.push(format!("section[{i}]=({}, {}, speed={})", s.in_time, s.out_time, s.speed));
     }
     log_command("export_clip params", &log_fields, None);
 
@@ -453,8 +461,30 @@ async fn extract_and_concat_sections(
     for (i, section) in params.sections.iter().enumerate() {
         let seg_duration = section.out_time - section.in_time;
         let seg_path = std::env::temp_dir().join(format!("klippit-{temp_prefix}-seg{i}-{}.mkv", std::process::id()));
+        let speed_active = (section.speed - 1.0).abs() > 0.0001;
 
         let mut filters: Vec<String> = vec![];
+        // When speed is active, trim uses an EXPLICIT, ABSOLUTE start
+        // (matching the source's own original timeline) rather than
+        // relying on any outer "-ss" to position things first — and the
+        // outer "-ss"/"-t" flags are omitted entirely below for this
+        // case. Two earlier attempts at combining an outer seek with an
+        // internal trim/setpts chain both showed real, confirmed bugs
+        // (wrong source range selected; then a segment's reported
+        // duration coming back as nearly the entire rest of the source
+        // file), which points at the interaction between outer seeking
+        // and this filter chain being unreliable in ways not worth
+        // continuing to guess at. Removing the outer seek entirely
+        // avoids that interaction as a category: `trim` here reads the
+        // source's raw, original timestamps with nothing else having
+        // touched them first, so its behavior is unambiguous. Slower —
+        // ffmpeg decodes from the file's start to reach this section
+        // rather than jumping ahead — but correctness matters more than
+        // speed for what's already a less common case (most exports
+        // never touch speed at all).
+        if speed_active {
+            filters.push(format!("trim=start={}:duration={seg_duration}", section.in_time));
+        }
         if let Some(f) = crop_filter(params.crop_x, params.crop_y, params.crop_width, params.crop_height) {
             filters.push(f);
         }
@@ -480,22 +510,65 @@ async fn extract_and_concat_sections(
             filters.push(subtitle_filter(&extracted, effective_width, effective_height));
             cwd = Some(temp_dir);
         }
+        // Speed change goes LAST in the video filter chain, after crop
+        // and subtitle burn-in — subtitles get burned in at their
+        // normal, correct timing first, then setpts speeds up the whole
+        // resulting frame (video plus now-burned-in text) together. This
+        // avoids needing any separate subtitle-timestamp scaling for
+        // speed at all: the text is just pixels in the frame by the
+        // time setpts touches anything.
+        //
+        // (PTS-STARTPTS), not just PTS: trim above leaves this stream's
+        // timestamps starting at section.in_time (its own absolute
+        // source position, not rebased to zero — trim only filters which
+        // frames pass through, it doesn't renumber them), so this single
+        // expression both rebases to zero AND applies the speed change
+        // in one step.
+        let mut audio_filters: Vec<String> = vec![];
+        if speed_active {
+            filters.push(format!("setpts=(PTS-STARTPTS)/{:.6}", section.speed));
+            if keep_audio {
+                // Same reasoning as the video side, mirrored for audio:
+                // atrim with the same explicit absolute start first
+                // (raw, unambiguous input-time limit), asetpts to
+                // rebase, then the actual tempo change.
+                audio_filters.push(format!("atrim=start={}:duration={seg_duration}", section.in_time));
+                audio_filters.push("asetpts=PTS-STARTPTS".into());
+                audio_filters.push(atempo_chain(section.speed));
+            }
+        }
 
-        // "-ss" placed AFTER "-i" here (output/accurate seeking) rather
-        // than before it (input/fast seeking, used everywhere else in
-        // this file for single-export speed) — deliberately different
-        // for multi-section specifically. Input seeking jumps to the
-        // nearest keyframe and can leave small timing/sync imprecision
-        // right at the seek point; invisible in a single standalone
-        // export, but multi-section glues several of these together, so
-        // any per-segment imprecision becomes a visible seam exactly at
-        // a join. Slower (decodes from the file's start to reach the
-        // seek point) but accurate, which matters more here than in the
-        // single-section path.
-        let mut extract_args: Vec<String> = vec![
-            "-y".into(), "-i".into(), params.file_path.clone(),
-            "-ss".into(), section.in_time.to_string(), "-t".into(), seg_duration.to_string(),
-        ];
+        // Two different seeking strategies depending on whether speed is
+        // active, not one shared path:
+        //
+        // - Normal speed (the common case): outer "-ss" placed AFTER
+        //   "-i" (output/accurate seeking, not the fast input-seeking
+        //   used elsewhere in this file) plus outer "-t seg_duration".
+        //   Slower than input-seeking but accurate — multi-section glues
+        //   several of these together, so any per-segment seek
+        //   imprecision becomes a visible seam exactly at a join. No
+        //   filter-chain interaction to worry about here since there's
+        //   no setpts involved at all.
+        //
+        // - Speed active: NO outer "-ss"/"-t" at all — trim (added to
+        //   the filter chain above) handles both start and duration
+        //   explicitly instead, on the source's raw, untouched
+        //   timestamps. This was arrived at after two earlier attempts
+        //   at combining an outer seek with trim/setpts both showed
+        //   real, confirmed bugs (wrong source range selected; then a
+        //   segment's reported duration coming back as nearly the
+        //   entire rest of the source file) — removing the outer seek
+        //   entirely avoids that interaction as a category rather than
+        //   continuing to guess at exactly how it was going wrong.
+        //   Slower (decodes from the file's start every time) but
+        //   unambiguous.
+        let mut extract_args: Vec<String> = vec!["-y".into(), "-i".into(), params.file_path.clone()];
+        if !speed_active {
+            extract_args.push("-ss".into());
+            extract_args.push(section.in_time.to_string());
+            extract_args.push("-t".into());
+            extract_args.push(seg_duration.to_string());
+        }
         if !filters.is_empty() {
             extract_args.push("-vf".into());
             extract_args.push(filters.join(","));
@@ -514,6 +587,10 @@ async fn extract_and_concat_sections(
             extract_args.push("aac".into());
             extract_args.push("-b:a".into());
             extract_args.push("192k".into());
+            if !audio_filters.is_empty() {
+                extract_args.push("-af".into());
+                extract_args.push(audio_filters.join(","));
+            }
         } else {
             extract_args.push("-an".into());
         }
@@ -563,6 +640,22 @@ async fn extract_and_concat_sections(
     // intermediate step for what are typically short clips anyway.
     let mut concat_args: Vec<String> = vec!["-y".into()];
     for p in &segment_paths {
+        // Generous probe budget for each input — the error this fixes
+        // ("Could not find codec parameters... unspecified pixel
+        // format", with ffmpeg's own suggestion to raise these) showed
+        // up specifically for a segment that had gone through setpts
+        // (a speed change): rewriting timestamps there leaves the file
+        // with less standard-looking packet timing that the concat
+        // filter's default, tighter probe budget couldn't reliably read
+        // — worse still with several inputs being probed at once here.
+        // analyzeduration is in MICROSECONDS, probesize in BYTES — easy
+        // to mix up; values below are generously oversized relative to
+        // these small, few-second intermediate segment files, so this
+        // costs nothing when probing succeeds quickly anyway.
+        concat_args.push("-analyzeduration".into());
+        concat_args.push("100000000".into());
+        concat_args.push("-probesize".into());
+        concat_args.push("50000000".into());
         concat_args.push("-i".into());
         concat_args.push(p.to_string_lossy().to_string());
     }
@@ -626,6 +719,31 @@ fn scale_filter(resolution: u32) -> Option<String> {
 // invariant holds. Takes raw values rather than &ExportParams so it's
 // reusable from extract_frame (screenshots), which has its own
 // individual parameters rather than an ExportParams instance.
+// atempo (audio tempo/speed change, pitch-preserving) only accepts
+// 0.5–2.0 per filter instance — chaining multiple instances covers the
+// full 0.25x–4x range this app exposes (e.g. 4.0 becomes two chained
+// atempo=2.0 filters, since 2.0 * 2.0 = 4.0).
+fn atempo_chain(speed: f64) -> String {
+    let mut factors: Vec<f64> = vec![];
+    let mut remaining = speed;
+    if remaining < 0.5 {
+        while remaining < 0.5 {
+            factors.push(0.5);
+            remaining /= 0.5;
+        }
+        factors.push(remaining);
+    } else if remaining > 2.0 {
+        while remaining > 2.0 {
+            factors.push(2.0);
+            remaining /= 2.0;
+        }
+        factors.push(remaining);
+    } else {
+        factors.push(remaining);
+    }
+    factors.iter().map(|f| format!("atempo={f:.6}")).collect::<Vec<_>>().join(",")
+}
+
 fn crop_filter(x: Option<u32>, y: Option<u32>, w: Option<u32>, h: Option<u32>) -> Option<String> {
     match (x, y, w, h) {
         (Some(x), Some(y), Some(w), Some(h)) if w > 0 && h > 0 => {
@@ -1145,8 +1263,7 @@ fn format_ass_time(total_seconds: f64) -> String {
 // while the video segment it was burned onto had already been rebased
 // to start at 0 and was only ~5.7s long — the subtitle timing pointed at
 // a moment in the segment's non-existent future and simply never arrived.
-fn shift_ass_timestamps(ass_path: &std::path::Path, offset_seconds: f64) -> Result<(), String> {
-    if offset_seconds == 0.0 { return Ok(()); }
+fn shift_ass_timestamps(ass_path: &std::path::Path, offset_seconds: f64, duration: f64) -> Result<(), String> {
     let content = std::fs::read_to_string(ass_path).map_err(|e| e.to_string())?;
     let mut out = String::with_capacity(content.len());
     for line in content.lines() {
@@ -1158,6 +1275,22 @@ fn shift_ass_timestamps(ass_path: &std::path::Path, offset_seconds: f64) -> Resu
             let fields: Vec<&str> = rest.splitn(10, ',').collect();
             if fields.len() == 10 {
                 if let (Some(s), Some(e)) = (parse_ass_time(fields[1]), parse_ass_time(fields[2])) {
+                    // Drop lines entirely outside [offset_seconds,
+                    // offset_seconds + duration] rather than shifting
+                    // them — a real, confirmed bug: a line that ends
+                    // before the clip's own start would shift to a
+                    // NEGATIVE timestamp, which format_ass_time's
+                    // .max(0.0) clamp then squashed to exactly 0 instead
+                    // of excluding it, making dialogue from well before
+                    // the marked In point incorrectly appear at the very
+                    // start of the export — confirmed via a side-by-side
+                    // comparison showing the wrong line burned in at
+                    // frame 0 versus what the source actually shows at
+                    // that timestamp. Same reasoning applies to a line
+                    // starting after the clip ends.
+                    if e <= offset_seconds || s >= offset_seconds + duration {
+                        continue;
+                    }
                     out.push_str("Dialogue:");
                     out.push_str(fields[0]);
                     out.push(',');
@@ -1200,8 +1333,8 @@ async fn extract_subtitles_to(
             ass_path.to_string_lossy().to_string(),
         ];
         run_bin(app, "ffmpeg", &extract_args, None).await?;
-        if let Some((in_time, _duration)) = trim {
-            shift_ass_timestamps(&ass_path, in_time)?;
+        if let Some((in_time, duration)) = trim {
+            shift_ass_timestamps(&ass_path, in_time, duration)?;
         }
         // External files don't carry embedded font attachments the way
         // an MKV might — nothing to extract there.
@@ -1281,8 +1414,8 @@ async fn extract_subtitles_to(
     });
 
     run_bin(app, "ffmpeg", &extract_args, None).await?;
-    if let Some((in_time, _duration)) = trim {
-        shift_ass_timestamps(&ass_path, in_time)?;
+    if let Some((in_time, duration)) = trim {
+        shift_ass_timestamps(&ass_path, in_time, duration)?;
     }
 
     let font_paths = font_task.await.unwrap_or_default();

@@ -142,6 +142,17 @@ function activate()
         d:show()
         vlc.msg.err("[klippit] activate() error: " .. tostring(err))
     end
+
+    -- This extension never shows a persistent panel — it does its work
+    -- and returns immediately (or shows a one-off error dialog above),
+    -- so nothing else was ever going to tell VLC "this is finished."
+    -- Without this call, VLC kept showing the View > Extensions menu
+    -- item as ticked/active indefinitely after activate() had already
+    -- completed — a real, confirmed bug: reopening the menu later showed
+    -- it still "on," and clicking it again did nothing until manually
+    -- unticking first. Called unconditionally (success or error) so the
+    -- checkbox always resets regardless of which path above was taken.
+    vlc.deactivate()
 end
 
 function deactivate()

@@ -41,6 +41,11 @@ var state = {
   // exactly as before — multi-section isn't a separate mode, just this
   // array having more than zero entries.
   sections: [],
+  // Speed for the CURRENT in-progress section only — committed sections
+  // each carry their own speed value inside their own object in
+  // `sections` above once added. Resets to 1.0 after "+ Add Section",
+  // same as inTime/outTime reset for the next section.
+  speed: 1.0,
   format: 'mp4', // 'mp4' | 'gif'
   burnSubs: false,
   mode: 'quality', // 'quality' | 'size'
@@ -109,6 +114,16 @@ function render() {
 
   updateDefaultFilename();
   renderSectionsUI();
+  // Anything above can change the sections list's own height (a row
+  // added/removed), which changes how much vertical space is left for
+  // the video preview area, in turn changing where the crop overlay
+  // should actually sit — without this, the crop box kept showing
+  // wherever it was calculated for the PREVIOUS layout size, sticking
+  // out past the video's new boundary until something else (like
+  // starting to drag it) happened to trigger a recalculation. A real,
+  // confirmed visual bug, not just theoretical: the box would visibly
+  // jump back into place the moment it was clicked.
+  renderCropOverlay();
 }
 
 // ---------- multi-section export ----------
@@ -121,6 +136,18 @@ function render() {
 // at all.
 var committedSectionsEl = document.getElementById('committed-sections');
 var sectionsListEl = document.getElementById('sections-list');
+// Reused for every per-row speed pill in the sections list, identical to
+// the static one on the current-section frame-time row — one consistent
+// component regardless of which "kind" of section it's attached to.
+var SPEED_ICON_SVG = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M21 3v5h-5"/><path d="M12 8v4l3 2"/></svg>';
+function speedPillHtml(index, speed) {
+  return '<span class="speed-pill" title="Playback speed for this section">' +
+    '<button class="speed-step sect-speed-down" data-index="' + index + '" title="Decrease speed">\u2212</button>' +
+    SPEED_ICON_SVG +
+    '<input class="speed-pill-input sect-speed-input" data-index="' + index + '" type="number" value="' + speed + '" step="0.1" min="0.25" max="4">' +
+    '<button class="speed-step sect-speed-up" data-index="' + index + '" title="Increase speed">+</button>' +
+    '</span>';
+}
 function renderSectionsUI() {
   var dur = state.duration || 1;
   var blocksHtml = state.sections.map(function (s) {
@@ -137,26 +164,31 @@ function renderSectionsUI() {
   }
   sectionsListEl.style.display = 'block';
   var rowsHtml = state.sections.map(function (s, i) {
+    // Shown duration is the EFFECTIVE (speed-adjusted) one, not the raw
+    // range length — once speed is in play, "how long this actually
+    // plays for in the output" is the number worth seeing at a glance,
+    // not the source range it was cut from.
+    var effectiveDur = (s.outTime - s.inTime) / (s.speed || 1.0);
     return '<div class="sections-list-row">' +
       '<span class="sect-label">' + (i + 1) + '. ' + fmtTime(s.inTime) + ' \u2192 ' + fmtTime(s.outTime) +
-      ' (' + fmtTime(s.outTime - s.inTime) + ')</span>' +
+      ' (' + fmtTime(effectiveDur) + ')</span>' +
+      speedPillHtml(i, s.speed || 1.0) +
       '<button class="sections-list-remove" data-index="' + i + '" title="Remove this section">\u00d7</button>' +
       '</div>';
   }).join('');
   // Once any section is committed, the CURRENT in/out is deliberately
   // NOT counted here or included at export — see exportClip's own
-  // comment for why auto-including it was a real, confirmed bug. The
-  // hint line makes that explicit rather than leaving it to be
-  // discovered the hard way in an exported file.
-  var totalCommitted = state.sections.reduce(function (sum, s) { return sum + (s.outTime - s.inTime); }, 0);
+  // comment for why auto-including it was a real, confirmed bug. Kept
+  // short and secondary (dim, single line) rather than a full sentence —
+  // this is a footnote, not the main thing to read in this list.
+  var totalCommitted = state.sections.reduce(function (sum, s) { return sum + (s.outTime - s.inTime) / (s.speed || 1.0); }, 0);
   rowsHtml += '<div id="sections-total">' + state.sections.length + (state.sections.length === 1 ? ' section' : ' sections') +
-    ' will be combined \u2014 ' + fmtTime(totalCommitted) + ' total. Current In/Out (' + fmtTime(state.inTime) + ' \u2192 ' + fmtTime(state.outTime) +
-    ') is NOT included yet \u2014 click + Add Section to include it.</div>';
+    ' \u2014 ' + fmtTime(totalCommitted) + ' total &nbsp;<span class="sections-hint">(current range not added yet)</span></div>';
   sectionsListEl.innerHTML = rowsHtml;
 
-  // Rebuilt from scratch above, so every remove button is (re)wired
-  // fresh each render rather than relying on stale references. A plain
-  // loop over querySelectorAll's result rather than .forEach on it —
+  // Rebuilt from scratch above, so every control is (re)wired fresh
+  // each render rather than relying on stale references. Plain loops
+  // over querySelectorAll's result rather than .forEach on it —
   // NodeList.forEach is broadly supported in real browsers/WebView2,
   // but this sidesteps the one environment found during testing where
   // it wasn't (an old bundled WebKit build used by a static-render
@@ -169,7 +201,50 @@ function renderSectionsUI() {
       render();
     };
   }
+  // Editable per-row speed — updates that committed section's own
+  // stored speed directly. This directly replaces an earlier, rejected
+  // design where changing a committed section's speed meant deleting
+  // and re-adding it.
+  var speedInputs = sectionsListEl.querySelectorAll('.sect-speed-input');
+  for (var si = 0; si < speedInputs.length; si++) {
+    speedInputs[si].onchange = function () {
+      var idx = parseInt(this.getAttribute('data-index'), 10);
+      state.sections[idx].speed = clamp(parseFloat(this.value) || 1.0, 0.25, 4);
+      render();
+    };
+  }
+  var speedDownButtons = sectionsListEl.querySelectorAll('.sect-speed-down');
+  for (var d = 0; d < speedDownButtons.length; d++) {
+    speedDownButtons[d].onclick = function () {
+      var idx = parseInt(this.getAttribute('data-index'), 10);
+      var cur = state.sections[idx].speed || 1.0;
+      state.sections[idx].speed = clamp(Math.round((cur - 0.1) * 10) / 10, 0.25, 4);
+      render();
+    };
+  }
+  var speedUpButtons = sectionsListEl.querySelectorAll('.sect-speed-up');
+  for (var u = 0; u < speedUpButtons.length; u++) {
+    speedUpButtons[u].onclick = function () {
+      var idx = parseInt(this.getAttribute('data-index'), 10);
+      var cur = state.sections[idx].speed || 1.0;
+      state.sections[idx].speed = clamp(Math.round((cur + 0.1) * 10) / 10, 0.25, 4);
+      render();
+    };
+  }
 }
+
+document.getElementById('speed-input').onchange = function () {
+  state.speed = clamp(parseFloat(this.value) || 1.0, 0.25, 4);
+  this.value = state.speed;
+};
+document.getElementById('speed-down').onclick = function () {
+  state.speed = clamp(Math.round((state.speed - 0.1) * 10) / 10, 0.25, 4);
+  document.getElementById('speed-input').value = state.speed;
+};
+document.getElementById('speed-up').onclick = function () {
+  state.speed = clamp(Math.round((state.speed + 0.1) * 10) / 10, 0.25, 4);
+  document.getElementById('speed-input').value = state.speed;
+};
 
 document.getElementById('add-section-btn').onclick = function () {
   var newIn = state.inTime, newOut = state.outTime;
@@ -177,22 +252,22 @@ document.getElementById('add-section-btn').onclick = function () {
     setStatus('out point must be after in point', 'error');
     return;
   }
-  // Overlap check against already-committed sections — allowing overlap
-  // would silently duplicate that content in the combined output,
-  // confusing to hit only after a full export completes.
-  for (var i = 0; i < state.sections.length; i++) {
-    var s = state.sections[i];
-    if (newIn < s.outTime && s.inTime < newOut) {
-      setStatus('sections can\u2019t overlap \u2014 adjust In/Out first', 'error');
-      return;
-    }
-  }
-  state.sections.push({ inTime: newIn, outTime: newOut });
-  // Reset current in/out for the next section, right after the one
-  // just added — same default-length pattern as the very first
+  // Overlapping sections used to be blocked here as a heuristic against
+  // accidental duplication (e.g. imprecise handle dragging) — removed
+  // now that per-section speed makes overlap a genuinely useful,
+  // intentional technique: e.g. one section over a moment at normal
+  // speed, a second section covering that SAME range right after in
+  // slow motion, as a replay effect. Nothing about the export pipeline
+  // ever required sections to be disjoint — each is extracted
+  // independently regardless of what any other section covers.
+  state.sections.push({ inTime: newIn, outTime: newOut, speed: state.speed });
+  // Reset current in/out AND speed for the next section, right after
+  // the one just added — same default-length pattern as the very first
   // section's own (start, start+3) initialization.
   state.inTime = newOut;
   state.outTime = Math.min(newOut + 3, state.duration || newOut + 3);
+  state.speed = 1.0;
+  document.getElementById('speed-input').value = '1.0';
   render();
   setStatus('section added \u2014 mark the next one', 'done');
 };
@@ -995,7 +1070,7 @@ function exportClip() {
   // single-clip case, unchanged from before this feature existed) —
   // once multi-section is in play at all, every section, including the
   // last one, needs its own explicit "+ Add Section" click.
-  var sections = state.sections.length > 0 ? state.sections.slice() : [{ inTime: state.inTime, outTime: state.outTime }];
+  var sections = state.sections.length > 0 ? state.sections.slice() : [{ inTime: state.inTime, outTime: state.outTime, speed: state.speed }];
   var params = {
     filePath: init.filePath,
     sections: sections,
@@ -1110,6 +1185,8 @@ function applyInit(newInit) {
   state.inTime = init.startTime;
   state.outTime = init.startTime + 3;
   state.sections = [];
+  state.speed = 1.0;
+  document.getElementById('speed-input').value = '1.0';
   filenameManuallyEdited = false;
   lastExportedPath = null;
   state.sourceWidth = 0;
@@ -1224,9 +1301,9 @@ if (loadBrowseBtn) {
 // pixels on screen first. The delay is imperceptible to a person but
 // keeps this off the critical startup path.
 setTimeout(function setUpDragDrop() {
-  if (!window.__TAURI__ || !window.__TAURI__.window) return;
+  if (!window.__TAURI__ || !window.__TAURI__.webviewWindow) return;
   try {
-    var win = window.__TAURI__.window.getCurrentWebviewWindow();
+    var win = window.__TAURI__.webviewWindow.getCurrentWebviewWindow();
     win.onDragDropEvent(function (event) {
       var payload = event.payload || {};
       var loadPrompt = document.getElementById('load-prompt');

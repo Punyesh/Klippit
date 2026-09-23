@@ -230,6 +230,260 @@ doesn't understand it, unlike MP4. Fixed by checking the file extension
 and creating an `<img>` element instead for `.gif` paths, which handles
 animated GIFs correctly and natively (including looping).
 
+## Crop overlay jump bug fixed
+
+Confirmed the crop-per-section theory from the previous entry via the
+suggested left-vs-right test — user confirmed it's one shared crop, not
+per-section, matching what the code showed.
+
+Separately, a real visual bug: the crop selection box would visibly
+stick out past the video's actual boundary, then snap back into place
+the moment it was clicked. Root cause: `render()` — called by, among
+other things, "+ Add Section" — never called `renderCropOverlay()`.
+Adding a section grows the sections list, which shrinks the vertical
+space left for the video preview (the main column's total height is
+fixed), which changes where the crop overlay should sit — but nothing
+told it to recalculate. It kept showing the position computed for the
+previous, larger layout until something else (starting to drag it, which
+does call `renderCropOverlay()`) happened to trigger a correction.
+Fixed by calling `renderCropOverlay()` at the end of `render()` too, so
+any layout change that reaches `render()` keeps the crop box in sync
+automatically. Verified by reproducing the exact scenario — crop
+enabled with a full-height rectangle, then adding a section — and
+confirming the box's edges stayed correctly aligned with the video
+boundary afterward rather than extending past it.
+
+## Drag-and-drop namespace fix, crop-per-section clarified again
+
+**Drag-and-drop finally addressed** — flagged by a stray console log
+several turns back but never actually fixed until now. The error
+("`window.__TAURI__.window.getCurrentWebviewWindow is not a
+function`") was a namespace mismatch: `getCurrentWebviewWindow`
+belongs to Tauri's `webviewWindow` module, not `window` — the code was
+looking for a `webviewWindow`-module function under the `.window`
+namespace instead, matching neither the npm package split nor the
+pattern already used everywhere else in this codebase
+(`window.__TAURI__.core.invoke`, `.core.convertFileSrc`, both nested by
+module name the same way). Fixed both the guard check and the actual
+call. Flagged honestly: this resolves the one confirmed error, but if
+drag-and-drop still doesn't work after this, the next thing to check
+would be a missing permission in `capabilities/default.json` for
+listening to window events specifically — `core:default` is already
+granted there and may already cover it, but that's unconfirmed without
+testing, and a different error message post-fix would tell us which it
+is.
+
+**Crop-per-section, revisited** — a report that "different crop kinda
+already works" prompted re-confirming the code: `extract_and_concat_
+sections` reads `params.crop_x/y/width/height` from one fixed,
+unchanging `ExportParams` reference for the entire export call, so
+every section in a single combined export is structurally guaranteed
+to receive identical crop values — there's no code path by which two
+sections in the SAME export could end up with different crops. Most
+likely explanation for what was observed: separate, sequential
+single-clip exports (crop → export → change crop → export again) each
+correctly picking up whatever crop was current at that moment, which
+is real and already working, but is a different thing from true
+per-section crop within one combined multi-section export — that
+remains an unbuilt, separately-scoped feature (see the "load a
+section back for editing" design discussion from a couple turns ago).
+
+## Real subtitle timing bug found via a side-by-side frame comparison
+
+Asked for a specific test to distinguish "two players just at different
+playback positions" from an actual timing bug: pause the exported
+preview at frame 0 and the live preview at the exact same source
+timestamp (the marked In point), and compare. The user did exactly
+this and the result was unambiguous — identical video frame, two
+completely different subtitle lines. Real bug, not a coincidence of
+playback position.
+
+Root cause, found in `shift_ass_timestamps` (added a few turns back to
+manually rebase `.ass` dialogue timestamps, since ffmpeg's own trim
+doesn't do this for embedded subtitle text): a dialogue line that
+entirely PRECEDES the clip's In point shifts to a NEGATIVE timestamp
+after subtracting the offset — and `format_ass_time`'s `.max(0.0)`
+clamp squashed that negative value to exactly 0 instead of the line
+being excluded. So dialogue from well before the marked In point
+(an earlier line in the same conversation) incorrectly appeared burned
+in at the very start of the export, instead of whatever line is
+actually active at that timestamp — exactly matching the screenshots:
+"I can't wait to grow up and design a cap with two points!" (an earlier
+line) showing up instead of "Five of the stupid things that don't
+matter." (the actually-correct one).
+
+Fixed by dropping — not clamping — any line whose original timing falls
+entirely outside `[in_time, in_time + duration]`, checked against the
+UN-shifted original timestamps before any shifting happens. Required
+threading the clip's duration through to `shift_ass_timestamps` (it
+previously only received the offset), updated at both call sites.
+Verified against the exact reported scenario before considering this
+done: a line ending well before the clip's start is now correctly
+dropped instead of clamped to appear at frame 0, while a line that's
+genuinely active right at the In point is correctly kept, with its
+start clamped to 0 (correct here — it was already playing when the
+clip begins) and its end shifted normally.
+
+## Overlap restriction removed, crop-per-section clarified, VLC checkbox bug fixed
+
+**Sections can now overlap.** The original "sections can't overlap"
+guard was a heuristic against assumed-accidental duplication, added
+before per-section speed existed. It no longer makes sense now: a
+genuinely useful, intentional technique is two sections covering the
+SAME source range with different speeds — e.g. a moment at normal
+speed, then a second section over that identical range in slow motion
+right after, as a replay effect. Nothing about the export pipeline ever
+required sections to be disjoint (each is extracted independently
+regardless of what any other section covers), so the check was purely a
+frontend guess about intent that turned out to be wrong. Removed
+entirely. Worth noting since it's now relevant: sections combine in
+the order they were ADDED (list order), not sorted by their in-time —
+this was already true structurally (no sort_by exists anywhere in the
+backend) even before this change, and now matters more directly, since
+overlapping ranges don't have a single well-defined chronological order
+anyway.
+
+**Crop is not per-section — clarified, not changed.** A user question
+("what's the logic of one clip at one crop, another at a different")
+assumed per-section crop existed by analogy with per-section speed. It
+doesn't: `crop_filter()` reads directly from the top-level export
+params, applied identically to every section regardless of speed or
+position. Genuinely inconsistent with how speed works, but correctly
+describing existing behavior rather than a bug — per-section crop
+would be new, separate work (a stored rectangle per section, editable
+per-row UI, likely non-trivial given crop's own UI is a full draggable
+overlay, not a small pill like speed) that hasn't been scoped or agreed
+to yet.
+
+**VLC extension "sticky" checkbox.** Real, confirmed bug: `activate()`
+did its work (capture current file/position, launch Klippit) and
+returned, but never called `vlc.deactivate()` — so VLC kept showing the
+View > Extensions menu item as ticked/active indefinitely afterward,
+requiring a manual untick-then-retick to trigger it a second time.
+Added an unconditional `vlc.deactivate()` at the end of `activate()`,
+covering both the success path and every error-dialog path, so the
+checkbox always resets regardless of which branch ran. Flagged with the
+same honesty as other VLC Lua API work in this project: this exact API
+surface hasn't always behaved as expected on the first attempt here, so
+this is the best-informed fix rather than a verified one.
+
+## Speed segment extraction rewritten again — removed outer seek entirely
+
+Real export failure combining sections of different speeds: ffmpeg
+couldn't determine codec parameters for the second (sped) segment when
+reading it into the concat filter ("unspecified pixel format"), and
+that segment's own reported duration was showing as nearly the entire
+rest of the source file (~22:46 for a section that should have been a
+few seconds) — a second, more serious symptom than a probe-budget issue
+alone would explain.
+
+This was the third attempt at this exact area, and the pattern across
+all three (wrong source range selected; then a wildly wrong reported
+duration) pointed at the same underlying thing: combining an outer
+`-ss` seek with an internal `trim`/`setpts` filter chain has an
+interaction that isn't behaving as documented, in ways not worth
+continuing to guess at one flag at a time. Rather than add a fourth
+patch on the same foundation, removed the outer seek entirely for the
+speed-active case: `trim`/`atrim` now take an EXPLICIT, ABSOLUTE
+`start=` (the section's own `in_time` on the source's original
+timeline) instead of relying on any outer `-ss` to position things
+first, and no outer `-ss`/`-t` flags are sent at all when speed is
+active. This means `trim` operates on the source's raw, completely
+untouched timestamps, which removes the ambiguous interaction as a
+category rather than trying to out-guess its exact behavior. Trade-off:
+slower for sections deep into a long file, since ffmpeg now decodes
+from the very start of the source to reach them rather than jumping
+ahead — accepted since correctness matters more here, and this only
+affects sections that actually use a speed change, not the (more
+common) normal-speed path, which keeps its existing, already-proven
+outer-seek approach untouched.
+
+Also added, independently: a generous `-analyzeduration`/`-probesize`
+budget on each input to the concat filter step, directly matching
+ffmpeg's own suggestion in the error text — worth keeping regardless of
+whether the duration issue above was the primary cause, since probing
+several inputs at once with default budgets is a real, separate way for
+this step to fail.
+
+## Speed control fixes: real duration bug, decluttering, +/- steppers
+
+**Real, confirmed bug in the duration math** — reported as "different
+sections selected in the output, differing from my marks" when speed
+was involved. Root cause: the per-section extraction was combining an
+outer `-t <raw_duration>` CLI flag with a `setpts` filter in the same
+ffmpeg call. `-t` as an output option limits how much OUTPUT gets
+written, not how much SOURCE content gets read — so for a slowed-down
+section, the output would hit that limit before all the intended source
+footage had been processed (using LESS source content than marked); for
+a sped-up section, more source content than marked got pulled in to
+fill the same output-duration limit. Fixed by using ffmpeg's `trim`/
+`atrim` filters instead, placed as the very first filters in the chain
+— they operate on raw input timestamps before `setpts` or anything else
+touches them, so the amount of source content selected is unambiguous
+regardless of what speed change follows. `setpts=(PTS-STARTPTS)/speed`
+replaces the plain `setpts=PTS/speed` to both rebase the now-non-zero
+timestamps `trim` leaves behind and apply the speed change in one
+expression. Scoped to only apply this extra machinery when speed is
+actually active — the unchanged, already-correct outer `-ss`/`-t` path
+still handles the (far more common) speed=1.0 case exactly as before.
+
+**Decluttering.** The sections list hint text was a full sentence
+wrapping to two lines ("N sections will be combined — Xs total. Current
+In/Out (...) is NOT included yet — click + Add Section to include
+it."), reported as making the whole list feel busy. Shortened to a
+single dim, secondary line ("N sections — Xs total (current range not
+added yet)") — same information, a fraction of the visual weight.
+
+**+/- speed steppers.** Added compact stepper buttons flanking the
+number in every speed pill (both the current-section one and each
+committed row), 0.1 increments, so adjusting speed doesn't require
+clicking into the field and typing a value manually every time.
+Verified via real execution: the per-row stepper correctly updated a
+committed section's speed (0.5→0.6) and the row's displayed duration
+recalculated correctly against it (3.95s raw ÷ 0.6 = 6.58s), matching
+by hand-calculation before considering this done.
+
+## Speed control, per section
+
+Designed extensively before building (see the earlier back-and-forth on
+icon choice — a plain "x" suffix read as a confusing echo of the
+sections list's "×" remove button, so it went through a comparison of
+several icon options before landing on a clock-with-curved-arrow at
+16-18px, the established video-editor convention for "rate of time,"
+sized up specifically because the first attempt at that size read as
+muddy detail rather than a clear shape).
+
+**Backend**: `SectionParam` gained a `speed` field (default 1.0, so a
+frontend that somehow omitted it wouldn't break). Speed filters apply
+during each section's own extraction, LAST in the video filter chain —
+after crop and subtitle burn-in specifically, so subtitles get burned
+in at their normal, correct timing first and then `setpts=PTS/speed`
+speeds up the whole resulting frame (video plus now-burned-in text)
+together, avoiding any separate subtitle-timestamp scaling for speed
+entirely. Audio uses `atempo` (pitch-preserving tempo change, unlike
+plain resampling which would also shift pitch), chained across multiple
+filter instances for speeds outside atempo's native 0.5–2.0 range —
+verified the chaining math against the app's full 0.25x–4x range before
+wiring it in. Duration bookkeeping updated throughout: a section's
+contribution to the total is its raw range divided by its own speed
+(a 5s section at 2x contributes 2.5s), not the raw range itself.
+
+**Frontend — the "speed pill"**: one consistent component (icon +
+borderless editable number, no visible spinner arrows) used identically
+for the current in-progress section (next to the frame-time readout)
+and every row in the committed sections list. Directly replaces an
+earlier, explicitly rejected design where a committed section's speed
+could only be changed by deleting and re-adding it — each row's pill is
+independently editable in place now. The sections list's per-row
+duration display shows the EFFECTIVE (speed-adjusted) duration rather
+than the raw range length, since "how long this actually plays in the
+output" is the number worth seeing once speed is in play.
+
+Verified via real execution, not just code review: added a section at
+2x, added another at 0.5x, edited the first committed section's speed
+in place afterward, and confirmed every displayed duration and the
+running total matched hand-calculated expected values exactly.
+
 ## Multi-section stutter — third attempt, switched concatenation method entirely
 
 Subtitle burn-in confirmed fixed. The stutter/gap at section boundaries
