@@ -34,13 +34,29 @@ struct ExportResult {
     encoder_used: String,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+struct SectionParam {
+    in_time: f64,
+    out_time: f64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ExportParams {
     file_path: String,
-    in_time: f64,
-    out_time: f64,
-    format: String,   // "mp4" | "gif"
+    // One or more (start,end) ranges from the source, combined in the
+    // order given into a single output. The frontend always sends at
+    // least one entry (the current Mark In/Out range) — multi-section
+    // export isn't a separate mode, just this array having more than
+    // one entry. Replaces the old single in_time/out_time fields
+    // entirely, rather than keeping both and special-casing the
+    // single-section path — every export, one section or several, goes
+    // through the same extract-each-then-concat logic (see
+    // extract_and_concat_sections), with N=1 just skipping the actual
+    // concat step since there's nothing to join.
+    sections: Vec<SectionParam>,
+    format: String,   // "mp4" | "gif" | "apng"
     burn_subs: bool,
     mode: String,     // "quality" | "size"
     crf: u32,
@@ -326,37 +342,45 @@ fn expand_tilde(path: &str) -> String {
 // ---------- export ----------
 #[tauri::command]
 async fn export_clip(app: AppHandle, params: ExportParams) -> Result<ExportResult, String> {
-    let duration = params.out_time - params.in_time;
+    if params.sections.is_empty() {
+        return Err("no section to export".into());
+    }
+    for s in &params.sections {
+        if s.out_time <= s.in_time {
+            return Err("out point must be after in point".into());
+        }
+    }
+    let duration: f64 = params.sections.iter().map(|s| s.out_time - s.in_time).sum();
+
     // Logged specifically to help diagnose a report (not yet
     // reproducible here) of GIF export ignoring the Out marker and
     // clipping to the end of the video instead. This records exactly
-    // what the frontend actually sent — in_time, out_time, the computed
-    // duration, and the format/mode — so if this happens again, the
-    // diagnostic log shows definitively whether the wrong duration was
-    // ever received here at all (a frontend-side issue) versus received
-    // correctly but mishandled somewhere further down the export
-    // pipeline (a backend issue) — a real distinction that's impossible
-    // to tell apart from the symptom alone.
-    log_command(
-        "export_clip params",
-        &[
-            format!("format={}", params.format),
-            format!("mode={}", params.mode),
-            format!("inTime={}", params.in_time),
-            format!("outTime={}", params.out_time),
-            format!("computedDuration={duration}"),
-        ],
-        None,
-    );
-    if duration <= 0.0 {
-        return Err("out point must be after in point".into());
+    // what the frontend actually sent for every section — so if this
+    // happens again, the diagnostic log shows definitively whether the
+    // wrong values were ever received here at all (a frontend-side
+    // issue) versus received correctly but mishandled somewhere further
+    // down the export pipeline (a backend issue) — a real distinction
+    // that's impossible to tell apart from the symptom alone.
+    let mut log_fields: Vec<String> = vec![
+        format!("format={}", params.format),
+        format!("mode={}", params.mode),
+        format!("sectionCount={}", params.sections.len()),
+        format!("totalDuration={duration}"),
+    ];
+    for (i, s) in params.sections.iter().enumerate() {
+        log_fields.push(format!("section[{i}]=({}, {})", s.in_time, s.out_time));
     }
+    log_command("export_clip params", &log_fields, None);
 
     let output_dir = expand_tilde(&params.output_dir);
     std::fs::create_dir_all(&output_dir)
         .map_err(|e| format!("couldn't create output folder '{output_dir}': {e}"))?;
 
-    let ext = if params.format == "gif" { "gif" } else { "mp4" };
+    let ext = match params.format.as_str() {
+        "gif" => "gif",
+        "apng" => "apng",
+        _ => "mp4",
+    };
 
     // A name typed into the Output field is used exactly as given (minus
     // any illegal characters / accidental extension) rather than having
@@ -378,51 +402,216 @@ async fn export_clip(app: AppHandle, params: ExportParams) -> Result<ExportResul
         ext
     );
 
-    // Extracted once here (not per-attempt inside export_gif's retry
-    // loop) since it's the same subtitle data regardless of how many
-    // encode attempts target-size mode ends up needing.
-    //
     // Subtitle original_size uses the CROPPED dimensions when crop is
     // active, not the original source dimensions — subtitles are burned
-    // in after crop in the filter chain (see the crop_filter ordering
-    // below), so they need to be positioned/sized relative to the frame
-    // they're actually being drawn onto, not the pre-crop source.
+    // in after crop in each section's own extraction filter chain (see
+    // extract_and_concat_sections), so they need to be positioned/sized
+    // relative to the frame they're actually being drawn onto, not the
+    // pre-crop source. Subtitle extraction itself now happens per
+    // section (inside extract_and_concat_sections), not once upfront
+    // here — each section needs its own subtitle timestamps rebased to
+    // that section's own start, not the source's original timeline.
     let (effective_width, effective_height) = match (params.crop_width, params.crop_height) {
         (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
         _ => (params.source_width, params.source_height),
     };
-    let subtitle_filter_str: Option<String> = if params.burn_subs {
-        let temp_dir = std::env::temp_dir().join(format!("klippit-burn-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        let extracted = extract_subtitles_to(
-            &app, &params.file_path, &temp_dir, Some((params.in_time, duration)),
-            params.subtitle_external_file.as_deref(), params.subtitle_lang.as_deref(),
-        ).await?;
-        Some(subtitle_filter(&extracted, effective_width, effective_height))
-    } else {
-        None
-    };
-    // The encode step's ffmpeg process runs with its working directory
-    // set to this same temp folder whenever burn_subs is active — see
-    // subtitle_filter()'s comment for why (sidesteps a Windows
-    // drive-letter-colon escaping problem inside the filter string
-    // entirely, rather than continuing to fight ffmpeg's exact escaping
-    // rules for it).
-    let subtitle_cwd = if params.burn_subs {
-        Some(std::env::temp_dir().join(format!("klippit-burn-{}", std::process::id())))
-    } else {
-        None
-    };
 
     let encoder_used = if params.format == "gif" {
-        export_gif(&app, &params, duration, &out_path, subtitle_filter_str.as_deref(), subtitle_cwd.as_deref()).await?;
+        export_gif(&app, &params, &out_path, effective_width, effective_height).await?;
         "gif".to_string()
+    } else if params.format == "apng" {
+        export_apng(&app, &params, &out_path, effective_width, effective_height).await?;
+        "apng".to_string()
     } else {
-        export_mp4(&app, &params, duration, &out_path, subtitle_filter_str.as_deref(), subtitle_cwd.as_deref()).await?
+        export_mp4(&app, &params, duration, &out_path, effective_width, effective_height).await?
     };
 
     Ok(ExportResult { output_path: out_path, encoder_used })
 }
+
+// Extracts each section separately (crop and, if active, that section's
+// own subtitle range rebased to start at 0 — see extract_subtitles_to's
+// trim parameter — burned in during extraction), then concatenates them
+// via ffmpeg's concat demuxer into one combined file. A single section
+// just returns its own extracted file directly, skipping the concat
+// step since there's nothing to join — this is the same code path for
+// one section or several, not a special case bolted on top.
+//
+// Every section is re-encoded (never stream-copied) for the same
+// frame-accuracy reason already established elsewhere in this file:
+// stream copy can only cut at keyframes, silently shifting the actual
+// requested start. All sections use identical codec settings
+// specifically so the final concat step CAN safely use stream copy
+// (-c copy) — mismatched codecs/parameters across concat inputs is a
+// real way for that step to fail or produce a broken file.
+async fn extract_and_concat_sections(
+    app: &AppHandle, params: &ExportParams, effective_width: u32, effective_height: u32,
+    keep_audio: bool, temp_prefix: &str,
+) -> Result<std::path::PathBuf, String> {
+    let mut segment_paths: Vec<std::path::PathBuf> = vec![];
+
+    for (i, section) in params.sections.iter().enumerate() {
+        let seg_duration = section.out_time - section.in_time;
+        let seg_path = std::env::temp_dir().join(format!("klippit-{temp_prefix}-seg{i}-{}.mkv", std::process::id()));
+
+        let mut filters: Vec<String> = vec![];
+        if let Some(f) = crop_filter(params.crop_x, params.crop_y, params.crop_width, params.crop_height) {
+            filters.push(f);
+        }
+        // Set (only when burn_subs is active) to this section's own
+        // subtitle temp folder, so subtitle_filter()'s bare filename
+        // resolves correctly — see subtitle_filter's own comment for
+        // the full history of why a bare filename + matching cwd is
+        // used here instead of embedding a path directly.
+        let mut cwd: Option<std::path::PathBuf> = None;
+        if params.burn_subs {
+            let temp_dir = std::env::temp_dir().join(format!("klippit-{temp_prefix}-subs{i}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            // Rebased to THIS section's own start — critical for
+            // multi-section exports: a section starting at, say, 1:00 in
+            // the source needs its subtitle timestamps shifted back to
+            // start at 0, since in the combined output that content
+            // plays starting wherever this section lands after concat,
+            // not at the source's original 1:00 mark.
+            let extracted = extract_subtitles_to(
+                app, &params.file_path, &temp_dir, Some((section.in_time, seg_duration)),
+                params.subtitle_external_file.as_deref(), params.subtitle_lang.as_deref(),
+            ).await?;
+            filters.push(subtitle_filter(&extracted, effective_width, effective_height));
+            cwd = Some(temp_dir);
+        }
+
+        // "-ss" placed AFTER "-i" here (output/accurate seeking) rather
+        // than before it (input/fast seeking, used everywhere else in
+        // this file for single-export speed) — deliberately different
+        // for multi-section specifically. Input seeking jumps to the
+        // nearest keyframe and can leave small timing/sync imprecision
+        // right at the seek point; invisible in a single standalone
+        // export, but multi-section glues several of these together, so
+        // any per-segment imprecision becomes a visible seam exactly at
+        // a join. Slower (decodes from the file's start to reach the
+        // seek point) but accurate, which matters more here than in the
+        // single-section path.
+        let mut extract_args: Vec<String> = vec![
+            "-y".into(), "-i".into(), params.file_path.clone(),
+            "-ss".into(), section.in_time.to_string(), "-t".into(), seg_duration.to_string(),
+        ];
+        if !filters.is_empty() {
+            extract_args.push("-vf".into());
+            extract_args.push(filters.join(","));
+        }
+        extract_args.push("-c:v".into());
+        extract_args.push("libx264".into());
+        extract_args.push("-crf".into());
+        extract_args.push("18".into()); // visually near-lossless — every intermediate segment is a throwaway, not the final output
+        extract_args.push("-preset".into());
+        extract_args.push("veryfast".into());
+        if keep_audio {
+            // Every segment re-encoded with identical audio settings —
+            // required for the final concat's stream-copy to work
+            // correctly across segments.
+            extract_args.push("-c:a".into());
+            extract_args.push("aac".into());
+            extract_args.push("-b:a".into());
+            extract_args.push("192k".into());
+        } else {
+            extract_args.push("-an".into());
+        }
+        // Forces this segment's own timestamps to cleanly rebase to
+        // zero. Without this, "-ss before -i" seeking can leave small
+        // timestamp irregularities (especially around B-frames near the
+        // seek point) that don't reset cleanly — harmless within a
+        // single standalone segment, but the concat step below only
+        // stream-copies raw packets and timestamps (-c copy, chosen for
+        // speed since every segment is already freshly re-encoded here),
+        // so it has no opportunity to fix up a segment that didn't start
+        // clean. That's the likely cause of a real reported symptom:
+        // a stutter/gap exactly at a section boundary, with the
+        // following section's visible playtime feeling short even
+        // though the file's total reported duration matches.
+        extract_args.push("-avoid_negative_ts".into());
+        extract_args.push("make_zero".into());
+        extract_args.push(seg_path.to_string_lossy().to_string());
+        run_bin(app, "ffmpeg", &extract_args, cwd.as_deref()).await?;
+        segment_paths.push(seg_path);
+    }
+
+    if segment_paths.len() == 1 {
+        return Ok(segment_paths.into_iter().next().unwrap());
+    }
+
+    // Concat FILTER (-filter_complex ... concat=...), not the concat
+    // DEMUXER (-f concat -c copy) used here previously. This is a
+    // deliberate escalation, not a first attempt: two prior fixes at the
+    // demuxer/stream-copy level (-avoid_negative_ts make_zero on both
+    // the per-segment extraction and the demuxer step, then switching
+    // segment extraction to accurate output-seeking) were both
+    // confirmed present in the actual commands that ran, and neither
+    // resolved a real reported stutter/gap at segment boundaries. The
+    // concat demuxer's `-c copy` only splices compressed packets and
+    // trusts the segments are perfectly compatible — it has no
+    // mechanism to correct a residual per-segment quirk (encoder
+    // priming delay, any leftover timing irregularity), it just
+    // faithfully preserves whatever's there straight into the output.
+    // The concat filter instead operates on fully DECODED frames: every
+    // segment gets decoded and the filter itself re-times everything
+    // into one continuous sequence, which eliminates packet/timestamp-
+    // level splice concerns as a category rather than continuing to
+    // patch around them. Costs a real re-encode at this step (previously
+    // just a fast stream copy), acceptable here since correctness at a
+    // segment boundary matters more than shaving time off an
+    // intermediate step for what are typically short clips anyway.
+    let mut concat_args: Vec<String> = vec!["-y".into()];
+    for p in &segment_paths {
+        concat_args.push("-i".into());
+        concat_args.push(p.to_string_lossy().to_string());
+    }
+    let n = segment_paths.len();
+    let mut filter = String::new();
+    for i in 0..n {
+        filter.push_str(&format!("[{i}:v]"));
+        if keep_audio { filter.push_str(&format!("[{i}:a]")); }
+    }
+    let a_flag = if keep_audio { 1 } else { 0 };
+    filter.push_str(&format!("concat=n={n}:v=1:a={a_flag}[outv]"));
+    if keep_audio { filter.push_str("[outa]"); }
+    concat_args.push("-filter_complex".into());
+    concat_args.push(filter);
+    concat_args.push("-map".into());
+    concat_args.push("[outv]".into());
+    if keep_audio {
+        concat_args.push("-map".into());
+        concat_args.push("[outa]".into());
+    }
+    concat_args.push("-c:v".into());
+    concat_args.push("libx264".into());
+    concat_args.push("-crf".into());
+    concat_args.push("18".into()); // still an intermediate, throwaway file — the final format-specific step re-encodes again
+    concat_args.push("-preset".into());
+    concat_args.push("veryfast".into());
+    if keep_audio {
+        concat_args.push("-c:a".into());
+        concat_args.push("aac".into());
+        concat_args.push("-b:a".into());
+        concat_args.push("192k".into());
+    } else {
+        concat_args.push("-an".into());
+    }
+
+    let combined_path = std::env::temp_dir().join(format!("klippit-{temp_prefix}-combined-{}.mkv", std::process::id()));
+    concat_args.push(combined_path.to_string_lossy().to_string());
+    let concat_result = run_bin(app, "ffmpeg", &concat_args, None).await;
+
+    // Best-effort cleanup of the per-section intermediates regardless of
+    // outcome — only the combined file (or the error) matters past this
+    // point.
+    for p in &segment_paths { let _ = std::fs::remove_file(p); }
+
+    concat_result?;
+    Ok(combined_path)
+}
+
+
 
 fn scale_filter(resolution: u32) -> Option<String> {
     if resolution == 0 { return None; }
@@ -464,26 +653,37 @@ fn crop_filter(x: Option<u32>, y: Option<u32>, w: Option<u32>, h: Option<u32>) -
 // straight from the original source, just via a cleanly-named
 // intermediate file instead of the messy original path.
 fn subtitle_filter(extracted: &ExtractedSubtitles, source_width: u32, source_height: u32) -> String {
-    // Bare filename, no path at all — after two different colon-escaping
-    // attempts both failed on real files with variations of "No option
-    // name near ..." right at the Windows drive-letter colon, the robust
-    // fix is to not have a colon (or any path at all) in this string in
-    // the first place. The ffmpeg process invoking this filter runs with
-    // its working directory set to this same folder (see export_clip /
-    // extract_frame, which pass Some(cwd) to run_bin for exactly this
-    // encode step), so a bare filename resolves correctly without any
-    // escaping question at all.
+    // Fourth attempt at the Windows drive-letter-colon problem in
+    // ffmpeg's subtitles filter, and this one has actual evidence behind
+    // it rather than another guess. Real ffmpeg 9.0.2 output confirmed
+    // the third attempt's backslash-escaped colon (filename=C\:/...) was
+    // NOT treated as a literal colon at all: the parser still split
+    // there ("No option name near '/Users/...'" — it consumed "C" as
+    // the complete value and choked on the remainder). That's now three
+    // separate escaping attempts across this debugging history that
+    // have all failed the same way, which is a strong signal that
+    // escaping this colon directly isn't the right mechanism for this
+    // filter's parser, whatever the exact reason.
+    //
+    // Reverting to bare filename + a matching process working directory
+    // instead — avoids the colon question entirely rather than
+    // continuing to guess at escape syntax. This was abandoned earlier
+    // based on a vague "still doesn't work" report, but that report
+    // came before the actual confirmed bug (run_bin's stdout
+    // newline-accumulation issue, breaking subtitle STREAM DETECTION
+    // entirely) was found and fixed — meaning no subtitles were ever
+    // being extracted at all at that point, regardless of whether cwd
+    // worked. This approach never actually had contrary evidence
+    // against it; it just never got a fair test. See extract_and_
+    // concat_sections and extract_frame for where cwd is set back to
+    // match this section's/screenshot's own extraction temp folder.
     let filename = extracted.ass_path.file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| "subs.ass".to_string());
-    // fontsdir intentionally dropped: it was implicated in the same class
-    // of error and, unlike filename/original_size, I don't have a
-    // confident fix for its specific escaping behavior yet — rather than
-    // stack another unverified guess on top, dropping it entirely gets a
-    // working export now. Tradeoff: burned-in text may render in a
-    // system fallback font instead of the exact embedded one if that
-    // font isn't already installed. Revisit if font accuracy turns out
-    // to matter in practice.
+    // fontsdir intentionally still dropped: it was implicated in the
+    // same class of error and hasn't been re-verified since. Tradeoff:
+    // burned-in text may render in a system fallback font instead of
+    // the exact embedded one if that font isn't already installed.
     let mut filter = format!("subtitles=filename={filename}");
     // Explicitly telling the filter the source's real resolution avoids a
     // separate real bug hit in testing: ffmpeg's auto-detection of this
@@ -495,23 +695,20 @@ fn subtitle_filter(extracted: &ExtractedSubtitles, source_width: u32, source_hei
     filter
 }
 
-async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str, subtitle_filter_str: Option<&str>, subtitle_cwd: Option<&std::path::Path>) -> Result<String, String> {
-    let mut filters: Vec<String> = vec![];
-    // Crop first: subtitles need to be burned onto the already-cropped
-    // frame (see the effective_width/height computation in export_clip,
-    // which points subtitle_filter's original_size at the cropped
-    // dimensions specifically so this ordering is self-consistent), and
-    // scale runs last of all, after both.
-    if let Some(f) = crop_filter(params.crop_x, params.crop_y, params.crop_width, params.crop_height) { filters.push(f); }
-    // Subtitles before scale: burns onto the original-resolution frame,
-    // matching the coordinates the ASS/SSA styling was authored against,
-    // then scale runs afterward on the already-burned-in frame. Also
-    // avoids the original_size auto-detection bug noted in subtitle_filter.
-    if let Some(f) = subtitle_filter_str { filters.push(f.to_string()); }
-    if let Some(f) = scale_filter(params.resolution) { filters.push(f); }
-    let vf = if filters.is_empty() { None } else { Some(filters.join(",")) };
+async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str, effective_width: u32, effective_height: u32) -> Result<String, String> {
+    let combined_path = extract_and_concat_sections(app, params, effective_width, effective_height, !params.mute_audio, "mp4").await?;
+    let combined_path_str = combined_path.to_string_lossy().to_string();
 
-    if params.mode == "size" {
+    // Crop and subtitles are already baked into combined_path (applied
+    // per-section during extraction) — only scale remains to apply
+    // here, last of all, on the already-assembled, already-burned-in
+    // frame. combined_path is also already exactly the desired content
+    // start to finish, so no -ss/-t trimming is needed reading from it
+    // (start=0.0, full duration) the way the old single-section version
+    // needed to seek into the original source directly.
+    let vf = scale_filter(params.resolution);
+
+    let result = if params.mode == "size" {
         // Target-size mode: compute bitrate from target_size / duration,
         // reserve a fixed slice for audio, 2-pass encode to hit it
         // reliably. Muted: skip that reservation entirely and give the
@@ -521,11 +718,14 @@ async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_p
         let audio_kbps = if params.mute_audio { 0.0 } else { 128.0 };
         let video_kbps = ((target_bits / duration / 1000.0) - audio_kbps).max(200.0);
 
-        run_ffmpeg_2pass(app, &params.file_path, params.in_time, duration, vf.as_deref(), video_kbps, audio_kbps, out_path, subtitle_cwd, params.mute_audio).await?;
-        Ok("libx264".to_string())
+        run_ffmpeg_2pass(app, &combined_path_str, 0.0, duration, vf.as_deref(), video_kbps, audio_kbps, out_path, params.mute_audio).await
+            .map(|_| "libx264".to_string())
     } else {
-        encode_quality_mode(app, params, duration, vf.as_deref(), out_path, subtitle_cwd).await
-    }
+        encode_quality_mode(app, params, &combined_path_str, 0.0, duration, vf.as_deref(), out_path).await
+    };
+
+    let _ = std::fs::remove_file(&combined_path);
+    result
 }
 
 // GPU-accelerated encoding: opt-in (params.use_gpu), with automatic,
@@ -561,8 +761,8 @@ fn gpu_quality_args(encoder: &str, crf: u32) -> Vec<String> {
 }
 
 async fn encode_quality_mode(
-    app: &AppHandle, params: &ExportParams, duration: f64, vf: Option<&str>,
-    out_path: &str, subtitle_cwd: Option<&std::path::Path>,
+    app: &AppHandle, params: &ExportParams, input: &str, start: f64, duration: f64, vf: Option<&str>,
+    out_path: &str,
 ) -> Result<String, String> {
     let mut audio_args: Vec<String> = vec![];
     if params.mute_audio {
@@ -576,8 +776,8 @@ async fn encode_quality_mode(
         for encoder in GPU_ENCODER_NAMES {
             let mut args: Vec<String> = vec![
                 "-y".into(),
-                "-ss".into(), params.in_time.to_string(),
-                "-i".into(), params.file_path.clone(),
+                "-ss".into(), start.to_string(),
+                "-i".into(), input.to_string(),
                 "-t".into(), duration.to_string(),
                 "-c:v".into(), (*encoder).to_string(),
             ];
@@ -585,7 +785,7 @@ async fn encode_quality_mode(
             args.extend(audio_args.clone());
             if let Some(f) = vf { args.push("-vf".into()); args.push(f.to_string()); }
             args.push(out_path.into());
-            if run_bin(app, "ffmpeg", &args, subtitle_cwd).await.is_ok() {
+            if run_bin(app, "ffmpeg", &args, None).await.is_ok() {
                 return Ok((*encoder).to_string());
             }
             // This specific hardware encoder isn't available or failed
@@ -598,8 +798,8 @@ async fn encode_quality_mode(
     // hardware option above failed.
     let mut args: Vec<String> = vec![
         "-y".into(),
-        "-ss".into(), params.in_time.to_string(),
-        "-i".into(), params.file_path.clone(),
+        "-ss".into(), start.to_string(),
+        "-i".into(), input.to_string(),
         "-t".into(), duration.to_string(),
         "-crf".into(), params.crf.to_string(),
         "-preset".into(), "medium".into(),
@@ -607,13 +807,13 @@ async fn encode_quality_mode(
     args.extend(audio_args);
     if let Some(f) = vf { args.push("-vf".into()); args.push(f.to_string()); }
     args.push(out_path.into());
-    run_bin(app, "ffmpeg", &args, subtitle_cwd).await?;
+    run_bin(app, "ffmpeg", &args, None).await?;
     Ok("libx264".to_string())
 }
 
 async fn run_ffmpeg_2pass(
     app: &AppHandle, input: &str, start: f64, duration: f64, vf: Option<&str>,
-    video_kbps: f64, audio_kbps: f64, out_path: &str, subtitle_cwd: Option<&std::path::Path>,
+    video_kbps: f64, audio_kbps: f64, out_path: &str,
     mute_audio: bool,
 ) -> Result<(), String> {
     let bitrate = format!("{}k", video_kbps as u64);
@@ -626,9 +826,6 @@ async fn run_ffmpeg_2pass(
     // as source and rebuilds+relaunches the whole app on any change,
     // which looked like a crash but was actually this. Pointing it at
     // the OS temp dir instead avoids that everywhere, dev or release.
-    // (This is an absolute path regardless of subtitle_cwd, so changing
-    // the process's working directory for the subtitle-burn case below
-    // doesn't affect it.)
     let passlog_prefix = std::env::temp_dir()
         .join(format!("klippit-2pass-{}", std::process::id()))
         .to_string_lossy()
@@ -644,7 +841,7 @@ async fn run_ffmpeg_2pass(
     if let Some(f) = vf { pass1.push("-vf".into()); pass1.push(f.into()); }
     #[cfg(windows)] pass1.push("NUL".into());
     #[cfg(not(windows))] pass1.push("/dev/null".into());
-    run_bin(app, "ffmpeg", &pass1, subtitle_cwd).await?;
+    run_bin(app, "ffmpeg", &pass1, None).await?;
 
     let mut pass2: Vec<String> = vec![
         "-y".into(), "-ss".into(), start.to_string(), "-i".into(), input.into(),
@@ -660,7 +857,7 @@ async fn run_ffmpeg_2pass(
     }
     if let Some(f) = vf { pass2.push("-vf".into()); pass2.push(f.into()); }
     pass2.push(out_path.into());
-    let result = run_bin(app, "ffmpeg", &pass2, subtitle_cwd).await.map(|_| ());
+    let result = run_bin(app, "ffmpeg", &pass2, None).await.map(|_| ());
 
     // Best-effort cleanup — leftover pass-log files in the temp dir are
     // harmless either way, so a failed removal here doesn't fail the export.
@@ -670,55 +867,21 @@ async fn run_ffmpeg_2pass(
     result
 }
 
-async fn export_gif(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str, subtitle_filter_str: Option<&str>, subtitle_cwd: Option<&std::path::Path>) -> Result<(), String> {
-    // Extract the target window ONCE into a small intermediate file,
-    // rather than re-seeking into the original source for every single
+async fn export_gif(app: &AppHandle, params: &ExportParams, out_path: &str, effective_width: u32, effective_height: u32) -> Result<(), String> {
+    // Extraction (each section, crop/subtitles baked in per-section, then
+    // concatenated if there's more than one) happens once here, rather
+    // than re-seeking into the original source for every single
     // palette-gen/paletteuse pass and every target-size retry attempt.
     // Confirmed via real testing: a clip ~9 minutes into a file took
-    // ~6 minutes to GIF-export even with duration correctly bounded (see
-    // the -t fix above) — almost certainly the cost of two separate deep
-    // seeks into the source (one per pass), which in target-size mode
-    // could happen up to six times across retries. Extracting once up
-    // front pays that cost exactly once no matter how many GIF passes
-    // follow, since every subsequent pass reads from this small file
-    // starting at position 0 — no seeking needed there at all.
-    let temp_segment = std::env::temp_dir().join(format!("klippit-gif-src-{}.mkv", std::process::id()));
-    let mut extract_args: Vec<String> = vec![
-        "-y".into(), "-ss".into(), params.in_time.to_string(), "-i".into(), params.file_path.clone(),
-        "-t".into(), duration.to_string(),
-    ];
-    // Crop before subtitles here too, same ordering and same reasoning
-    // as export_mp4 — subtitle_filter_str's original_size was already
-    // computed against the cropped dimensions in export_clip when crop
-    // is active, so it expects to be burning onto an already-cropped
-    // frame.
-    let mut gif_filters: Vec<String> = vec![];
-    if let Some(f) = crop_filter(params.crop_x, params.crop_y, params.crop_width, params.crop_height) { gif_filters.push(f); }
-    if let Some(f) = subtitle_filter_str { gif_filters.push(f.to_string()); }
-    if !gif_filters.is_empty() {
-        extract_args.push("-vf".into());
-        extract_args.push(gif_filters.join(","));
-    }
-    // Always re-encoded here, deliberately never stream-copied (-c copy)
-    // even without subtitles: stream copy can only cut at keyframes,
-    // since it never decodes anything at all — meaning the extracted
-    // segment could start several seconds before the actual requested
-    // in-point if the nearest keyframe is far away, silently shifting
-    // the whole clip. Re-encoding this tiny few-second segment costs
-    // well under a second on any modern machine — negligible next to
-    // the seek-avoidance this whole restructure is for — and this app
-    // is specifically about frame-accurate exports, so that's not a
-    // trade worth making to save a fraction of a second here.
-    extract_args.push("-c:v".into());
-    extract_args.push("libx264".into());
-    extract_args.push("-crf".into());
-    extract_args.push("18".into()); // visually near-lossless — this file is a throwaway intermediate, not the final output
-    extract_args.push("-preset".into());
-    extract_args.push("veryfast".into());
-    extract_args.push("-an".into()); // GIFs never have audio — no reason to carry it into the intermediate file
-    extract_args.push(temp_segment.to_string_lossy().to_string());
-    run_bin(app, "ffmpeg", &extract_args, subtitle_cwd).await?;
-    let segment_path = temp_segment.to_string_lossy().to_string();
+    // ~6 minutes to GIF-export even with duration correctly bounded —
+    // almost certainly the cost of two separate deep seeks into the
+    // source (one per pass), which in target-size mode could happen up
+    // to six times across retries. Extracting once up front pays that
+    // cost exactly once no matter how many GIF passes follow, since
+    // every subsequent pass reads from this small file starting at
+    // position 0 — no seeking needed there at all.
+    let combined_path = extract_and_concat_sections(app, params, effective_width, effective_height, false, "gif").await?;
+    let segment_path = combined_path.to_string_lossy().to_string();
 
     // Two-pass palette gen/use — same technique as the wasm version, just
     // real ffmpeg instead of a wasm build. Target-size mode iterates width/
@@ -729,9 +892,10 @@ async fn export_gif(app: &AppHandle, params: &ExportParams, duration: f64, out_p
         (if params.resolution == 0 { 480 } else { params.resolution }, params.gif_fps)
     };
 
+    let mut result = Ok(());
     for attempt in 0..3 {
-        encode_gif_attempt(app, &segment_path, width, fps, out_path).await?;
-        if params.mode != "size" { break; }
+        result = encode_gif_attempt(app, &segment_path, width, fps, out_path).await;
+        if result.is_err() || params.mode != "size" { break; }
 
         let size_mb = std::fs::metadata(out_path).map(|m| m.len() as f64 / 1_000_000.0).unwrap_or(0.0);
         if size_mb <= params.target_mb || attempt == 2 { break; }
@@ -742,8 +906,8 @@ async fn export_gif(app: &AppHandle, params: &ExportParams, duration: f64, out_p
 
     // Best-effort cleanup — a leftover temp segment is harmless either
     // way, so a failed removal here doesn't fail the export.
-    let _ = std::fs::remove_file(&temp_segment);
-    Ok(())
+    let _ = std::fs::remove_file(&combined_path);
+    result
 }
 
 async fn encode_gif_attempt(app: &AppHandle, segment_path: &str, width: u32, fps: u32, out_path: &str) -> Result<(), String> {
@@ -772,6 +936,53 @@ async fn encode_gif_attempt(app: &AppHandle, segment_path: &str, width: u32, fps
     Ok(())
 }
 
+async fn export_apng(app: &AppHandle, params: &ExportParams, out_path: &str, effective_width: u32, effective_height: u32) -> Result<(), String> {
+    // Same extract-once (per section, then concatenated if more than
+    // one) approach as GIF and for the same reason, but simpler: APNG
+    // needs no palette generation at all, so a retry here is just one
+    // direct ffmpeg call against the already-extracted segment, not
+    // GIF's two-pass palettegen/paletteuse dance.
+    let combined_path = extract_and_concat_sections(app, params, effective_width, effective_height, false, "apng").await?;
+    let segment_path = combined_path.to_string_lossy().to_string();
+
+    // APNG is lossless — there's no CRF-equivalent quality knob the way
+    // MP4 has, so resolution and fps are the only real file-size levers,
+    // the same two GIF already exposes. Target-size mode reuses that
+    // identical shrink-and-retry approach.
+    let (mut width, mut fps) = if params.mode == "size" {
+        (480u32, params.gif_fps.max(10))
+    } else {
+        (if params.resolution == 0 { 480 } else { params.resolution }, params.gif_fps)
+    };
+
+    let mut result = Ok(());
+    for attempt in 0..3 {
+        result = encode_apng_attempt(app, &segment_path, width, fps, out_path).await;
+        if result.is_err() || params.mode != "size" { break; }
+
+        let size_mb = std::fs::metadata(out_path).map(|m| m.len() as f64 / 1_000_000.0).unwrap_or(0.0);
+        if size_mb <= params.target_mb || attempt == 2 { break; }
+        width = (width as f64 * 0.8) as u32;
+        fps = (fps as f64 * 0.85).max(8.0) as u32;
+    }
+
+    let _ = std::fs::remove_file(&combined_path);
+    result
+}
+
+async fn encode_apng_attempt(app: &AppHandle, segment_path: &str, width: u32, fps: u32, out_path: &str) -> Result<(), String> {
+    // -plays 0 loops forever, matching GIF's default looping behavior.
+    // No palette step at all, unlike GIF — PNG doesn't have an 8-bit/
+    // 256-color ceiling, so this is one direct pass.
+    run_bin(app, "ffmpeg", &[
+        "-y".into(), "-i".into(), segment_path.to_string(),
+        "-vf".into(), format!("fps={fps},scale={width}:-2:flags=lanczos"),
+        "-plays".into(), "0".into(),
+        out_path.into(),
+    ], None).await?;
+    Ok(())
+}
+
 // ---------- screenshots ----------
 // Screenshots are handled by mpv itself (`screenshot video` / `screenshot
 // subtitles`) — see mpv-scripts/clip-trigger.lua. This command is a
@@ -787,7 +998,6 @@ async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, o
         "-y".into(), "-ss".into(), at.to_string(), "-i".into(), path.clone(),
         "-frames:v".into(), "1".into(),
     ];
-    let mut cwd: Option<std::path::PathBuf> = None;
     // Crop applies here too — a screenshot should match whatever the
     // live preview is currently showing, and crop is a real, visible
     // editing decision the same way subtitles-on/off already is.
@@ -800,12 +1010,12 @@ async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, o
         (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
         _ => (source_width, source_height),
     };
+    let mut cwd: Option<std::path::PathBuf> = None;
     if burn_subs {
-        // Same clean-extracted-path approach as subtitle_filter() in the
-        // export path, for the same reason: pointing the filter directly
-        // at the original source file risks the same bracket-in-filename
-        // parser corruption bug documented there. cwd gets set below so
-        // subtitle_filter()'s bare filename resolves correctly.
+        // Bare filename + matching cwd — see subtitle_filter's own
+        // comment for the full history of why (three escaping attempts
+        // at embedding the full path directly all failed against real
+        // ffmpeg builds).
         let temp_dir = std::env::temp_dir().join(format!("klippit-shot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
         let extracted = extract_subtitles_to(
@@ -902,6 +1112,73 @@ struct ExtractedSubtitles {
 // all) — better than failing outright, though it's the same "might
 // silently pick the wrong track" behavior this whole feature exists to
 // fix, just as a last resort rather than the default.
+// Parses an .ass timestamp (H:MM:SS.CC — hours with no leading zero,
+// then minutes:seconds.centiseconds) into total seconds.
+fn parse_ass_time(s: &str) -> Option<f64> {
+    let parts: Vec<&str> = s.trim().split(':').collect();
+    if parts.len() != 3 { return None; }
+    let h: f64 = parts[0].parse().ok()?;
+    let m: f64 = parts[1].parse().ok()?;
+    let sec: f64 = parts[2].parse().ok()?;
+    Some(h * 3600.0 + m * 60.0 + sec)
+}
+
+fn format_ass_time(total_seconds: f64) -> String {
+    let total_seconds = total_seconds.max(0.0);
+    let h = (total_seconds / 3600.0).floor() as u64;
+    let m = ((total_seconds % 3600.0) / 60.0).floor() as u64;
+    let sec = total_seconds % 60.0;
+    format!("{h}:{m:02}:{sec:05.2}")
+}
+
+// Shifts every Dialogue line's Start/End timestamps by -offset_seconds,
+// rewriting the file in place. Necessary because ffmpeg's own "-ss"/"-t"
+// output-seeking trim does NOT rebase an .ass subtitle stream's own
+// embedded Dialogue timestamps to start at 0 the way it does for
+// video/audio packet timestamps — .ass stores each event's timing as
+// literal text within the line itself (Dialogue: 0,0:01:46.05,...), not
+// as container-level packet timestamps, so ffmpeg's trim only filters
+// which lines make it into the output without rewriting their text.
+// Confirmed as the actual cause of a real "export succeeds, no subtitles
+// appear" bug via real ffmpeg command logs: the extracted .ass file kept
+// its ORIGINAL, un-shifted times (e.g. still ~106s into the source),
+// while the video segment it was burned onto had already been rebased
+// to start at 0 and was only ~5.7s long — the subtitle timing pointed at
+// a moment in the segment's non-existent future and simply never arrived.
+fn shift_ass_timestamps(ass_path: &std::path::Path, offset_seconds: f64) -> Result<(), String> {
+    if offset_seconds == 0.0 { return Ok(()); }
+    let content = std::fs::read_to_string(ass_path).map_err(|e| e.to_string())?;
+    let mut out = String::with_capacity(content.len());
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("Dialogue:") {
+            // Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text —
+            // splitn(10, ',') keeps the Text field intact even if it
+            // contains commas of its own, since only the first 9 are
+            // ever structural.
+            let fields: Vec<&str> = rest.splitn(10, ',').collect();
+            if fields.len() == 10 {
+                if let (Some(s), Some(e)) = (parse_ass_time(fields[1]), parse_ass_time(fields[2])) {
+                    out.push_str("Dialogue:");
+                    out.push_str(fields[0]);
+                    out.push(',');
+                    out.push_str(&format_ass_time(s - offset_seconds));
+                    out.push(',');
+                    out.push_str(&format_ass_time(e - offset_seconds));
+                    for f in &fields[3..] {
+                        out.push(',');
+                        out.push_str(f);
+                    }
+                    out.push('\n');
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    std::fs::write(ass_path, out).map_err(|e| e.to_string())
+}
+
 async fn extract_subtitles_to(
     app: &AppHandle, path: &str, temp_dir: &std::path::Path, trim: Option<(f64, f64)>,
     external_file: Option<&str>, preferred_lang: Option<&str>,
@@ -911,19 +1188,21 @@ async fn extract_subtitles_to(
 
     // External file takes priority — it's a separate, standalone
     // subtitle file, not a stream within the video container at all, so
-    // there's no "-map 0:N" involved: just convert it directly.
+    // there's no "-map 0:N" involved: just convert it directly. Extracts
+    // the FULL, untrimmed file (no -ss/-t here — see shift_ass_timestamps'
+    // own comment for why ffmpeg's trim can't be trusted to rebase an
+    // .ass file's embedded timestamps), then shifts timestamps manually
+    // afterward if a trim was requested.
     if let Some(ext) = external_file.filter(|s| !s.is_empty()) {
-        let mut extract_args: Vec<String> = vec!["-y".into(), "-i".into(), ext.to_string()];
-        if let Some((in_time, duration)) = trim {
-            extract_args.push("-ss".into());
-            extract_args.push(in_time.to_string());
-            extract_args.push("-t".into());
-            extract_args.push(duration.to_string());
-        }
-        extract_args.push("-c:s".into());
-        extract_args.push("ass".into());
-        extract_args.push(ass_path.to_string_lossy().to_string());
+        let extract_args: Vec<String> = vec![
+            "-y".into(), "-i".into(), ext.to_string(),
+            "-c:s".into(), "ass".into(),
+            ass_path.to_string_lossy().to_string(),
+        ];
         run_bin(app, "ffmpeg", &extract_args, None).await?;
+        if let Some((in_time, _duration)) = trim {
+            shift_ass_timestamps(&ass_path, in_time)?;
+        }
         // External files don't carry embedded font attachments the way
         // an MKV might — nothing to extract there.
         return Ok(ExtractedSubtitles { ass_path, font_paths: vec![] });
@@ -971,19 +1250,19 @@ async fn extract_subtitles_to(
     let sub_index = matched_index.or(first_index)
         .ok_or_else(|| "no subtitle stream found".to_string())?;
 
-    let mut extract_args: Vec<String> = vec![
+    // Extracts the FULL, untrimmed subtitle stream — no -ss/-t here.
+    // See shift_ass_timestamps' own comment for why ffmpeg's own
+    // "-ss"/"-t" trim can't be trusted to rebase an .ass file's embedded
+    // Dialogue timestamps to start at 0 (it doesn't — confirmed via real
+    // command logs from a genuine "export succeeds, no subtitles appear"
+    // bug). Timestamps are shifted manually afterward instead, once, on
+    // the extracted file.
+    let extract_args: Vec<String> = vec![
         "-y".into(), "-i".into(), path.to_string(),
         "-map".into(), format!("0:{sub_index}"),
+        "-c:s".into(), "ass".into(),
+        ass_path.to_string_lossy().to_string(),
     ];
-    if let Some((in_time, duration)) = trim {
-        extract_args.push("-ss".into());
-        extract_args.push(in_time.to_string());
-        extract_args.push("-t".into());
-        extract_args.push(duration.to_string());
-    }
-    extract_args.push("-c:s".into());
-    extract_args.push("ass".into());
-    extract_args.push(ass_path.to_string_lossy().to_string());
 
     // Font extraction is independent of the ASS extraction below —
     // neither reads the other's output, both just read from the same
@@ -1002,6 +1281,9 @@ async fn extract_subtitles_to(
     });
 
     run_bin(app, "ffmpeg", &extract_args, None).await?;
+    if let Some((in_time, _duration)) = trim {
+        shift_ass_timestamps(&ass_path, in_time)?;
+    }
 
     let font_paths = font_task.await.unwrap_or_default();
 
@@ -1434,7 +1716,7 @@ fn main() {
                 tauri::WebviewUrl::App("index.html".into()),
             )
             .title("Klippit")
-            .inner_size(900.0, 620.0)
+            .inner_size(900.0, 720.0)
             .min_inner_size(700.0, 480.0)
             .resizable(true);
 

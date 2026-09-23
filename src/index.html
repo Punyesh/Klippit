@@ -93,9 +93,11 @@
     <div class="handle-select" role="group" aria-label="Which point the frame controls adjust">
       <button class="mark-btn" id="sel-in" title="Set In to current position (I)">Mark In</button>
       <button class="mark-btn" id="sel-out" title="Set Out to current position (O)">Mark Out</button>
+      <button class="mark-btn" id="add-section-btn" title="Add this range as a section and start marking the next one">+ Add Section</button>
     </div>
 
     <div id="trim-track">
+      <div id="committed-sections"></div>
       <div id="trim-range"></div>
       <div class="trim-handle" id="handle-in" style="left:0%" title="In point"></div>
       <div class="trim-handle" id="handle-out" style="left:20%" title="Out point"></div>
@@ -111,6 +113,7 @@
       <button class="frame-btn" id="fb-bigfwd" title="forward ~1s ( Shift+. )">»</button>
     </div>
     <div class="frame-time" id="frame-time">in 0:00.00 &nbsp;&rarr;&nbsp; out 0:00.00 &nbsp;(0:00.00)</div>
+    <div id="sections-list"></div>
   </div>
 
   </div>
@@ -122,6 +125,7 @@
     <div class="seg-group" role="group" aria-label="Output format">
       <button class="seg-btn" id="fmt-mp4" aria-pressed="true">MP4</button>
       <button class="seg-btn" id="fmt-gif" aria-pressed="false">GIF</button>
+      <button class="seg-btn" id="fmt-apng" aria-pressed="false">APNG</button>
     </div>
 
     <div class="section-label">Subtitles</div>
@@ -131,18 +135,21 @@
     </div>
     <div class="frame-time" id="subs-status" style="text-align:left;margin-top:4px"></div>
 
-    <div id="audio-field">
-      <div class="section-label">Audio</div>
-      <div class="seg-group" role="group" aria-label="Audio track">
-        <button class="seg-btn" id="audio-keep" aria-pressed="true">Keep</button>
-        <button class="seg-btn" id="audio-mute" aria-pressed="false">Mute</button>
+    <div class="compact-toggles-grid">
+      <div id="audio-field">
+        <div class="section-label">Audio</div>
+        <div class="seg-group" role="group" aria-label="Audio track">
+          <button class="seg-btn" id="audio-keep" aria-pressed="true">Keep</button>
+          <button class="seg-btn" id="audio-mute" aria-pressed="false">Mute</button>
+        </div>
       </div>
-    </div>
-
-    <div class="section-label">Crop</div>
-    <div class="seg-group" role="group" aria-label="Crop">
-      <button class="seg-btn" id="crop-off" aria-pressed="true">Off</button>
-      <button class="seg-btn" id="crop-on" aria-pressed="false">On</button>
+      <div>
+        <div class="section-label">Crop</div>
+        <div class="seg-group" role="group" aria-label="Crop">
+          <button class="seg-btn" id="crop-off" aria-pressed="true">Off</button>
+          <button class="seg-btn" id="crop-on" aria-pressed="false">On</button>
+        </div>
+      </div>
     </div>
     <div id="crop-controls" style="display:none">
       <div class="seg-group" role="group" aria-label="Crop aspect ratio" style="margin-top:6px">
@@ -165,7 +172,7 @@
 
     <!-- Quality mode -->
     <div id="panel-quality">
-      <div class="row" style="margin-top:10px">
+      <div class="row" style="margin-top:10px" id="crf-field">
         <div class="field">
           <label for="crf">Quality (CRF, lower = better)</label>
           <input class="input" type="range" id="crf" min="15" max="35" value="23" />
@@ -188,8 +195,8 @@
             <option value="480">480p</option>
           </select>
         </div>
-        <div class="field" id="fps-field">
-          <label for="fps">FPS (GIF only)</label>
+        <div class="field" id="fps-field" style="display:none">
+          <label for="fps">FPS (GIF/APNG)</label>
           <select class="input" id="fps">
             <option value="24" selected>24</option>
             <option value="15">15</option>

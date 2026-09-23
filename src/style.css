@@ -460,6 +460,40 @@ html, body {
 #handle-in { border-radius: 0 2px 2px 0; }
 #handle-out { border-radius: 2px 0 0 2px; }
 
+/* Committed sections (added via "+ Add Section") render as separate,
+   dimmer blocks along the trim track — distinguishable from the
+   current in-progress range (#trim-range, brighter/more saturated red)
+   without competing with it visually. Positioned via left/width
+   percentages set in JS (renderSectionsUI in app.js). */
+#committed-sections { position: absolute; top: 0; bottom: 0; left: 0; right: 0; pointer-events: none; }
+.committed-section-block {
+  position: absolute;
+  top: 0; bottom: 0;
+  background: rgba(224, 52, 44, 0.18);
+  border-left: 1px solid rgba(224, 52, 44, 0.5);
+  border-right: 1px solid rgba(224, 52, 44, 0.5);
+}
+
+/* List of committed sections — only shown once at least one exists (see
+   renderSectionsUI), so this adds no clutter for the common single-clip
+   case that never touches "+ Add Section" at all. */
+#sections-list { margin-top: 6px; font-family: var(--mono); font-size: 10px; }
+.sections-list-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 3px 6px; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 2px; margin-bottom: 3px; color: var(--dim);
+}
+.sections-list-row .sect-label { color: var(--text); }
+.sections-list-remove {
+  background: none; border: none; color: var(--dim); cursor: pointer;
+  font-size: 13px; line-height: 1; padding: 0 2px;
+}
+.sections-list-remove:hover { color: var(--red); }
+#sections-total {
+  text-align: center; font-size: 10px; color: var(--dim); margin-top: 4px;
+  padding: 4px 6px; line-height: 1.4;
+}
+
 /* ---------- frame bar ---------- */
 .frame-bar { padding: 5px 10px; background: var(--panel2); border-top: 1px solid var(--line); flex-shrink: 0; }
 .frame-row { display: flex; align-items: center; gap: 2px; flex-wrap: nowrap; }
@@ -502,6 +536,12 @@ html, body {
   color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 2px;
 }
 .mark-btn:hover { border-color: var(--red); color: var(--red); }
+/* Deliberately smaller than Mark In/Mark Out — this is a special-case
+   action (most exports are a single range and never touch it), not a
+   primary control that should visually compete equally with the two
+   buttons everyone uses on every export. */
+#add-section-btn { flex: 0.6; color: var(--dim); font-size: 9px; }
+#add-section-btn:hover { color: var(--red); }
 .mark-btn:active { background: var(--red-dim); border-color: var(--red); color: var(--text); }
 
 /* ---------- body / options ---------- */
@@ -512,6 +552,26 @@ html, body {
   font-family: var(--mono);
 }
 .section-label:first-child { margin-top: 0; padding-top: 0; border-top: none; }
+/* Audio and Crop are both simple two-button toggles, so they share a
+   row instead of each taking a full-width section — reclaims real
+   vertical space that used to overflow the default window height (a
+   scrollbar showing up on first open was a real, confirmed usability
+   problem, made worse as more sections accumulated over time; see the
+   window height bump in main.rs, which addresses the same issue from
+   the other direction). */
+.compact-toggles-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+.compact-toggles-grid .seg-group { width: 100%; }
+/* Visual divider between the two columns — without it, Audio and Crop
+   read ambiguously as one combined section rather than two separate
+   ones sharing a row purely for space reasons. */
+.compact-toggles-grid > div:nth-child(2) {
+  border-left: 1px solid var(--line);
+  padding-left: 14px;
+}
 
 /* Segmented button groups — the one control shape used for every binary
    or multi-way choice (format, subtitles, mode, handle select), rather

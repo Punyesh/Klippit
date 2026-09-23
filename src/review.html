@@ -33,10 +33,10 @@
   window.applyReviewPath = function (path) {
     var old = document.getElementById('v');
     if (old) old.remove();
-    var isGif = /\.gif$/i.test(path || '');
-    var el = document.createElement(isGif ? 'img' : 'video');
+    var isAnimatedImage = /\.(gif|apng)$/i.test(path || '');
+    var el = document.createElement(isAnimatedImage ? 'img' : 'video');
     el.id = 'v';
-    if (!isGif) { el.controls = true; el.autoplay = true; }
+    if (!isAnimatedImage) { el.controls = true; el.autoplay = true; }
     document.body.appendChild(el);
     if (path && window.__TAURI__) {
       el.src = window.__TAURI__.core.convertFileSrc(path);

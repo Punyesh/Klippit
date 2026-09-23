@@ -230,6 +230,282 @@ doesn't understand it, unlike MP4. Fixed by checking the file extension
 and creating an `<img>` element instead for `.gif` paths, which handles
 animated GIFs correctly and natively (including looping).
 
+## Multi-section stutter — third attempt, switched concatenation method entirely
+
+Subtitle burn-in confirmed fixed. The stutter/gap at section boundaries
+was reported as still present, despite two prior fixes
+(`-avoid_negative_ts make_zero` at both the segment and concat-demuxer
+level, then switching segment extraction to accurate output-seeking)
+both being confirmed present in the real commands that ran via the
+earlier log. Two flag-level attempts at the same underlying mechanism
+not working was a signal to reconsider the mechanism itself rather than
+try a third flag.
+
+Root reconsideration: the concat *demuxer* (`-f concat -c copy`, used
+until now) only splices compressed packets together and trusts the
+inputs are perfectly compatible — it has no way to correct a residual
+per-segment quirk (an encoder priming delay, any leftover timing
+irregularity from re-encoding); it just faithfully carries whatever's
+there straight into the output. Switched to the concat *filter*
+(`-filter_complex "[0:v][0:a][1:v][1:a]...concat=n=N:v=1:a=1[outv][outa]"`)
+instead, which operates on fully DECODED frames — every segment gets
+decoded and the filter re-times everything into one continuous
+sequence itself, eliminating packet/timestamp-level splice concerns as
+a category rather than continuing to patch around them at the
+container level. Handles the muted/no-audio case too (`a=0`, video-only
+`[outv]` map, `-an`) since GIF/APNG and MP4-with-Mute never have an
+audio stream in their segments. Costs a real re-encode at this step
+instead of a fast stream copy — accepted as worthwhile here, since
+correctness at a segment boundary matters more than shaving time off an
+intermediate step, and the final format-specific step re-encodes again
+regardless.
+
+Verified the filter-string construction logic (interleaved `[i:v][i:a]`
+pairs, correct `n=`/`a=` flags, correct output labels for both the
+with-audio and no-audio cases) against several section counts before
+considering this ready, matching the exact documented ffmpeg concat
+filter syntax.
+
+## Real root causes found via actual ffmpeg command logs — subtitle burn-in and multi-section stutter
+
+The user provided the full `klippit-ffmpeg.log` contents after confirming burn-in "succeeds" with no error but no visible subtitles — this turned out to be exactly the evidence needed to stop guessing.
+
+**Subtitle burn-in — the actual bug, found by reading the real
+commands.** The extraction command was:
+`ffmpeg -i source.mkv -map 0:2 -ss 106.05 -t 5.76 -c:s ass subs.ass`.
+This looked reasonable, but `.ass` files store each dialogue line's
+timing as literal text within the line itself
+(`Dialogue: 0,0:01:46.05,0:01:47.30,...`), unlike video/audio where
+container-level packet timestamps get rebased automatically by `-ss`/
+`-t`. ffmpeg's output-seeking trim only filters which lines make it into
+the extracted file — it does not rewrite their embedded text
+timestamps. So the extracted `subs.ass` kept saying "this line appears
+at 1:46," while the video segment it was being burned onto had already
+been rebased (via input-seeking `-ss`) to start at 0 and was only ~5.7s
+long. The dialogue was scheduled for a moment in the segment's
+non-existent future and simply never arrived — explaining "succeeds, no
+error, no subtitles" exactly, and why nothing showed up in the console
+either (nothing crashed).
+
+Fixed with `shift_ass_timestamps()`: extraction now always pulls the
+FULL, untrimmed subtitle track (no `-ss`/`-t` on the ffmpeg side at
+all — same as the already-working live-preview extraction), then a new
+function parses every `Dialogue:` line's Start/End fields as
+`H:MM:SS.CC`, subtracts the section's own start time, and rewrites the
+line with the shifted timestamp — manually doing the rebase ffmpeg
+wasn't doing for this format. Verified the parsing/formatting logic
+against the exact scenario from the log (a line at 107.3s, section
+starting at 106.05s, correctly shifts to 1.25s) before considering this
+done, including that the Text field (which can itself contain commas)
+survives intact via a 10-way split that only treats the first 9 commas
+as structural.
+
+**Multi-section stutter — a second contributing fix, since
+`avoid_negative_ts` alone (confirmed via the log as actually present in
+the real commands that ran) wasn't sufficient.** Switched per-segment
+extraction from `-ss` before `-i` (fast, keyframe-based input seeking —
+used everywhere else in this file for single-export speed) to `-ss`
+after `-i` (slower, decode-and-discard output seeking, genuinely more
+accurate). Input seeking's small per-seek timing imprecision is
+invisible in a single standalone export but becomes a visible seam once
+multiple independently-seeked segments get glued together at a concat
+boundary — exactly the reported symptom. Scoped to multi-section
+extraction specifically, not applied to the proven, working
+single-section path elsewhere in the file.
+
+## Multi-section stutter/gap at segment boundaries
+
+Follow-up clarification on the earlier multi-section fix: the reported
+issue wasn't (only) the auto-include bug — with sections properly
+added via "+ Add Section," playback still showed a short stutter/gap
+exactly at each transition, with the following section's visible
+playtime feeling short even though the file's total reported duration
+matched expectations. A genuinely different, more technical problem
+than the UI ambiguity fixed earlier.
+
+Likely cause: each section is extracted independently via `-ss <time>
+-i <file> -t <duration>` (input seeking, chosen for speed). This kind
+of seek can leave small timestamp irregularities in the resulting
+segment — particularly around B-frames near the seek point — that
+don't cleanly rebase to zero. Invisible in a single standalone segment,
+but the concat step only stream-copies raw packets and timestamps
+(`-c copy`, chosen for speed since every segment is already freshly
+re-encoded during extraction) with no opportunity to fix up a segment
+that didn't start clean. A residual offset at a join point would show
+up as exactly the reported symptom: a stutter at the boundary, and the
+next section's actual visible content shortened by however much the
+irregularity ate into it.
+
+Fix: `-avoid_negative_ts make_zero` added to both the per-segment
+extraction and the final concat step — forces timestamps to cleanly
+rebase to zero at each stage, the standard, documented fix for this
+exact class of ffmpeg concat issue. Flagged honestly: this is a
+well-reasoned fix for the most likely cause based on how the pipeline
+works, not something verified against a real multi-section export,
+since that's not possible from here. If the gap persists after this,
+the next most useful thing to check would be whether it's specifically
+audio/video sync drift at the boundary (which would point to a
+different fix — re-encoding through the concat step instead of stream
+copying) versus a video-only stutter (which would point to something
+still wrong with the per-segment extraction itself).
+
+## Subtitle burn-in (fourth attempt, with real evidence this time), multi-section export ambiguity fixed, Add Section button resized
+
+**Subtitle burn-in — root cause finally confirmed via real ffmpeg
+output.** The third attempt's escaped-full-path approach
+(`filename=C\:/Users/...`) failed against a real ffmpeg 9.0.2 build:
+`No option name near '/Users/...'` — the parser did not treat `\:` as
+an escaped literal colon at all; it split there regardless, consumed
+"C" as the complete value, and choked on the remainder. That's three
+separate escaping attempts across this debugging history now, all
+failing the same way — strong evidence that escaping this colon
+directly isn't the right mechanism for this filter's parser, whatever
+the exact reason.
+
+Reverted to bare filename + matching ffmpeg process working directory
+(`cwd`), re-adding it to `extract_and_concat_sections` and
+`extract_frame` where it had been removed. This approach was abandoned
+earlier based on a vague "still doesn't work" report — but in hindsight
+that report almost certainly predated the actual confirmed bug (the
+`run_bin` stdout newline-accumulation issue, which broke subtitle
+*stream detection* entirely, meaning no subtitles were ever being
+extracted at all regardless of whether cwd worked). The bare-filename
+approach never actually had contrary evidence against it; it just never
+got a fair test before being replaced. It sidesteps the colon-escaping
+question entirely rather than continuing to guess at syntax variations.
+
+**Multi-section export — found and fixed a real design flaw, not a
+frame-accuracy issue as first suspected.** The original model always
+auto-included the current in-progress in/out as an implicit "final
+section" at export time. Combined with "+ Add Section" resetting that
+same in/out to a fresh default range, this created a real trap: mark a
+section, click "+ Add Section," then export without marking a genuine
+second range — the leftover auto-reset range would silently get
+combined in as an unintended extra section, indistinguishable from "the
+export is subtly wrong" from the outside (exactly matching a report of
+drift/inconsistency). Fixed by removing the implicit auto-include:
+once `state.sections` has any entries, ONLY committed sections are used
+at export — the current in/out must be explicitly added via "+ Add
+Section" even for the last one. Below the sections list, a status line
+now states plainly what will and won't be included ("N sections will be
+combined — Xs total. Current In/Out (...) is NOT included yet") rather
+than leaving this to be discovered the hard way in an exported file.
+
+**"+ Add Section" resized.** Was sharing equal width with Mark In/Mark
+Out in a three-button row — visually implying equal importance for a
+control that's a special case most exports never touch. Now noticeably
+smaller and dimmer (`flex: 0.6`, muted color), so Mark In/Mark Out stay
+the visually dominant, primary controls.
+
+## Multi-section export, APNG viewer fix, subtitle burn-in (third attempt), Audio/Crop divider
+
+**Multi-section export — the big one.** Mark multiple, non-contiguous
+ranges from the source and combine them into a single output. Backend
+architecture: `ExportParams.sections` is a `Vec<SectionParam>` that
+*replaces* the old singular `in_time`/`out_time` fields entirely rather
+than keeping both — every export, whether one range or several, goes
+through the same `extract_and_concat_sections` (extract each section
+separately with crop/subtitles baked in per-section, since subtitle
+timestamps need rebasing to each section's own start; concat via
+ffmpeg's concat demuxer; N=1 just skips the actual concat step since
+there's nothing to join). Every section is re-encoded with identical
+codec settings specifically so the concat step can safely use `-c copy`
+— mismatched parameters across concat inputs is a real way for that
+step to fail. `export_mp4`/`export_gif`/`export_apng` all now read from
+this pre-assembled combined file rather than seeking into the original
+source directly, and are otherwise unchanged.
+
+Frontend: the current in-progress Mark In/Out range is *always* the
+final section at export time, whether or not "+ Add Section" was ever
+clicked — a single-clip export (the common case) just sends a
+one-entry array, invisible to someone who never touches the new
+button. "+ Add Section" commits the current range to `state.sections`,
+validates it doesn't overlap any already-committed section (rejected
+with a clear status message, since silently allowing overlap would
+duplicate content in the output), then resets in/out for the next one.
+Committed sections render as dimmer blocks along the trim track
+(distinct from the current bright in-progress range) and as a list
+below the frame-time readout, each with a delete button — the list
+stays hidden entirely until at least one section exists, so it adds no
+UI weight for anyone not using the feature.
+
+Found and fixed one real bug during testing: `querySelectorAll(...).forEach`
+threw in the static-render tool used to verify this (`NodeList.forEach`
+isn't supported by its old bundled WebKit build — the real app's
+WebView2 has supported this since 2016, so this was a test-environment
+gap, not an app bug) — switched to a plain indexed loop, which sidesteps
+the question entirely for zero cost either way, and let the delete
+button's behavior actually be verified rather than assumed. Verified via
+real execution: adding two sections, deleting one (list, blocks, and
+total duration all update correctly), and the overlap check correctly
+rejecting a second, overlapping add attempt.
+
+**Subtitle burn-in — third attempt.** Reported still broken even after
+the newline-accumulation fix. Root cause reconsidered from scratch:
+the previous fix (bare filename + matching ffmpeg process working
+directory) depended on `tauri-plugin-shell`'s sidecar `.current_dir()`
+actually being honored, which was never confirmed and evidently isn't
+reliably happening. Dropped that dependency entirely — `subtitle_filter()`
+now embeds the full path directly in the filter string, converting
+backslashes to forward slashes (ffmpeg accepts these on Windows too,
+sidestepping the need to escape every backslash individually — likely
+the actual mistake in the two earlier direct-escaping attempts) and
+escaping only the one structurally significant character left over,
+the drive-letter colon. No `cwd` needed anywhere in the encode step for
+this anymore; the parameter is kept (always `None` now) rather than
+removed from every downstream function signature, so this stays a
+small, easily-reverted change if a cwd ever turns out to be needed here
+again for some unrelated reason.
+
+**APNG viewer fix.** The Play/review window only checked for a `.gif`
+extension to decide `<img>` vs `<video>` — APNG files hit the `<video>`
+branch, which can't decode a still-image-based animated format any more
+than it could GIF originally. Extended the check to `/\.(gif|apng)$/i`.
+
+**Audio/Crop divider.** A thin vertical border between the two grid
+columns — without it, Audio and Crop read ambiguously as one combined
+section rather than two separate ones sharing a row purely for space
+reasons.
+
+## APNG output + sidebar reorganization (default-open scrollbar fixed)
+
+**APNG added as a third export format.** Genuinely simpler than GIF to
+implement: no palette generation needed at all (PNG has no 256-color
+ceiling the way GIF does), so `export_apng` skips straight from the
+same extract-once-with-crop-and-subtitles-baked-in approach GIF uses to
+a single direct ffmpeg pass (`-plays 0` for infinite looping). Since
+APNG is lossless, there's no CRF-equivalent quality knob — resolution
+and fps are the only real file-size levers, the same two GIF already
+exposes, so target-size mode reuses that identical shrink-and-retry
+loop against the pre-extracted segment (even cheaper here than GIF's
+retries, since there's no palette pass to redo each time either).
+Format toggle converted from the two-button `bindSeg` to the
+`bindSegGroup` helper (already existed for crop's aspect-ratio row) to
+support a third option; CRF slider, Encoding (GPU) section, and Audio
+section now all correctly hide for both GIF and APNG together, sharing
+one `isAnimatedImage` check rather than duplicating format comparisons.
+
+**Bonus fix found along the way**: the FPS field had no initial
+`display:none` in the static HTML, so it was visible even for the
+default MP4 format until the very first format switch — a real,
+pre-existing bug, not something introduced by APNG. Fixed directly
+since it's exactly the kind of default-state clutter the reorganization
+below was about.
+
+**Sidebar reorganization — diagnosed before fixing.** Rendered the
+actual default state first rather than guessing at causes: confirmed
+the Output section's folder/browse row was genuinely being cut off at
+the original 900×620 default size, and that enabling crop (which adds
+an aspect-preset row) made it worse, cutting off the filename field too.
+Fix, verified across every state tested (default, crop enabled, Quality
+mode, Target-size mode): Audio and Crop — both simple two-button
+toggles that each previously claimed a full-width section — now share
+one row via a `.compact-toggles-grid` (2-column CSS grid), and the
+default window height moved from 620 to 720px. Together these
+comfortably fit every combination checked, with visible spare room even
+in the most crowded case (Quality mode, crop on with its presets
+showing).
+
 ## v1.2.0: critical subtitle burn-in regression — root cause found
 
 Reported as broken across the board: MP4 and GIF, cropped and

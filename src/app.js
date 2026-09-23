@@ -33,6 +33,14 @@ var state = {
   fps: 24, // replaced with the real value once ffprobe reports it (see loadMetadata)
   inTime: init.startTime,
   outTime: init.startTime + 3,
+  // Committed sections from "+ Add Section" — does NOT include the
+  // current in-progress inTime/outTime above, which is always appended
+  // as the final section automatically at export time (see
+  // exportClip's params construction). A person who never touches
+  // "+ Add Section" at all just exports their single Mark In/Out range
+  // exactly as before — multi-section isn't a separate mode, just this
+  // array having more than zero entries.
+  sections: [],
   format: 'mp4', // 'mp4' | 'gif'
   burnSubs: false,
   mode: 'quality', // 'quality' | 'size'
@@ -100,7 +108,94 @@ function render() {
     '  (' + fmtTime(Math.max(0, state.outTime - state.inTime)) + ')';
 
   updateDefaultFilename();
+  renderSectionsUI();
 }
+
+// ---------- multi-section export ----------
+// Committed sections (from "+ Add Section") render as dimmer blocks
+// along the trim track, separate from the current in-progress range —
+// see renderSectionsUI's own comment on the CSS side for why. The list
+// below the frame-time readout is hidden entirely (renderSectionsUI's
+// early return) until at least one section has been committed, so
+// single-clip exports — the overwhelming common case — see no new UI
+// at all.
+var committedSectionsEl = document.getElementById('committed-sections');
+var sectionsListEl = document.getElementById('sections-list');
+function renderSectionsUI() {
+  var dur = state.duration || 1;
+  var blocksHtml = state.sections.map(function (s) {
+    var left = (s.inTime / dur) * 100;
+    var width = Math.max(0, (s.outTime - s.inTime) / dur * 100);
+    return '<div class="committed-section-block" style="left:' + left + '%;width:' + width + '%"></div>';
+  }).join('');
+  committedSectionsEl.innerHTML = blocksHtml;
+
+  if (state.sections.length === 0) {
+    sectionsListEl.innerHTML = '';
+    sectionsListEl.style.display = 'none';
+    return;
+  }
+  sectionsListEl.style.display = 'block';
+  var rowsHtml = state.sections.map(function (s, i) {
+    return '<div class="sections-list-row">' +
+      '<span class="sect-label">' + (i + 1) + '. ' + fmtTime(s.inTime) + ' \u2192 ' + fmtTime(s.outTime) +
+      ' (' + fmtTime(s.outTime - s.inTime) + ')</span>' +
+      '<button class="sections-list-remove" data-index="' + i + '" title="Remove this section">\u00d7</button>' +
+      '</div>';
+  }).join('');
+  // Once any section is committed, the CURRENT in/out is deliberately
+  // NOT counted here or included at export — see exportClip's own
+  // comment for why auto-including it was a real, confirmed bug. The
+  // hint line makes that explicit rather than leaving it to be
+  // discovered the hard way in an exported file.
+  var totalCommitted = state.sections.reduce(function (sum, s) { return sum + (s.outTime - s.inTime); }, 0);
+  rowsHtml += '<div id="sections-total">' + state.sections.length + (state.sections.length === 1 ? ' section' : ' sections') +
+    ' will be combined \u2014 ' + fmtTime(totalCommitted) + ' total. Current In/Out (' + fmtTime(state.inTime) + ' \u2192 ' + fmtTime(state.outTime) +
+    ') is NOT included yet \u2014 click + Add Section to include it.</div>';
+  sectionsListEl.innerHTML = rowsHtml;
+
+  // Rebuilt from scratch above, so every remove button is (re)wired
+  // fresh each render rather than relying on stale references. A plain
+  // loop over querySelectorAll's result rather than .forEach on it —
+  // NodeList.forEach is broadly supported in real browsers/WebView2,
+  // but this sidesteps the one environment found during testing where
+  // it wasn't (an old bundled WebKit build used by a static-render
+  // tool), for zero cost either way.
+  var removeButtons = sectionsListEl.querySelectorAll('.sections-list-remove');
+  for (var r = 0; r < removeButtons.length; r++) {
+    removeButtons[r].onclick = function () {
+      var idx = parseInt(this.getAttribute('data-index'), 10);
+      state.sections.splice(idx, 1);
+      render();
+    };
+  }
+}
+
+document.getElementById('add-section-btn').onclick = function () {
+  var newIn = state.inTime, newOut = state.outTime;
+  if (newOut <= newIn) {
+    setStatus('out point must be after in point', 'error');
+    return;
+  }
+  // Overlap check against already-committed sections — allowing overlap
+  // would silently duplicate that content in the combined output,
+  // confusing to hit only after a full export completes.
+  for (var i = 0; i < state.sections.length; i++) {
+    var s = state.sections[i];
+    if (newIn < s.outTime && s.inTime < newOut) {
+      setStatus('sections can\u2019t overlap \u2014 adjust In/Out first', 'error');
+      return;
+    }
+  }
+  state.sections.push({ inTime: newIn, outTime: newOut });
+  // Reset current in/out for the next section, right after the one
+  // just added — same default-length pattern as the very first
+  // section's own (start, start+3) initialization.
+  state.inTime = newOut;
+  state.outTime = Math.min(newOut + 3, state.duration || newOut + 3);
+  render();
+  setStatus('section added \u2014 mark the next one', 'done');
+};
 // Reflects the video's current playhead position — not a marked point —
 // since frame-stepping is now pure navigation (see step() below). Called
 // on every timeupdate too, so it also tracks live during playback and
@@ -344,16 +439,24 @@ function bindSeg(idOn, idOff, onSelect) {
   a.onclick = function () { a.setAttribute('aria-pressed', 'true'); b.setAttribute('aria-pressed', 'false'); onSelect(idOn); };
   b.onclick = function () { b.setAttribute('aria-pressed', 'true'); a.setAttribute('aria-pressed', 'false'); onSelect(idOff); };
 }
-bindSeg('fmt-mp4', 'fmt-gif', function (id) {
-  state.format = id === 'fmt-mp4' ? 'mp4' : 'gif';
-  document.getElementById('fps-field').style.display = state.format === 'gif' ? 'block' : 'none';
-  // GIFs never carry audio at all, so the mute toggle is meaningless
-  // there — hide it rather than leave a control with nothing to control.
-  document.getElementById('audio-field').style.display = state.format === 'gif' ? 'none' : 'block';
-  // GIF is palette-based, not H.264 — no GPU encoder involved at all.
-  // gpu-field also sits inside panel-quality, so target-size mode
-  // already hides it for free without needing a separate check here.
-  document.getElementById('gpu-field').style.display = state.format === 'gif' ? 'none' : 'block';
+bindSegGroup(['fmt-mp4', 'fmt-gif', 'fmt-apng'], function (id) {
+  state.format = { 'fmt-mp4': 'mp4', 'fmt-gif': 'gif', 'fmt-apng': 'apng' }[id];
+  var isAnimatedImage = state.format === 'gif' || state.format === 'apng';
+  document.getElementById('fps-field').style.display = isAnimatedImage ? 'block' : 'none';
+  // Neither GIF nor APNG carry audio at all, so the mute toggle is
+  // meaningless for either — hide it rather than leave a control with
+  // nothing to control.
+  document.getElementById('audio-field').style.display = isAnimatedImage ? 'none' : 'block';
+  // Neither is H.264 (GIF is palette-based, APNG is just PNG frames) —
+  // no GPU encoder involved for either. gpu-field also sits inside
+  // panel-quality, so target-size mode already hides it for free
+  // without needing a separate check here.
+  document.getElementById('gpu-field').style.display = isAnimatedImage ? 'none' : 'block';
+  // Both GIF and APNG are effectively lossless-or-palette formats with
+  // no CRF-equivalent quality knob the way MP4 has — resolution and fps
+  // (still shown, via fps-field above) are the only real size levers
+  // for either, so the CRF slider is just noise for both.
+  document.getElementById('crf-field').style.display = isAnimatedImage ? 'none' : 'block';
   updateOutputExt();
 });
 bindSeg('mode-quality', 'mode-size', function (id) {
@@ -879,10 +982,23 @@ function cancelExport() {
 
 // ---------- export ----------
 function exportClip() {
+  // Once ANY section has been committed via "+ Add Section", ONLY
+  // committed sections count — the current in-progress in/out is NOT
+  // auto-included as an implicit "final section" anymore. That earlier
+  // design was a real, confirmed bug: clicking "+ Add Section" resets
+  // the current in/out to a fresh default range (see its own handler),
+  // and if a person then exported without marking a genuine next
+  // section, they'd silently get that leftover reset range combined in
+  // as an unintended extra section — indistinguishable from "the export
+  // is subtly wrong" from their side. Now, the current in/out is only
+  // used as-is when state.sections is still empty (the common,
+  // single-clip case, unchanged from before this feature existed) —
+  // once multi-section is in play at all, every section, including the
+  // last one, needs its own explicit "+ Add Section" click.
+  var sections = state.sections.length > 0 ? state.sections.slice() : [{ inTime: state.inTime, outTime: state.outTime }];
   var params = {
     filePath: init.filePath,
-    inTime: state.inTime,
-    outTime: state.outTime,
+    sections: sections,
     format: state.format,
     burnSubs: state.burnSubs,
     mode: state.mode,
@@ -990,9 +1106,10 @@ function applyInit(newInit) {
   document.getElementById('source-name').title = init.filePath;
 
   // Reset editing state for the new clip rather than carrying over
-  // whatever in/out/filename the previous file had.
+  // whatever in/out/filename/sections the previous file had.
   state.inTime = init.startTime;
   state.outTime = init.startTime + 3;
+  state.sections = [];
   filenameManuallyEdited = false;
   lastExportedPath = null;
   state.sourceWidth = 0;
