@@ -484,6 +484,12 @@ html, body {
   border-radius: 2px; margin-bottom: 3px; color: var(--dim);
 }
 .sections-list-row .sect-label { color: var(--text); flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sections-list-crop {
+  background: none; border: 1px solid var(--line); color: var(--dim);
+  font-family: var(--mono); font-size: 9px; padding: 2px 6px; border-radius: 2px;
+  cursor: pointer; flex-shrink: 0;
+}
+.sections-list-crop:hover, .sections-list-crop.active { border-color: var(--red); color: var(--red); }
 .sections-list-remove {
   background: none; border: none; color: var(--dim); cursor: pointer;
   font-size: 13px; line-height: 1; padding: 0 2px; flex-shrink: 0;

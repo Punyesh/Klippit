@@ -60,14 +60,22 @@ var state = {
   muteAudio: false,
   useGpu: false,
   cropEnabled: false,
-  cropAspect: 'free', // 'free' | '16:9' | '9:16' | '1:1'
-  // Crop rectangle in SOURCE VIDEO PIXEL coordinates, not screen pixels —
-  // this is what actually gets sent to export, and stays correct
-  // regardless of window resizing or preview letterboxing changes.
+  cropAspect: 'free', // project-wide shape: 'free' | '16:9' | '4:3' | '9:16' | '1:1'
+  // The live crop box is the editor state for the CURRENT in-progress
+  // section. Committed sections snapshot their own crop rectangles inside
+  // state.sections, so position/zoom can differ per cut. The live box is
+  // deliberately NOT reset after "+ Add Section" — it stays where the
+  // user left it as the starting point for the next section.
   cropX: 0,
   cropY: 0,
-  cropWidth: 0,  // 0 = not yet initialized; set to the full frame when crop is first enabled
-  cropHeight: 0
+  cropWidth: 0,  // 0 = not initialized yet; resetCrop() fills it
+  cropHeight: 0,
+  // When editing a committed section's crop, changes write through to
+  // that section immediately. pendingCropBeforeEdit preserves the crop
+  // box that belonged to the still-in-progress section so clicking Done
+  // returns the editor exactly where it was.
+  editingCropSection: null,
+  pendingCropBeforeEdit: null
 };
 
 var MED_STEP = 5;
@@ -169,9 +177,18 @@ function renderSectionsUI() {
     // plays for in the output" is the number worth seeing at a glance,
     // not the source range it was cut from.
     var effectiveDur = (s.outTime - s.inTime) / (s.speed || 1.0);
+    var cropButton = '';
+    if (state.cropEnabled) {
+      var cropTitle = s.crop
+        ? ('Crop ' + Math.round(s.crop.width) + '\u00d7' + Math.round(s.crop.height))
+        : 'Crop (full frame)';
+      var cropText = state.editingCropSection === i ? 'Done' : 'Crop';
+      cropButton = '<button class="sections-list-crop' + (state.editingCropSection === i ? ' active' : '') + '" data-index="' + i + '" title="' + cropTitle + '">' + cropText + '</button>';
+    }
     return '<div class="sections-list-row">' +
       '<span class="sect-label">' + (i + 1) + '. ' + fmtTime(s.inTime) + ' \u2192 ' + fmtTime(s.outTime) +
       ' (' + fmtTime(effectiveDur) + ')</span>' +
+      cropButton +
       speedPillHtml(i, s.speed || 1.0) +
       '<button class="sections-list-remove" data-index="' + i + '" title="Remove this section">\u00d7</button>' +
       '</div>';
@@ -197,6 +214,11 @@ function renderSectionsUI() {
   for (var r = 0; r < removeButtons.length; r++) {
     removeButtons[r].onclick = function () {
       var idx = parseInt(this.getAttribute('data-index'), 10);
+      if (state.editingCropSection === idx) {
+        finishSectionCropEdit(false);
+      } else if (state.editingCropSection !== null && idx < state.editingCropSection) {
+        state.editingCropSection -= 1;
+      }
       state.sections.splice(idx, 1);
       render();
     };
@@ -205,6 +227,18 @@ function renderSectionsUI() {
   // stored speed directly. This directly replaces an earlier, rejected
   // design where changing a committed section's speed meant deleting
   // and re-adding it.
+  var cropButtons = sectionsListEl.querySelectorAll('.sections-list-crop');
+  for (var c = 0; c < cropButtons.length; c++) {
+    cropButtons[c].onclick = function () {
+      var idx = parseInt(this.getAttribute('data-index'), 10);
+      if (state.editingCropSection === idx) {
+        finishSectionCropEdit(true);
+      } else {
+        beginSectionCropEdit(idx);
+      }
+    };
+  }
+
   var speedInputs = sectionsListEl.querySelectorAll('.sect-speed-input');
   for (var si = 0; si < speedInputs.length; si++) {
     speedInputs[si].onchange = function () {
@@ -247,6 +281,9 @@ document.getElementById('speed-up').onclick = function () {
 };
 
 document.getElementById('add-section-btn').onclick = function () {
+  // If a committed section's crop is being edited, return to the crop
+  // box for the in-progress section before snapshotting the new cut.
+  if (state.editingCropSection !== null) finishSectionCropEdit(false);
   var newIn = state.inTime, newOut = state.outTime;
   if (newOut <= newIn) {
     setStatus('out point must be after in point', 'error');
@@ -260,7 +297,17 @@ document.getElementById('add-section-btn').onclick = function () {
   // slow motion, as a replay effect. Nothing about the export pipeline
   // ever required sections to be disjoint — each is extracted
   // independently regardless of what any other section covers.
-  state.sections.push({ inTime: newIn, outTime: newOut, speed: state.speed });
+  state.sections.push({
+    inTime: newIn,
+    outTime: newOut,
+    speed: state.speed,
+    crop: state.cropEnabled ? cloneCrop(currentCropSnapshot()) : null
+  });
+  // In/Out and speed reset for the next section, but crop deliberately
+  // does NOT: the selection box stays exactly where the user left it,
+  // as agreed for a fast shot-to-shot reframing workflow. Each committed
+  // section already owns its snapshot above, so changing this live box
+  // for the next cut cannot mutate earlier sections.
   // Reset current in/out AND speed for the next section, right after
   // the one just added — same default-length pattern as the very first
   // section's own (start, start+3) initialization.
@@ -559,7 +606,126 @@ var cropBox = document.getElementById('crop-box');
 var cropMaskHole = document.getElementById('crop-mask-hole');
 var cropDimensions = document.getElementById('crop-dimensions');
 var cropSizeReadout = document.getElementById('crop-size-readout');
-var ASPECT_RATIOS = { '16:9': 16 / 9, '9:16': 9 / 16, '1:1': 1 };
+var ASPECT_RATIOS = { '16:9': 16 / 9, '4:3': 4 / 3, '9:16': 9 / 16, '1:1': 1 };
+
+
+function cloneCrop(crop) {
+  if (!crop) return null;
+  return { x: crop.x, y: crop.y, width: crop.width, height: crop.height };
+}
+
+function currentCropSnapshot() {
+  if (!state.cropWidth || !state.cropHeight) return null;
+  return {
+    x: state.cropX,
+    y: state.cropY,
+    width: state.cropWidth,
+    height: state.cropHeight
+  };
+}
+
+function setCurrentCrop(crop) {
+  if (!crop) return;
+  state.cropX = crop.x;
+  state.cropY = crop.y;
+  state.cropWidth = crop.width;
+  state.cropHeight = crop.height;
+}
+
+// Crop shape is project-wide while position/zoom are per-section. In
+// explicit aspect modes the selected ratio is the project ratio. In
+// Free mode, the first committed crop establishes a custom ratio once
+// multi-section editing begins; before that, a single section is truly
+// free-form.
+function effectiveCropRatio() {
+  if (state.cropAspect !== 'free') return ASPECT_RATIOS[state.cropAspect] || null;
+  for (var i = 0; i < state.sections.length; i++) {
+    var c = state.sections[i].crop;
+    if (c && c.width > 0 && c.height > 0) return c.width / c.height;
+  }
+  return null;
+}
+
+function fitCropToRatio(crop, ratio) {
+  if (!crop || !ratio || !state.sourceWidth || !state.sourceHeight) return cloneCrop(crop);
+  var centerX = crop.x + crop.width / 2;
+  var centerY = crop.y + crop.height / 2;
+  // Preserve the crop's current height first, matching the old crop
+  // aspect control's behavior; fall back to width only if that would
+  // exceed the source frame.
+  var newH = crop.height;
+  var newW = newH * ratio;
+  if (newW > state.sourceWidth) { newW = state.sourceWidth; newH = newW / ratio; }
+  if (newH > state.sourceHeight) { newH = state.sourceHeight; newW = newH * ratio; }
+  newW = Math.max(2, newW);
+  newH = Math.max(2, newH);
+  return {
+    x: clamp(centerX - newW / 2, 0, state.sourceWidth - newW),
+    y: clamp(centerY - newH / 2, 0, state.sourceHeight - newH),
+    width: newW,
+    height: newH
+  };
+}
+
+function maxCropForRatio(ratio) {
+  if (!state.sourceWidth || !state.sourceHeight) return null;
+  if (!ratio) return { x: 0, y: 0, width: state.sourceWidth, height: state.sourceHeight };
+  var w = state.sourceWidth;
+  var h = w / ratio;
+  if (h > state.sourceHeight) { h = state.sourceHeight; w = h * ratio; }
+  return {
+    x: (state.sourceWidth - w) / 2,
+    y: (state.sourceHeight - h) / 2,
+    width: w,
+    height: h
+  };
+}
+
+function syncEditedSectionCrop() {
+  if (state.editingCropSection === null) return;
+  var section = state.sections[state.editingCropSection];
+  if (!section) return;
+  section.crop = cloneCrop(currentCropSnapshot());
+}
+
+function initializeCommittedSectionCrops() {
+  if (!state.cropEnabled) return;
+  var base = currentCropSnapshot() || maxCropForRatio(effectiveCropRatio());
+  if (!base) return;
+  for (var i = 0; i < state.sections.length; i++) {
+    if (!state.sections[i].crop) state.sections[i].crop = cloneCrop(base);
+  }
+}
+
+function beginSectionCropEdit(index) {
+  if (!state.cropEnabled || !state.sections[index]) return;
+  if (state.editingCropSection === null) {
+    state.pendingCropBeforeEdit = cloneCrop(currentCropSnapshot());
+  }
+  state.editingCropSection = index;
+  if (!state.sections[index].crop) {
+    state.sections[index].crop = cloneCrop(currentCropSnapshot() || maxCropForRatio(effectiveCropRatio()));
+  }
+  setCurrentCrop(state.sections[index].crop);
+  var midpoint = (state.sections[index].inTime + state.sections[index].outTime) / 2;
+  video.currentTime = clamp(midpoint, 0, state.duration || midpoint);
+  render();
+  setStatus('editing crop for section ' + (index + 1) + ' — click Done when finished', 'done');
+}
+
+function finishSectionCropEdit(shouldRender) {
+  if (state.editingCropSection === null) return;
+  syncEditedSectionCrop();
+  state.editingCropSection = null;
+  if (state.pendingCropBeforeEdit) {
+    var restored = cloneCrop(state.pendingCropBeforeEdit);
+    var ratio = effectiveCropRatio();
+    if (ratio) restored = fitCropToRatio(restored, ratio);
+    setCurrentCrop(restored);
+  }
+  state.pendingCropBeforeEdit = null;
+  if (shouldRender !== false) render();
+}
 
 // Generic N-button segmented group — bindSeg() above only handles
 // exactly two buttons, which the aspect-ratio row (four) doesn't fit.
@@ -636,64 +802,68 @@ function renderCropOverlay() {
   cropMaskHole.setAttribute('height', boxHeight);
 
   var label = Math.round(state.cropWidth) + ' \u00d7 ' + Math.round(state.cropHeight);
+  if (state.editingCropSection !== null) label += '  ·  section ' + (state.editingCropSection + 1);
   cropDimensions.textContent = label;
-  cropSizeReadout.textContent = label;
+  var readout = label;
+  if (state.cropAspect === 'free' && state.sections.length > 0 && effectiveCropRatio()) readout += '  ·  custom ratio locked';
+  cropSizeReadout.textContent = readout;
 }
 window.addEventListener('resize', renderCropOverlay);
 
-// Back to the full source frame — the "undo" for crop isn't a history
-// stack (see the design discussion this came out of): since crop is
-// never destructive to the source, redefining the box or resetting it
-// entirely covers everything a real undo would, without this being the
-// one setting in the whole app with its own history tracking.
+// Reset to the largest crop that fits the project aspect ratio. In Free
+// single-section mode that is the full source frame; for a locked ratio it
+// is the largest centered rectangle of that shape.
 function resetCrop() {
   if (!state.sourceWidth || !state.sourceHeight) return;
-  state.cropX = 0;
-  state.cropY = 0;
-  state.cropWidth = state.sourceWidth;
-  state.cropHeight = state.sourceHeight;
+  var crop = maxCropForRatio(effectiveCropRatio());
+  setCurrentCrop(crop);
+  syncEditedSectionCrop();
   renderCropOverlay();
 }
 
 function applyCropAspect(ratioKey) {
   state.cropAspect = ratioKey;
-  if (ratioKey === 'free' || !state.sourceWidth || !state.cropWidth) return;
-  var ratio = ASPECT_RATIOS[ratioKey];
-  var centerX = state.cropX + state.cropWidth / 2;
-  var centerY = state.cropY + state.cropHeight / 2;
-  // Fit to the current crop height first, falling back to width if that
-  // would overflow the source frame — keeps the result as large as
-  // reasonable while always staying fully inside the source.
-  var newH = state.cropHeight;
-  var newW = newH * ratio;
-  if (newW > state.sourceWidth) { newW = state.sourceWidth; newH = newW / ratio; }
-  if (newH > state.sourceHeight) { newH = state.sourceHeight; newW = newH * ratio; }
-  state.cropWidth = newW;
-  state.cropHeight = newH;
-  state.cropX = clamp(centerX - newW / 2, 0, state.sourceWidth - newW);
-  state.cropY = clamp(centerY - newH / 2, 0, state.sourceHeight - newH);
+  if (!state.sourceWidth || !state.cropWidth) return;
+
+  // Free is genuinely unconstrained for a single section. Once there
+  // are committed sections, switching to Free establishes a custom
+  // project ratio from the currently visible crop; every section then
+  // keeps that same shape while remaining independently movable and
+  // resizable.
+  var ratio = ratioKey === 'free'
+    ? (state.sections.length > 0 ? state.cropWidth / state.cropHeight : null)
+    : ASPECT_RATIOS[ratioKey];
+
+  if (ratio) {
+    for (var i = 0; i < state.sections.length; i++) {
+      if (state.sections[i].crop) state.sections[i].crop = fitCropToRatio(state.sections[i].crop, ratio);
+    }
+    var current = fitCropToRatio(currentCropSnapshot(), ratio);
+    if (state.editingCropSection !== null && state.sections[state.editingCropSection] && state.sections[state.editingCropSection].crop) {
+      current = cloneCrop(state.sections[state.editingCropSection].crop);
+    }
+    setCurrentCrop(current);
+    syncEditedSectionCrop();
+  }
   renderCropOverlay();
+  renderSectionsUI();
 }
 
 document.getElementById('crop-reset-btn').onclick = function () {
-  state.cropAspect = 'free';
-  bindSegGroupReset();
   resetCrop();
 };
-function bindSegGroupReset() {
-  ['crop-aspect-free', 'crop-aspect-169', 'crop-aspect-916', 'crop-aspect-11'].forEach(function (id) {
-    document.getElementById(id).setAttribute('aria-pressed', id === 'crop-aspect-free' ? 'true' : 'false');
-  });
-}
-bindSegGroup(['crop-aspect-free', 'crop-aspect-169', 'crop-aspect-916', 'crop-aspect-11'], function (id) {
-  applyCropAspect({ 'crop-aspect-free': 'free', 'crop-aspect-169': '16:9', 'crop-aspect-916': '9:16', 'crop-aspect-11': '1:1' }[id]);
+bindSegGroup(['crop-aspect-free', 'crop-aspect-169', 'crop-aspect-43', 'crop-aspect-916', 'crop-aspect-11'], function (id) {
+  applyCropAspect({ 'crop-aspect-free': 'free', 'crop-aspect-169': '16:9', 'crop-aspect-43': '4:3', 'crop-aspect-916': '9:16', 'crop-aspect-11': '1:1' }[id]);
 });
 
 bindSeg('crop-off', 'crop-on', function (id) {
-  state.cropEnabled = id === 'crop-on';
+  var enabling = id === 'crop-on';
+  if (!enabling && state.editingCropSection !== null) finishSectionCropEdit(false);
+  state.cropEnabled = enabling;
   if (state.cropEnabled && !state.cropWidth) resetCrop();
+  if (state.cropEnabled) initializeCommittedSectionCrops();
   document.getElementById('crop-controls').style.display = state.cropEnabled ? 'block' : 'none';
-  renderCropOverlay();
+  render();
 });
 
 // Drag inside the box (not on a handle) to move it without resizing.
@@ -710,6 +880,7 @@ cropBox.addEventListener('pointerdown', function (e) {
     var dySource = (ev.clientY - startY) / scaleY;
     state.cropX = clamp(startCropX + dxSource, 0, state.sourceWidth - state.cropWidth);
     state.cropY = clamp(startCropY + dySource, 0, state.sourceHeight - state.cropHeight);
+    syncEditedSectionCrop();
     renderCropOverlay();
   }
   function onUp() {
@@ -767,8 +938,8 @@ cropBox.addEventListener('pointerdown', function (e) {
         newY = hasN ? anchorY - newH : anchorY;
       }
 
-      if (state.cropAspect !== 'free') {
-        var ratio = ASPECT_RATIOS[state.cropAspect];
+      var ratio = effectiveCropRatio();
+      if (ratio) {
         if (hasHorizontal && !hasVertical) {
           // Pure width drag (e/w edge) — derive height from the ratio,
           // symmetric around the vertical center.
@@ -786,14 +957,20 @@ cropBox.addEventListener('pointerdown', function (e) {
         }
       }
 
+      // Keep the crop valid even when a ratio-locked edge drag would
+      // otherwise grow the derived dimension beyond the source frame.
+      if (ratio) {
+        if (newW > state.sourceWidth) { newW = state.sourceWidth; newH = newW / ratio; }
+        if (newH > state.sourceHeight) { newH = state.sourceHeight; newW = newH * ratio; }
+      }
+      newW = clamp(newW, 2, state.sourceWidth);
+      newH = clamp(newH, 2, state.sourceHeight);
       state.cropWidth = newW;
       state.cropHeight = newH;
-      // Re-clamp fully inside the source frame — aspect-locked resizing
-      // (or a symmetric edge-drag expansion) can otherwise push an edge
-      // past it.
       state.cropX = clamp(newX, 0, state.sourceWidth - newW);
       state.cropY = clamp(newY, 0, state.sourceHeight - newH);
 
+      syncEditedSectionCrop();
       renderCropOverlay();
     }
     function onUp() {
@@ -1070,7 +1247,31 @@ function exportClip() {
   // single-clip case, unchanged from before this feature existed) —
   // once multi-section is in play at all, every section, including the
   // last one, needs its own explicit "+ Add Section" click.
-  var sections = state.sections.length > 0 ? state.sections.slice() : [{ inTime: state.inTime, outTime: state.outTime, speed: state.speed }];
+  if (state.editingCropSection !== null) finishSectionCropEdit(false);
+  if (state.cropEnabled) initializeCommittedSectionCrops();
+  var sourceSections = state.sections.length > 0
+    ? state.sections.slice()
+    : [{ inTime: state.inTime, outTime: state.outTime, speed: state.speed, crop: currentCropSnapshot() }];
+  var sections = sourceSections.map(function (s) {
+    var c = state.cropEnabled ? (s.crop || currentCropSnapshot()) : null;
+    var roundedCrop = null;
+    if (c) {
+      var rw = clamp(Math.round(c.width), 2, state.sourceWidth);
+      var rh = clamp(Math.round(c.height), 2, state.sourceHeight);
+      roundedCrop = {
+        x: clamp(Math.round(c.x), 0, state.sourceWidth - rw),
+        y: clamp(Math.round(c.y), 0, state.sourceHeight - rh),
+        width: rw,
+        height: rh
+      };
+    }
+    return {
+      inTime: s.inTime,
+      outTime: s.outTime,
+      speed: s.speed || 1.0,
+      crop: roundedCrop
+    };
+  });
   var params = {
     filePath: init.filePath,
     sections: sections,
@@ -1088,11 +1289,7 @@ function exportClip() {
     subtitleLang: currentSubtitleLang(),
     subtitleExternalFile: currentSubtitleExternalFile(),
     muteAudio: state.muteAudio,
-    useGpu: state.useGpu,
-    cropX: state.cropEnabled ? Math.round(state.cropX) : null,
-    cropY: state.cropEnabled ? Math.round(state.cropY) : null,
-    cropWidth: state.cropEnabled ? Math.round(state.cropWidth) : null,
-    cropHeight: state.cropEnabled ? Math.round(state.cropHeight) : null
+    useGpu: state.useGpu
   };
   setStatus('exporting…', 'busy');
   statusActions.style.display = 'none';
@@ -1200,6 +1397,8 @@ function applyInit(newInit) {
   state.cropY = 0;
   state.cropWidth = 0;
   state.cropHeight = 0;
+  state.editingCropSection = null;
+  state.pendingCropBeforeEdit = null;
   document.getElementById('crop-off').setAttribute('aria-pressed', 'true');
   document.getElementById('crop-on').setAttribute('aria-pressed', 'false');
   document.getElementById('crop-controls').style.display = 'none';

@@ -36,11 +36,25 @@ struct ExportResult {
 
 #[derive(Debug, Deserialize, Clone, Copy)]
 #[serde(rename_all = "camelCase")]
+struct CropRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
 struct SectionParam {
     in_time: f64,
     out_time: f64,
     #[serde(default = "default_speed")]
     speed: f64,
+    // Crop is section-local: every cut can independently pan/zoom while
+    // the frontend keeps a project-wide aspect ratio. None means crop is
+    // disabled for the export.
+    #[serde(default)]
+    crop: Option<CropRect>,
 }
 fn default_speed() -> f64 { 1.0 }
 
@@ -91,17 +105,6 @@ struct ExportParams {
                    // offered for Target-size mode (2-pass hardware support
                    // is far less consistent across encoders/drivers) or
                    // GIF (palette-based, no H.264 encoder involved at all)
-    // Static crop applied uniformly to the whole clip, in SOURCE VIDEO
-    // PIXEL coordinates. All four Some or all four None — the frontend
-    // only ever sends real numbers when crop is enabled, null otherwise.
-    #[serde(default)]
-    crop_x: Option<u32>,
-    #[serde(default)]
-    crop_y: Option<u32>,
-    #[serde(default)]
-    crop_width: Option<u32>,
-    #[serde(default)]
-    crop_height: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,23 +161,18 @@ fn log_command(name: &str, args: &[String], cwd: Option<&std::path::Path>) {
 }
 
 // ---------- export cancellation ----------
-// Tracks the currently-running ffmpeg/ffprobe child process (if any) so
-// a separate cancel_export command can kill it. A single slot is enough:
-// one export runs its ffmpeg steps strictly sequentially, never
-// concurrently, so a new run_bin call simply replaces whatever was here
-// before it. Killing whichever step happens to be running when cancel
-// is pressed is exactly the right behavior — the resulting error
-// naturally aborts the rest of the export sequence via the same ?
-// propagation already used everywhere, no separate cancellation
-// plumbing needed through export_gif/export_mp4/etc.
+// Tracks only the child process that belongs to the active EXPORT job.
+// Metadata probes, subtitle preview preparation, screenshots, etc. use an
+// untracked runner so those background/auxiliary commands can never steal
+// the cancellation slot from a real export.
 struct ExportState {
-    current_child: std::sync::Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
+    current_export_child: std::sync::Mutex<Option<tauri_plugin_shell::process::CommandChild>>,
     cancelled: std::sync::atomic::AtomicBool,
 }
 impl Default for ExportState {
     fn default() -> Self {
         ExportState {
-            current_child: std::sync::Mutex::new(None),
+            current_export_child: std::sync::Mutex::new(None),
             cancelled: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -183,7 +181,7 @@ impl Default for ExportState {
 #[tauri::command]
 fn cancel_export(state: tauri::State<ExportState>) -> Result<(), String> {
     state.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
-    let mut guard = state.current_child.lock().map_err(|e| e.to_string())?;
+    let mut guard = state.current_export_child.lock().map_err(|e| e.to_string())?;
     if let Some(child) = guard.take() {
         child.kill().map_err(|e| e.to_string())?;
     }
@@ -199,7 +197,12 @@ fn cancel_export(state: tauri::State<ExportState>) -> Result<(), String> {
 // are deliberately unchanged from the old .output()-based version, so
 // if this needs adjusting, no other call site in the whole file is
 // affected — every existing caller keeps working exactly as before.
-async fn run_bin(app: &AppHandle, name: &str, args: &[String], cwd: Option<&std::path::Path>) -> Result<Vec<u8>, String> {
+async fn run_bin_impl(
+    app: &AppHandle, name: &str, args: &[String], cwd: Option<&std::path::Path>, track_export: bool,
+) -> Result<Vec<u8>, String> {
+    if track_export && app.state::<ExportState>().cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("cancelled".to_string());
+    }
     log_command(name, args, cwd);
     let sidecar = app
         .shell()
@@ -217,7 +220,9 @@ async fn run_bin(app: &AppHandle, name: &str, args: &[String], cwd: Option<&std:
         .map_err(|e| format!("failed to run {name}: {e}"))?;
 
     let state = app.state::<ExportState>();
-    *state.current_child.lock().map_err(|e| e.to_string())? = Some(child);
+    if track_export {
+        *state.current_export_child.lock().map_err(|e| e.to_string())? = Some(child);
+    }
 
     use tauri_plugin_shell::process::CommandEvent;
     let mut stdout: Vec<u8> = vec![];
@@ -246,23 +251,44 @@ async fn run_bin(app: &AppHandle, name: &str, args: &[String], cwd: Option<&std:
                 exit_success = payload.code == Some(0);
             }
             CommandEvent::Error(err) => {
-                *state.current_child.lock().map_err(|e| e.to_string())? = None;
+                if track_export {
+                    *state.current_export_child.lock().map_err(|e| e.to_string())? = None;
+                }
                 return Err(format!("failed to run {name}: {err}"));
             }
             _ => {}
         }
     }
 
-    let was_cancelled = state.cancelled.swap(false, std::sync::atomic::Ordering::SeqCst);
-    *state.current_child.lock().map_err(|e| e.to_string())? = None;
-    if was_cancelled {
-        return Err("cancelled".to_string());
+    if track_export {
+        let was_cancelled = state.cancelled.swap(false, std::sync::atomic::Ordering::SeqCst);
+        *state.current_export_child.lock().map_err(|e| e.to_string())? = None;
+        if was_cancelled {
+            return Err("cancelled".to_string());
+        }
     }
 
     if !exit_success {
         return Err(String::from_utf8_lossy(&stderr).to_string());
     }
     Ok(stdout)
+}
+
+// Auxiliary commands never participate in export cancellation.
+async fn run_bin(app: &AppHandle, name: &str, args: &[String], cwd: Option<&std::path::Path>) -> Result<Vec<u8>, String> {
+    run_bin_impl(app, name, args, cwd, false).await
+}
+
+// Export commands own the cancellation slot.
+async fn run_export_bin(app: &AppHandle, name: &str, args: &[String], cwd: Option<&std::path::Path>) -> Result<Vec<u8>, String> {
+    run_bin_impl(app, name, args, cwd, true).await
+}
+
+async fn run_bin_for_context(
+    app: &AppHandle, name: &str, args: &[String], cwd: Option<&std::path::Path>, track_export: bool,
+) -> Result<Vec<u8>, String> {
+    if track_export { run_export_bin(app, name, args, cwd).await }
+    else { run_bin(app, name, args, cwd).await }
 }
 
 // ---------- metadata (ffprobe) ----------
@@ -314,7 +340,9 @@ async fn get_video_metadata(app: AppHandle, path: String) -> Result<VideoMetadat
 // extension ourselves regardless, so a stray/wrong one shouldn't double up.
 fn sanitize_filename_stem(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
-    let trimmed = if lower.ends_with(".mp4") || lower.ends_with(".gif") {
+    let trimmed = if lower.ends_with(".apng") {
+        &name[..name.len() - 5]
+    } else if lower.ends_with(".mp4") || lower.ends_with(".gif") {
         &name[..name.len() - 4]
     } else {
         name
@@ -343,16 +371,93 @@ fn expand_tilde(path: &str) -> String {
 }
 
 // ---------- export ----------
-#[tauri::command]
-async fn export_clip(app: AppHandle, params: ExportParams) -> Result<ExportResult, String> {
+fn even_dimension(v: u32) -> u32 {
+    let v = v.max(2);
+    if v % 2 == 0 { v } else { v - 1 }
+}
+
+// Validates section-local transforms before any ffmpeg process starts and
+// returns the common intermediate canvas size used for concatenation.
+// Different crop sizes are allowed (that is the per-section zoom feature),
+// but their aspect ratio must match so normalization never stretches or
+// letterboxes a section. The largest crop becomes the intermediate canvas;
+// smaller crops are scaled up to it, producing the intended visual zoom.
+fn validate_export_params(params: &ExportParams) -> Result<(u32, u32), String> {
     if params.sections.is_empty() {
         return Err("no section to export".into());
     }
-    for s in &params.sections {
-        if s.out_time <= s.in_time {
-            return Err("out point must be after in point".into());
+    if params.source_width == 0 || params.source_height == 0 {
+        return Err("source dimensions are unavailable".into());
+    }
+    if !matches!(params.format.as_str(), "mp4" | "gif" | "apng") {
+        return Err(format!("unsupported output format '{}'", params.format));
+    }
+    if !matches!(params.mode.as_str(), "quality" | "size") {
+        return Err(format!("unsupported optimization mode '{}'", params.mode));
+    }
+    if params.format == "mp4" && params.mode == "quality" && params.crf > 51 {
+        return Err("CRF must be between 0 and 51".into());
+    }
+    if matches!(params.format.as_str(), "gif" | "apng") && (params.gif_fps == 0 || params.gif_fps > 120) {
+        return Err("frame rate must be between 1 and 120".into());
+    }
+    if params.mode == "size" && (!params.target_mb.is_finite() || params.target_mb <= 0.0) {
+        return Err("target size must be greater than 0 MB".into());
+    }
+
+    let any_crop = params.sections.iter().any(|s| s.crop.is_some());
+    let mut project_ratio: Option<f64> = None;
+    let mut largest_crop: Option<CropRect> = None;
+
+    for (i, section) in params.sections.iter().enumerate() {
+        if !section.in_time.is_finite() || !section.out_time.is_finite() || section.in_time < 0.0 || section.out_time <= section.in_time {
+            return Err(format!("section {} has an invalid in/out range", i + 1));
+        }
+        if !section.speed.is_finite() || !(0.25..=4.0).contains(&section.speed) {
+            return Err(format!("section {} speed must be between 0.25x and 4x", i + 1));
+        }
+
+        if any_crop && section.crop.is_none() {
+            return Err(format!("section {} is missing a crop while crop is enabled", i + 1));
+        }
+        if let Some(crop) = section.crop {
+            if crop.width < 2 || crop.height < 2 {
+                return Err(format!("section {} crop is too small", i + 1));
+            }
+            let right = crop.x.checked_add(crop.width).ok_or_else(|| format!("section {} crop is outside the source frame", i + 1))?;
+            let bottom = crop.y.checked_add(crop.height).ok_or_else(|| format!("section {} crop is outside the source frame", i + 1))?;
+            if right > params.source_width || bottom > params.source_height {
+                return Err(format!("section {} crop is outside the source frame", i + 1));
+            }
+
+            let ratio = crop.width as f64 / crop.height as f64;
+            if let Some(expected) = project_ratio {
+                // Integer rounding in the frontend can move an otherwise
+                // exact ratio by a fraction of a percent, so tolerate 1%.
+                if ((ratio - expected) / expected).abs() > 0.01 {
+                    return Err(format!("section {} crop aspect ratio does not match the other sections", i + 1));
+                }
+            } else {
+                project_ratio = Some(ratio);
+            }
+
+            if largest_crop.map(|c| crop.width as u64 * crop.height as u64 > c.width as u64 * c.height as u64).unwrap_or(true) {
+                largest_crop = Some(crop);
+            }
         }
     }
+
+    if let Some(crop) = largest_crop {
+        Ok((even_dimension(crop.width), even_dimension(crop.height)))
+    } else {
+        Ok((params.source_width, params.source_height))
+    }
+}
+
+#[tauri::command]
+async fn export_clip(app: AppHandle, params: ExportParams) -> Result<ExportResult, String> {
+    let (canvas_width, canvas_height) = validate_export_params(&params)?;
+    app.state::<ExportState>().cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
     // Each section's contribution to the final combined duration is its
     // raw range divided by its own speed — a 5s section at 2x plays back
     // in 2.5s, so it only contributes 2.5s toward the total the rest of
@@ -376,8 +481,12 @@ async fn export_clip(app: AppHandle, params: ExportParams) -> Result<ExportResul
         format!("totalDuration={duration}"),
     ];
     for (i, s) in params.sections.iter().enumerate() {
-        log_fields.push(format!("section[{i}]=({}, {}, speed={})", s.in_time, s.out_time, s.speed));
+        let crop_note = s.crop
+            .map(|c| format!(", crop={}x{}+{}+{}", c.width, c.height, c.x, c.y))
+            .unwrap_or_default();
+        log_fields.push(format!("section[{i}]=({}, {}, speed={}{})", s.in_time, s.out_time, s.speed, crop_note));
     }
+    log_fields.push(format!("canvas={}x{}", canvas_width, canvas_height));
     log_command("export_clip params", &log_fields, None);
 
     let output_dir = expand_tilde(&params.output_dir);
@@ -410,50 +519,33 @@ async fn export_clip(app: AppHandle, params: ExportParams) -> Result<ExportResul
         ext
     );
 
-    // Subtitle original_size uses the CROPPED dimensions when crop is
-    // active, not the original source dimensions — subtitles are burned
-    // in after crop in each section's own extraction filter chain (see
-    // extract_and_concat_sections), so they need to be positioned/sized
-    // relative to the frame they're actually being drawn onto, not the
-    // pre-crop source. Subtitle extraction itself now happens per
-    // section (inside extract_and_concat_sections), not once upfront
-    // here — each section needs its own subtitle timestamps rebased to
-    // that section's own start, not the source's original timeline.
-    let (effective_width, effective_height) = match (params.crop_width, params.crop_height) {
-        (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
-        _ => (params.source_width, params.source_height),
-    };
-
     let encoder_used = if params.format == "gif" {
-        export_gif(&app, &params, &out_path, effective_width, effective_height).await?;
+        export_gif(&app, &params, &out_path, canvas_width, canvas_height).await?;
         "gif".to_string()
     } else if params.format == "apng" {
-        export_apng(&app, &params, &out_path, effective_width, effective_height).await?;
+        export_apng(&app, &params, &out_path, canvas_width, canvas_height).await?;
         "apng".to_string()
     } else {
-        export_mp4(&app, &params, duration, &out_path, effective_width, effective_height).await?
+        export_mp4(&app, &params, duration, &out_path, canvas_width, canvas_height).await?
     };
 
     Ok(ExportResult { output_path: out_path, encoder_used })
 }
 
-// Extracts each section separately (crop and, if active, that section's
-// own subtitle range rebased to start at 0 — see extract_subtitles_to's
-// trim parameter — burned in during extraction), then concatenates them
-// via ffmpeg's concat demuxer into one combined file. A single section
+// Extracts each section separately (applying crop and, if active,
+// burning subtitles while both video frames and ASS events are still on
+// the source's original absolute timeline), then concatenates them into
+// one combined file. A single section
 // just returns its own extracted file directly, skipping the concat
 // step since there's nothing to join — this is the same code path for
 // one section or several, not a special case bolted on top.
 //
-// Every section is re-encoded (never stream-copied) for the same
-// frame-accuracy reason already established elsewhere in this file:
-// stream copy can only cut at keyframes, silently shifting the actual
-// requested start. All sections use identical codec settings
-// specifically so the final concat step CAN safely use stream copy
-// (-c copy) — mismatched codecs/parameters across concat inputs is a
-// real way for that step to fail or produce a broken file.
+// Every section is re-encoded (never stream-copied) for frame accuracy:
+// stream copy can only cut at keyframes, silently shifting the requested
+// start. Section geometry and codecs are normalized before the decoded-
+// frame concat filter joins them; that concat stage also re-encodes.
 async fn extract_and_concat_sections(
-    app: &AppHandle, params: &ExportParams, effective_width: u32, effective_height: u32,
+    app: &AppHandle, params: &ExportParams, canvas_width: u32, canvas_height: u32,
     keep_audio: bool, temp_prefix: &str,
 ) -> Result<std::path::PathBuf, String> {
     let mut segment_paths: Vec<std::path::PathBuf> = vec![];
@@ -485,9 +577,12 @@ async fn extract_and_concat_sections(
         if speed_active {
             filters.push(format!("trim=start={}:duration={seg_duration}", section.in_time));
         }
-        if let Some(f) = crop_filter(params.crop_x, params.crop_y, params.crop_width, params.crop_height) {
-            filters.push(f);
-        }
+        let (section_width, section_height) = if let Some(crop) = section.crop {
+            filters.push(format!("crop={}:{}:{}:{}", crop.width, crop.height, crop.x, crop.y));
+            (crop.width, crop.height)
+        } else {
+            (params.source_width, params.source_height)
+        };
         // Set (only when burn_subs is active) to this section's own
         // subtitle temp folder, so subtitle_filter()'s bare filename
         // resolves correctly — see subtitle_filter's own comment for
@@ -497,19 +592,48 @@ async fn extract_and_concat_sections(
         if params.burn_subs {
             let temp_dir = std::env::temp_dir().join(format!("klippit-{temp_prefix}-subs{i}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&temp_dir);
-            // Rebased to THIS section's own start — critical for
-            // multi-section exports: a section starting at, say, 1:00 in
-            // the source needs its subtitle timestamps shifted back to
-            // start at 0, since in the combined output that content
-            // plays starting wherever this section lands after concat,
-            // not at the source's original 1:00 mark.
-            let extracted = extract_subtitles_to(
-                app, &params.file_path, &temp_dir, Some((section.in_time, seg_duration)),
-                params.subtitle_external_file.as_deref(), params.subtitle_lang.as_deref(),
-            ).await?;
-            filters.push(subtitle_filter(&extracted, effective_width, effective_height));
+            // Keep the ASS stream on its ORIGINAL absolute source
+            // timeline here. At the point the subtitles filter runs,
+            // normal-speed sections selected with output-side -ss and
+            // speed-adjusted sections selected with trim still carry
+            // their original source PTS. Rebasing the ASS events to 0
+            // here therefore puts video and subtitles on different
+            // clocks (e.g. video at ~106s while ASS events are ~0s),
+            // which makes dialogue disappear or render at the wrong
+            // time. The section itself is rebased only AFTER subtitle
+            // burn-in (by ffmpeg's output handling for normal sections,
+            // or by setpts for speed-adjusted sections).
+            let extracted = match extract_subtitles_to(
+                app, &params.file_path, &temp_dir, None,
+                params.subtitle_external_file.as_deref(), params.subtitle_lang.as_deref(), true,
+            ).await {
+                Ok(extracted) => extracted,
+                Err(err) => {
+                    let _ = std::fs::remove_dir_all(&temp_dir);
+                    for path in &segment_paths { let _ = std::fs::remove_file(path); }
+                    let _ = std::fs::remove_file(&seg_path);
+                    return Err(err);
+                }
+            };
+            filters.push(subtitle_filter(&extracted, section_width, section_height));
             cwd = Some(temp_dir);
         }
+
+        // Every extracted segment must have identical frame dimensions
+        // before the concat filter can join them. Individual crop sizes
+        // are therefore normalized to one common project canvas here.
+        // This is the actual zoom effect: a smaller crop is enlarged to
+        // the same canvas as a wider crop, never stretched to a different
+        // aspect ratio (validated above before any ffmpeg work begins).
+        if section_width != canvas_width || section_height != canvas_height {
+            filters.push(format!("scale={canvas_width}:{canvas_height}:flags=lanczos"));
+        }
+        // scale may preserve display aspect by changing sample-aspect-ratio
+        // metadata; two differently-sized source crops can therefore end
+        // up with the same WxH but different SAR, which the concat filter
+        // correctly refuses. Normalize every intermediate to square pixels.
+        filters.push("setsar=1".into());
+
         // Speed change goes LAST in the video filter chain, after crop
         // and subtitle burn-in — subtitles get burned in at their
         // normal, correct timing first, then setpts speeds up the whole
@@ -580,9 +704,8 @@ async fn extract_and_concat_sections(
         extract_args.push("-preset".into());
         extract_args.push("veryfast".into());
         if keep_audio {
-            // Every segment re-encoded with identical audio settings —
-            // required for the final concat's stream-copy to work
-            // correctly across segments.
+            // Keep audio codec/settings identical across intermediates so
+            // the decoded-frame concat filter sees consistent streams.
             extract_args.push("-c:a".into());
             extract_args.push("aac".into());
             extract_args.push("-b:a".into());
@@ -594,22 +717,22 @@ async fn extract_and_concat_sections(
         } else {
             extract_args.push("-an".into());
         }
-        // Forces this segment's own timestamps to cleanly rebase to
-        // zero. Without this, "-ss before -i" seeking can leave small
-        // timestamp irregularities (especially around B-frames near the
-        // seek point) that don't reset cleanly — harmless within a
-        // single standalone segment, but the concat step below only
-        // stream-copies raw packets and timestamps (-c copy, chosen for
-        // speed since every segment is already freshly re-encoded here),
-        // so it has no opportunity to fix up a segment that didn't start
-        // clean. That's the likely cause of a real reported symptom:
-        // a stutter/gap exactly at a section boundary, with the
-        // following section's visible playtime feeling short even
-        // though the file's total reported duration matches.
+        // Normalize negative/offset timestamps on each throwaway segment.
+        // The concat filter below re-times decoded frames again, but clean
+        // segment starts make probing and A/V joining more predictable.
         extract_args.push("-avoid_negative_ts".into());
         extract_args.push("make_zero".into());
         extract_args.push(seg_path.to_string_lossy().to_string());
-        run_bin(app, "ffmpeg", &extract_args, cwd.as_deref()).await?;
+        let extract_result = run_export_bin(app, "ffmpeg", &extract_args, cwd.as_deref()).await;
+        // Subtitle/font folders are only needed while this one ffmpeg
+        // process is burning them into the segment. Remove them even on
+        // failure so repeated exports do not accumulate temp directories.
+        if let Some(dir) = &cwd { let _ = std::fs::remove_dir_all(dir); }
+        if let Err(err) = extract_result {
+            for path in &segment_paths { let _ = std::fs::remove_file(path); }
+            let _ = std::fs::remove_file(&seg_path);
+            return Err(err);
+        }
         segment_paths.push(seg_path);
     }
 
@@ -693,14 +816,17 @@ async fn extract_and_concat_sections(
 
     let combined_path = std::env::temp_dir().join(format!("klippit-{temp_prefix}-combined-{}.mkv", std::process::id()));
     concat_args.push(combined_path.to_string_lossy().to_string());
-    let concat_result = run_bin(app, "ffmpeg", &concat_args, None).await;
+    let concat_result = run_export_bin(app, "ffmpeg", &concat_args, None).await;
 
     // Best-effort cleanup of the per-section intermediates regardless of
     // outcome — only the combined file (or the error) matters past this
     // point.
     for p in &segment_paths { let _ = std::fs::remove_file(p); }
 
-    concat_result?;
+    if let Err(err) = concat_result {
+        let _ = std::fs::remove_file(&combined_path);
+        return Err(err);
+    }
     Ok(combined_path)
 }
 
@@ -713,12 +839,6 @@ fn scale_filter(resolution: u32) -> Option<String> {
     Some(format!("scale=-2:{resolution}"))
 }
 
-// Static crop applied uniformly to the whole clip. All four fields are
-// checked together — callers only ever pass all-Some or all-None, but
-// this stays defensive against a partial set rather than assuming that
-// invariant holds. Takes raw values rather than &ExportParams so it's
-// reusable from extract_frame (screenshots), which has its own
-// individual parameters rather than an ExportParams instance.
 // atempo (audio tempo/speed change, pitch-preserving) only accepts
 // 0.5–2.0 per filter instance — chaining multiple instances covers the
 // full 0.25x–4x range this app exposes (e.g. 4.0 becomes two chained
@@ -744,6 +864,8 @@ fn atempo_chain(speed: f64) -> String {
     factors.iter().map(|f| format!("atempo={f:.6}")).collect::<Vec<_>>().join(",")
 }
 
+// Screenshot-only crop helper. Export crops now live on each SectionParam.
+// All four values must be present together; a partial crop is treated as off.
 fn crop_filter(x: Option<u32>, y: Option<u32>, w: Option<u32>, h: Option<u32>) -> Option<String> {
     match (x, y, w, h) {
         (Some(x), Some(y), Some(w), Some(h)) if w > 0 && h > 0 => {
@@ -763,13 +885,16 @@ fn crop_filter(x: Option<u32>, y: Option<u32>, w: Option<u32>, h: Option<u32>) -
 // itself — parsing had already gone wrong on the bracket-heavy path
 // before reaching that option.
 //
-// Timing correctness note: extraction preserves the subtitle stream's
-// original absolute timestamps (no -ss applied during extraction), which
-// is what keeps this correctly in sync with a trimmed, -ss-shifted
-// output — the filter matches its subtitle file's absolute timestamps
-// against frame timing in the graph the same way it would reading
-// straight from the original source, just via a cleanly-named
-// intermediate file instead of the messy original path.
+// Timing correctness note: section export deliberately preserves the
+// subtitle stream's original absolute timestamps (no -ss/-t applied to
+// the ASS itself). When the subtitles filter runs, the selected video
+// frames are still on that same source timeline: output-side -ss does
+// not renumber filter-graph PTS, and trim selects a range without
+// rebasing it. The section is rebased only after subtitles have already
+// been burned into the pixels. Keeping both sides absolute at the burn
+// stage is therefore required for sync. Screenshot extraction is a
+// separate zero-based seek path and may still request a trimmed/rebased
+// ASS via extract_subtitles_to's `trim` parameter.
 fn subtitle_filter(extracted: &ExtractedSubtitles, source_width: u32, source_height: u32) -> String {
     // Fourth attempt at the Windows drive-letter-colon problem in
     // ffmpeg's subtitles filter, and this one has actual evidence behind
@@ -798,11 +923,12 @@ fn subtitle_filter(extracted: &ExtractedSubtitles, source_width: u32, source_hei
     let filename = extracted.ass_path.file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| "subs.ass".to_string());
-    // fontsdir intentionally still dropped: it was implicated in the
-    // same class of error and hasn't been re-verified since. Tradeoff:
-    // burned-in text may render in a system fallback font instead of
-    // the exact embedded one if that font isn't already installed.
-    let mut filter = format!("subtitles=filename={filename}");
+    // The ffmpeg process runs with the subtitle temp folder as cwd, and
+    // embedded fonts are extracted into that same folder. A relative
+    // fontsdir therefore avoids the Windows drive-letter escaping problem
+    // entirely while making export match the libass preview much more
+    // closely for fansubs that bundle custom fonts.
+    let mut filter = format!("subtitles=filename={filename}:fontsdir=.");
     // Explicitly telling the filter the source's real resolution avoids a
     // separate real bug hit in testing: ffmpeg's auto-detection of this
     // can fail ("Unable to parse 'original_size' option value '0x0'")
@@ -903,8 +1029,10 @@ async fn encode_quality_mode(
             args.extend(audio_args.clone());
             if let Some(f) = vf { args.push("-vf".into()); args.push(f.to_string()); }
             args.push(out_path.into());
-            if run_bin(app, "ffmpeg", &args, None).await.is_ok() {
-                return Ok((*encoder).to_string());
+            match run_export_bin(app, "ffmpeg", &args, None).await {
+                Ok(_) => return Ok((*encoder).to_string()),
+                Err(e) if e == "cancelled" => return Err(e),
+                Err(_) => {}
             }
             // This specific hardware encoder isn't available or failed
             // for some other reason — move on to the next one, or to
@@ -925,7 +1053,7 @@ async fn encode_quality_mode(
     args.extend(audio_args);
     if let Some(f) = vf { args.push("-vf".into()); args.push(f.to_string()); }
     args.push(out_path.into());
-    run_bin(app, "ffmpeg", &args, None).await?;
+    run_export_bin(app, "ffmpeg", &args, None).await?;
     Ok("libx264".to_string())
 }
 
@@ -959,7 +1087,7 @@ async fn run_ffmpeg_2pass(
     if let Some(f) = vf { pass1.push("-vf".into()); pass1.push(f.into()); }
     #[cfg(windows)] pass1.push("NUL".into());
     #[cfg(not(windows))] pass1.push("/dev/null".into());
-    run_bin(app, "ffmpeg", &pass1, None).await?;
+    run_export_bin(app, "ffmpeg", &pass1, None).await?;
 
     let mut pass2: Vec<String> = vec![
         "-y".into(), "-ss".into(), start.to_string(), "-i".into(), input.into(),
@@ -975,7 +1103,7 @@ async fn run_ffmpeg_2pass(
     }
     if let Some(f) = vf { pass2.push("-vf".into()); pass2.push(f.into()); }
     pass2.push(out_path.into());
-    let result = run_bin(app, "ffmpeg", &pass2, None).await.map(|_| ());
+    let result = run_export_bin(app, "ffmpeg", &pass2, None).await.map(|_| ());
 
     // Best-effort cleanup — leftover pass-log files in the temp dir are
     // harmless either way, so a failed removal here doesn't fail the export.
@@ -1037,13 +1165,13 @@ async fn encode_gif_attempt(app: &AppHandle, segment_path: &str, width: u32, fps
     let base = format!("fps={fps},scale={width}:-2:flags=lanczos");
     let palette = format!("{out_path}.palette.png");
 
-    run_bin(app, "ffmpeg", &[
+    run_export_bin(app, "ffmpeg", &[
         "-y".into(), "-i".into(), segment_path.to_string(),
         "-vf".into(), format!("{base},palettegen"),
         palette.clone(),
     ], None).await?;
 
-    run_bin(app, "ffmpeg", &[
+    run_export_bin(app, "ffmpeg", &[
         "-y".into(), "-i".into(), segment_path.to_string(),
         "-i".into(), palette.clone(),
         "-lavfi".into(), format!("{base}[x];[x][1:v]paletteuse=dither=bayer"),
@@ -1092,7 +1220,7 @@ async fn encode_apng_attempt(app: &AppHandle, segment_path: &str, width: u32, fp
     // -plays 0 loops forever, matching GIF's default looping behavior.
     // No palette step at all, unlike GIF — PNG doesn't have an 8-bit/
     // 256-color ceiling, so this is one direct pass.
-    run_bin(app, "ffmpeg", &[
+    run_export_bin(app, "ffmpeg", &[
         "-y".into(), "-i".into(), segment_path.to_string(),
         "-vf".into(), format!("fps={fps},scale={width}:-2:flags=lanczos"),
         "-plays".into(), "0".into(),
@@ -1138,7 +1266,7 @@ async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, o
         let _ = std::fs::remove_dir_all(&temp_dir);
         let extracted = extract_subtitles_to(
             &app, &path, &temp_dir, Some((at, 1.0)),
-            subtitle_external_file.as_deref(), subtitle_lang.as_deref(),
+            subtitle_external_file.as_deref(), subtitle_lang.as_deref(), false,
         ).await?;
         let mut shot_filters: Vec<String> = vec![];
         if let Some(f) = &crop { shot_filters.push(f.clone()); }
@@ -1151,7 +1279,9 @@ async fn extract_frame(app: AppHandle, path: String, at: f64, burn_subs: bool, o
         args.push(f.clone());
     }
     args.push(out_path.clone());
-    run_bin(&app, "ffmpeg", &args, cwd.as_deref()).await?;
+    let shot_result = run_bin(&app, "ffmpeg", &args, cwd.as_deref()).await;
+    if let Some(dir) = &cwd { let _ = std::fs::remove_dir_all(dir); }
+    shot_result?;
     Ok(out_path)
 }
 
@@ -1176,42 +1306,25 @@ struct SubtitlePreviewData {
 // extracted path sidesteps the whole class of problem regardless of how
 // messy the source filename is.
 //
-// Absolute subtitle timestamps are preserved (no -ss during extraction),
-// matching the same assumption documented on the old direct-file
-// approach: burning in against a file whose subtitle timestamps still
-// match the original absolute timeline stays correctly synced with a
-// trimmed, -ss-shifted output.
+// Section exports preserve absolute subtitle timestamps (no trim here),
+// because the subtitles filter sees source-timeline video PTS at burn-in.
+// The zero-based screenshot fallback is the one caller that requests a
+// trimmed/rebased ASS file explicitly; see `trim` below.
 //
-// STATUS: the attachment-dumping command construction here (multiple
-// -dump_attachment:INDEX flags batched into one ffmpeg call) is written
-// from documented ffmpeg wiki patterns, not yet confirmed against a real
-// run — if font extraction silently returns nothing, that command is the
-// first place to check by running it manually in a terminal.
+// Embedded-font attachment extraction has been confirmed against real MKV
+// files. The exported fonts live beside subs.ass and are exposed to libass
+// through `fontsdir=.` in subtitle_filter().
 struct ExtractedSubtitles {
     ass_path: std::path::PathBuf,
     font_paths: Vec<std::path::PathBuf>,
 }
 
-// `trim`: Some((in_time, duration)) for export/screenshot use — extracts
-// only that window, with output-side -ss/-t (subtitle streams are tiny,
-// so accuracy costs nothing here) so the extracted file's own timestamps
-// rebase to start near zero exactly like the main video's frames do
-// under the encode step's input-side -ss. Without this, a real timing
-// bug showed up: burned-in subtitles were completely out of sync,
-// because the subtitle filter was comparing the video's rebased-to-zero
-// frame times against the subtitle file's original absolute timestamps.
-// None for the live preview overlay, which shows the whole file, not a
-// trimmed segment, so no rebasing is needed or wanted there.
-// `trim`: Some((in_time, duration)) for export/screenshot use — extracts
-// only that window, with output-side -ss/-t (subtitle streams are tiny,
-// so accuracy costs nothing here) so the extracted file's own timestamps
-// rebase to start near zero exactly like the main video's frames do
-// under the encode step's input-side -ss. Without this, a real timing
-// bug showed up: burned-in subtitles were completely out of sync,
-// because the subtitle filter was comparing the video's rebased-to-zero
-// frame times against the subtitle file's original absolute timestamps.
-// None for the live preview overlay, which shows the whole file, not a
-// trimmed segment, so no rebasing is needed or wanted there.
+// `trim`: optional manual ASS timestamp rebasing for callers whose VIDEO
+// timeline is also zero-based before the subtitle filter runs. Today that
+// is the screenshot fallback only. Section export MUST pass None: its
+// video frames still carry absolute source PTS at subtitle burn-in, so
+// rebasing ASS events there would put the two clocks out of sync.
+// Live preview also passes None because it covers the full source timeline.
 //
 // `external_file`: if the player has an externally-loaded subtitle file
 // active (not embedded in the video container — e.g. VLC's "Add
@@ -1249,20 +1362,12 @@ fn format_ass_time(total_seconds: f64) -> String {
     format!("{h}:{m:02}:{sec:05.2}")
 }
 
-// Shifts every Dialogue line's Start/End timestamps by -offset_seconds,
-// rewriting the file in place. Necessary because ffmpeg's own "-ss"/"-t"
-// output-seeking trim does NOT rebase an .ass subtitle stream's own
-// embedded Dialogue timestamps to start at 0 the way it does for
-// video/audio packet timestamps — .ass stores each event's timing as
-// literal text within the line itself (Dialogue: 0,0:01:46.05,...), not
-// as container-level packet timestamps, so ffmpeg's trim only filters
-// which lines make it into the output without rewriting their text.
-// Confirmed as the actual cause of a real "export succeeds, no subtitles
-// appear" bug via real ffmpeg command logs: the extracted .ass file kept
-// its ORIGINAL, un-shifted times (e.g. still ~106s into the source),
-// while the video segment it was burned onto had already been rebased
-// to start at 0 and was only ~5.7s long — the subtitle timing pointed at
-// a moment in the segment's non-existent future and simply never arrived.
+// Shifts Dialogue Start/End timestamps by -offset_seconds and clips the
+// event set to the requested window. ASS timings are literal text fields,
+// not packet timestamps, so ffmpeg seeking does not rewrite them for us.
+// IMPORTANT: use this only when the corresponding video timeline is also
+// zero-based at subtitle burn-in (currently the screenshot fallback).
+// Section export deliberately keeps the ASS timeline absolute instead.
 fn shift_ass_timestamps(ass_path: &std::path::Path, offset_seconds: f64, duration: f64) -> Result<(), String> {
     let content = std::fs::read_to_string(ass_path).map_err(|e| e.to_string())?;
     let mut out = String::with_capacity(content.len());
@@ -1314,7 +1419,7 @@ fn shift_ass_timestamps(ass_path: &std::path::Path, offset_seconds: f64, duratio
 
 async fn extract_subtitles_to(
     app: &AppHandle, path: &str, temp_dir: &std::path::Path, trim: Option<(f64, f64)>,
-    external_file: Option<&str>, preferred_lang: Option<&str>,
+    external_file: Option<&str>, preferred_lang: Option<&str>, track_export: bool,
 ) -> Result<ExtractedSubtitles, String> {
     std::fs::create_dir_all(temp_dir).map_err(|e| e.to_string())?;
     let ass_path = temp_dir.join("subs.ass");
@@ -1332,7 +1437,7 @@ async fn extract_subtitles_to(
             "-c:s".into(), "ass".into(),
             ass_path.to_string_lossy().to_string(),
         ];
-        run_bin(app, "ffmpeg", &extract_args, None).await?;
+        run_bin_for_context(app, "ffmpeg", &extract_args, None, track_export).await?;
         if let Some((in_time, duration)) = trim {
             shift_ass_timestamps(&ass_path, in_time, duration)?;
         }
@@ -1344,13 +1449,13 @@ async fn extract_subtitles_to(
     // No external file — search the container's own subtitle streams,
     // preferring one whose language tag matches what the player reported
     // as active, falling back to the first one found.
-    let stream_probe = run_bin(app, "ffprobe", &[
+    let stream_probe = run_bin_for_context(app, "ffprobe", &[
         "-v".into(), "error".into(),
         "-select_streams".into(), "s".into(),
         "-show_entries".into(), "stream=index:stream_tags=language".into(),
         "-of".into(), "csv=p=0".into(),
         path.to_string(),
-    ], None).await?;
+    ], None, track_export).await?;
 
     let mut matched_index: Option<u32> = None;
     let mut first_index: Option<u32> = None;
@@ -1386,10 +1491,9 @@ async fn extract_subtitles_to(
     // Extracts the FULL, untrimmed subtitle stream — no -ss/-t here.
     // See shift_ass_timestamps' own comment for why ffmpeg's own
     // "-ss"/"-t" trim can't be trusted to rebase an .ass file's embedded
-    // Dialogue timestamps to start at 0 (it doesn't — confirmed via real
-    // command logs from a genuine "export succeeds, no subtitles appear"
-    // bug). Timestamps are shifted manually afterward instead, once, on
-    // the extracted file.
+    // Dialogue timestamps to start at 0. Manual shifting is therefore done
+    // only for callers that explicitly request `trim`; section export passes
+    // None and keeps these absolute timestamps intact.
     let extract_args: Vec<String> = vec![
         "-y".into(), "-i".into(), path.to_string(),
         "-map".into(), format!("0:{sub_index}"),
@@ -1397,28 +1501,29 @@ async fn extract_subtitles_to(
         ass_path.to_string_lossy().to_string(),
     ];
 
-    // Font extraction is independent of the ASS extraction below —
-    // neither reads the other's output, both just read from the same
-    // source file and write to different destinations — so it's spawned
-    // as a separate task to run concurrently rather than waiting for ASS
-    // extraction to finish first. Low risk: no shared mutable state
-    // between them, and font extraction was already best-effort before
-    // this change (a failure here was already swallowed silently),
-    // which is preserved — this task's own errors are simply treated as
-    // "no fonts found" the same way they already were.
-    let font_app = app.clone();
-    let font_path = path.to_string();
-    let font_temp_dir = temp_dir.to_path_buf();
-    let font_task = tauri::async_runtime::spawn(async move {
-        extract_fonts(&font_app, &font_path, &font_temp_dir).await
-    });
+    // Preview preparation may run font extraction concurrently for speed,
+    // because auxiliary commands do not own the export cancellation slot.
+    // During a real export we intentionally keep ASS/font extraction
+    // sequential. ASS conversion is tracked/cancellable; font extraction
+    // stays auxiliary because it is best-effort and short-lived, so it can
+    // never overwrite or consume the export cancellation state.
+    let font_paths = if track_export {
+        run_bin_for_context(app, "ffmpeg", &extract_args, None, true).await?;
+        extract_fonts(app, path, temp_dir, false).await
+    } else {
+        let font_app = app.clone();
+        let font_path = path.to_string();
+        let font_temp_dir = temp_dir.to_path_buf();
+        let font_task = tauri::async_runtime::spawn(async move {
+            extract_fonts(&font_app, &font_path, &font_temp_dir, false).await
+        });
+        run_bin_for_context(app, "ffmpeg", &extract_args, None, false).await?;
+        font_task.await.unwrap_or_default()
+    };
 
-    run_bin(app, "ffmpeg", &extract_args, None).await?;
     if let Some((in_time, duration)) = trim {
         shift_ass_timestamps(&ass_path, in_time, duration)?;
     }
-
-    let font_paths = font_task.await.unwrap_or_default();
 
     Ok(ExtractedSubtitles { ass_path, font_paths })
 }
@@ -1430,14 +1535,14 @@ async fn extract_subtitles_to(
 // than propagating an error, since a file with no fonts (or fonts
 // already present on the system) still works fine, just with less
 // accurate font matching.
-async fn extract_fonts(app: &AppHandle, path: &str, temp_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let font_probe = match run_bin(app, "ffprobe", &[
+async fn extract_fonts(app: &AppHandle, path: &str, temp_dir: &std::path::Path, track_export: bool) -> Vec<std::path::PathBuf> {
+    let font_probe = match run_bin_for_context(app, "ffprobe", &[
         "-v".into(), "error".into(),
         "-select_streams".into(), "t".into(),
         "-show_entries".into(), "stream=index:stream_tags=filename".into(),
         "-of".into(), "csv=p=0".into(),
         path.to_string(),
-    ], None).await {
+    ], None, track_export).await {
         Ok(out) => out,
         Err(_) => return vec![],
     };
@@ -1465,7 +1570,7 @@ async fn extract_fonts(app: &AppHandle, path: &str, temp_dir: &std::path::Path) 
         dump_args.push("-f".into());
         dump_args.push("null".into());
         dump_args.push("-".into());
-        let _ = run_bin(app, "ffmpeg", &dump_args, None).await; // best-effort
+        let _ = run_bin_for_context(app, "ffmpeg", &dump_args, None, track_export).await; // best-effort
         for p in pending {
             if p.exists() {
                 font_paths.push(p);
@@ -1489,7 +1594,7 @@ async fn extract_subtitles_for_preview(app: AppHandle, path: String, subtitle_la
     let _ = std::fs::remove_dir_all(&temp_dir);
     let extracted = extract_subtitles_to(
         &app, &path, &temp_dir, None,
-        subtitle_external_file.as_deref(), subtitle_lang.as_deref(),
+        subtitle_external_file.as_deref(), subtitle_lang.as_deref(), false,
     ).await?;
     // Forward slashes, not whatever PathBuf naturally formats as — same
     // fix as subtitle_filter() in the export path and for the same

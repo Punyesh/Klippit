@@ -15,7 +15,7 @@ points on the spot, export, done.
   clipping.
 - **Explicit Mark In / Mark Out** — scrub or frame-step to the exact
   frame, then mark it. No dragging tiny handles, no guessing.
-- **MP4 or GIF export**, each with two modes:
+- **MP4, GIF, or APNG export**, with Quality and Target-size workflows:
   - **Quality** — pick a CRF value, keep the source resolution or scale
     down.
   - **Target size** — give it a size in MB, it 2-pass encodes to hit
@@ -25,6 +25,11 @@ points on the spot, export, done.
   overlay you can toggle on/off while editing.
 - **Screenshots**, with or without subtitles, matching whatever the live
   preview is currently showing.
+- **Multi-section clips** — combine several source ranges into one export,
+  with independent speed and crop/framing for each section.
+- **Per-section crop/zoom** — keep one project-wide aspect ratio while each
+  section can pan and zoom independently; Klippit normalizes the sections
+  automatically before joining them.
 - **Mute audio** option for MP4 exports.
 - Frame-accurate stepping (`,` / `.`, or the on-screen buttons), a full
   keyboard-driven workflow (`I` / `O` to mark, `Space` to play/pause,
@@ -58,9 +63,12 @@ Once Klippit is open:
 1. Scrub, play, or frame-step (`,` / `.`) to your starting frame, then
    click **Mark In** (or press `I`).
 2. Do the same for your ending frame, then **Mark Out** (or press `O`).
-3. Choose MP4 or GIF, Quality or Target-size mode, resolution, subtitles,
-   and audio as needed.
-4. **Export** (or press `Enter`).
+3. For a multi-section clip, click **+ Add Section** after each range. Each
+   committed section keeps its own speed and crop; use its **Crop** button
+   to revisit the framing later.
+4. Choose MP4, GIF, or APNG, Quality or Target-size mode, resolution,
+   subtitles, crop/aspect ratio, and audio as needed.
+5. **Export** (or press `Enter`).
 
 Screenshots: the camera button captures a still at the current frame,
 matching whatever the subtitle preview toggle (the "CC" button) is
