@@ -2229,6 +2229,7 @@ fn main() {
             recorder::recorder_diagnostics,
             recorder::get_unsaved_recording,
             recorder::save_unsaved_recording,
+            recorder::acknowledge_exported_recording,
             recorder::discard_unsaved_recording,
             recorder::find_recoverable_recording,
             recorder::reopen_unsaved_recording

@@ -29,6 +29,7 @@ var init = window.__KLIPPIT_INIT__ || {
 };
 
 var tempRecordingPending = !!init.temporaryRecording;
+var tempRecordingRangeInitialized = false;
 var recordingCloseBypass = false;
 
 var state = {
@@ -103,6 +104,32 @@ var previewWrap = document.getElementById('preview-wrap');
 
 // ---------- helpers ----------
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+function initializeTemporaryRecordingRange() {
+  if (!tempRecordingPending || tempRecordingRangeInitialized || !state.duration) return;
+  // A freshly recorded clip is already the thing the user wanted to capture.
+  // Unlike a normal file/mpv handoff, default to the ENTIRE recording instead
+  // of Klippit's usual 3-second starter range. That makes an immediate export
+  // a true save/export of the untouched take.
+  state.inTime = 0;
+  state.outTime = state.duration;
+  tempRecordingRangeInitialized = true;
+}
+
+function temporaryRecordingHasContentEdits() {
+  if (!tempRecordingPending) return false;
+  if (state.sections.length > 0) return true;
+  var tolerance = Math.max(0.05, 1.5 / Math.max(1, state.fps || 24));
+  if (Math.abs(state.inTime) > tolerance) return true;
+  if (state.duration > 0 && Math.abs(state.outTime - state.duration) > tolerance) return true;
+  if (Math.abs((state.speed || 1) - 1) > 0.0001) return true;
+  if (state.cropEnabled) return true;
+  if (state.burnSubs) return true;
+  // Silent recordings are automatically represented as muted internally; that
+  // is source metadata, not a user edit. Only count mute when audio existed.
+  if (state.sourceHasAudio && state.muteAudio) return true;
+  return false;
+}
 
 function fmtTime(t) {
   var m = Math.floor(t / 60);
@@ -1132,6 +1159,7 @@ function loadMetadata() {
   if (!init.filePath || !window.__TAURI__) return; // dev preview mode, no real source / no backend
   window.__TAURI__.core.invoke('get_video_metadata', { path: init.filePath }).then(function (meta) {
     state.duration = meta.duration;
+    initializeTemporaryRecordingRange();
     state.fps = meta.fps || state.fps;
     state.sourceWidth = meta.width || 0;
     state.sourceHeight = meta.height || 0;
@@ -1484,7 +1512,27 @@ function exportClip() {
     setStatus('done' + note + ' — ' + path, 'done');
     lastExportedPath = path;
     statusActions.style.display = 'flex';
-    if (tempRecordingPending) showRecordingExportPrompt();
+    if (tempRecordingPending) {
+      var contentEdited = temporaryRecordingHasContentEdits();
+      if (contentEdited) {
+        showRecordingExportPrompt(true);
+      } else if (state.format === 'mp4') {
+        // A full-length, otherwise untouched MP4 export is the user's saved
+        // recording. Do not ask them to separately save/delete the temporary
+        // source after they have just saved it once already.
+        return acknowledgeUntouchedRecordingExport().catch(function (e) {
+          console.log('[klippit] could not settle untouched recording after export:', e);
+          // Fallback conservatively: keep the original pending rather than
+          // silently losing the user's recording if bookkeeping failed.
+          showRecordingExportPrompt(false);
+        });
+      } else {
+        // GIF/APNG are derived formats even without timeline edits (and drop
+        // audio), so keep the original-retention decision, but don't call the
+        // result an "edited clip" when nothing was edited.
+        showRecordingExportPrompt(false);
+      }
+    }
   }).catch(function (err) {
     // The Rust side returns the plain string "cancelled" specifically
     // for this case (see run_bin/cancel_export) — distinct from a
@@ -1545,6 +1593,7 @@ function applyInit(newInit) {
   }
   init = newInit || init;
   tempRecordingPending = !!init.temporaryRecording;
+  tempRecordingRangeInitialized = !tempRecordingPending;
   var tempBanner = document.getElementById('recording-temp-banner');
   if (tempBanner) tempBanner.style.display = tempRecordingPending ? 'flex' : 'none';
   document.getElementById('source-name').textContent = init.fileName;
@@ -1710,6 +1759,7 @@ setTimeout(function setUpDragDrop() {
 
 video.addEventListener('loadedmetadata', function () {
   state.duration = video.duration || 0;
+  initializeTemporaryRecordingRange();
   video.currentTime = state.inTime;
   render();
   renderCropOverlay();
@@ -1842,8 +1892,19 @@ if (recordingNewSave) recordingNewSave.onclick = function () {
   });
 };
 
-function showRecordingExportPrompt() {
-  if (recordingExportModal) recordingExportModal.style.display = 'flex';
+function showRecordingExportPrompt(edited) {
+  if (!recordingExportModal) return;
+  var title = recordingExportModal.querySelector('.recording-modal-title');
+  if (title) title.textContent = edited ? 'Edited clip exported' : 'Export complete';
+  recordingExportModal.style.display = 'flex';
+}
+function acknowledgeUntouchedRecordingExport() {
+  if (!window.__TAURI__ || !tempRecordingPending) return Promise.resolve();
+  return window.__TAURI__.core.invoke('acknowledge_exported_recording').then(function () {
+    tempRecordingPending = false;
+    init.temporaryRecording = false;
+    if (tempRecordingBanner) tempRecordingBanner.style.display = 'none';
+  });
 }
 function hideRecordingExportPrompt() {
   if (recordingExportModal) recordingExportModal.style.display = 'none';

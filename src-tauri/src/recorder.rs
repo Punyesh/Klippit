@@ -950,7 +950,11 @@ pub fn shutdown_for_app_exit(app: &AppHandle, state: &RecorderState) {
         { let _ = active.native.finish(); }
         for handle in active.audio_threads.drain(..) { let _ = handle.join(); }
     }
-    if let Ok(mut inner) = state.inner.lock() { stop_native_capture(&mut inner); }
+    let settled_dir = if let Ok(mut inner) = state.inner.lock() {
+        stop_native_capture(&mut inner);
+        if inner.unsaved_recording.is_none() { inner.unsaved_dir.take() } else { None }
+    } else { None };
+    if let Some(dir) = settled_dir { let _ = fs::remove_dir_all(dir); }
     close_recorder_windows(app);
 }
 
@@ -1058,6 +1062,22 @@ pub fn save_unsaved_recording(state:tauri::State<'_,RecorderState>,destination:S
     if let Some(dir)=&i.unsaved_dir { let _=fs::write(dir.join(".saved"), b"saved"); }
     i.unsaved_recording=None;
     Ok(dst.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn acknowledge_exported_recording(state:tauri::State<'_,RecorderState>)->Result<(),String>{
+    let mut i=state.inner.lock().map_err(|e|e.to_string())?;
+    if i.unsaved_recording.is_none() { return Ok(()); }
+    // The editor exported the untouched full recording to a user-chosen path.
+    // Mark this temp session as settled but keep its working directory alive
+    // while Chromium is still previewing the source. It is removed on the
+    // next recorder launch or normal app shutdown. The marker also prevents
+    // crash recovery from resurrecting an already-saved take.
+    if let Some(dir)=&i.unsaved_dir {
+        fs::write(dir.join(".saved"), b"exported").map_err(|e|format!("could not mark recording as saved: {e}"))?;
+    }
+    i.unsaved_recording=None;
+    Ok(())
 }
 
 #[tauri::command]

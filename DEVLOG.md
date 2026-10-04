@@ -1978,3 +1978,9 @@ check that crate's current docs for the exact call shape.
 - Editor-side Discard now immediately reopens the recorder after deleting the temporary source.
 - Remember the last recorder rectangle across Stop/Close so returning from the editor restores the prior capture area.
 - Main toolbar recorder control now includes the text label `Record` beside a slightly larger icon.
+
+
+## 2026-10-04 - v1.3.3 untouched recording export fix
+- Fresh screen recordings now default to the full recorded duration rather than the normal 3-second clip starter range.
+- Post-export original-recording prompt appears only when the recording content was actually changed (trim/sections/speed/crop/subtitle burn-in/audio mute).
+- Exporting an untouched recording now settles the temporary original automatically and suppresses later unsaved-original prompts.
