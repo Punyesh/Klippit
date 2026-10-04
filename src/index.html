@@ -9,7 +9,7 @@
 <div id="app">
 
   <div id="head">
-    <div class="brand"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><line x1="7" y1="4" x2="7" y2="20"/><line x1="7" y1="12" x2="18" y2="4"/><line x1="7" y1="12" x2="18" y2="20"/></svg></div>
+    <button id="record-btn" title="Record screen" aria-label="Record screen"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="14" rx="2.5"/><circle cx="12" cy="12" r="3.2" fill="currentColor" stroke="none"/></svg><span>Record</span></button>
     <div class="source-name" id="source-name" title="">no file loaded</div>
     <button id="settings-btn" title="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
   </div>
@@ -40,6 +40,50 @@
   <div id="setup-warning" style="display:none">
     <span id="setup-warning-text"></span>
     <button id="setup-warning-dismiss" title="Dismiss">&times;</button>
+  </div>
+
+  <div id="recording-temp-banner" style="display:none">
+    <span><strong>Temporary screen recording.</strong> Export your edit normally, save the original, or discard this recording.</span>
+    <div class="recording-temp-actions">
+      <button id="discard-recording-btn">Discard recording</button>
+      <button id="save-recording-original-btn">Save original…</button>
+    </div>
+  </div>
+
+  <div id="recording-new-modal" style="display:none">
+    <div class="recording-modal-panel">
+      <div class="recording-modal-title">Start another recording?</div>
+      <div class="recording-modal-copy">The current screen recording is still temporary. Save it or discard it before starting a new recording.</div>
+      <div class="recording-modal-actions">
+        <button class="btn secondary" id="recording-new-cancel">Cancel</button>
+        <button class="btn secondary" id="recording-new-discard">Discard &amp; Record New</button>
+        <button class="btn" id="recording-new-save">Save Original &amp; Record New</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="recording-close-modal" style="display:none">
+    <div id="recording-close-panel">
+      <div class="recording-modal-title">Unsaved screen recording</div>
+      <div class="recording-modal-copy">The original recording is still temporary. Save it, discard it, or return to Klippit.</div>
+      <div class="recording-modal-actions">
+        <button class="btn secondary" id="recording-close-cancel">Cancel</button>
+        <button class="btn secondary" id="recording-close-discard">Discard &amp; Close</button>
+        <button class="btn" id="recording-close-save">Save Original &amp; Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="recording-export-modal" style="display:none">
+    <div class="recording-modal-panel">
+      <div class="recording-modal-title">Edited clip exported</div>
+      <div class="recording-modal-copy">What should Klippit do with the original screen recording?</div>
+      <div class="recording-modal-actions">
+        <button class="btn secondary" id="recording-export-later">Decide later</button>
+        <button class="btn secondary" id="recording-export-delete">Delete original &amp; close</button>
+        <button class="btn" id="recording-export-keep">Save original…</button>
+      </div>
+    </div>
   </div>
 
   <div id="body-row">
@@ -141,7 +185,7 @@
       <button class="seg-btn" id="subs-off" aria-pressed="true">Off</button>
       <button class="seg-btn" id="subs-on" aria-pressed="false">Burn in</button>
     </div>
-    <div class="frame-time" id="subs-status" style="text-align:left;margin-top:4px"></div>
+    <div class="subtitle-status" id="subs-status"></div>
 
     <div class="compact-toggles-grid">
       <div id="audio-field">
@@ -160,13 +204,19 @@
       </div>
     </div>
     <div id="crop-controls" style="display:none">
-      <div class="seg-group" role="group" aria-label="Crop aspect ratio" style="margin-top:6px">
+      <div id="crop-edit-status" class="crop-edit-status"></div>
+      <div class="crop-control-heading">
+        <span>Output aspect</span>
+        <span>all sections</span>
+      </div>
+      <div class="seg-group" role="group" aria-label="Output crop aspect ratio">
         <button class="seg-btn" id="crop-aspect-free" aria-pressed="true" style="flex:1">Free</button>
         <button class="seg-btn" id="crop-aspect-169" style="flex:1">16:9</button>
         <button class="seg-btn" id="crop-aspect-43" style="flex:1">4:3</button>
         <button class="seg-btn" id="crop-aspect-916" style="flex:1">9:16</button>
         <button class="seg-btn" id="crop-aspect-11" style="flex:1">1:1</button>
       </div>
+      <div id="crop-project-aspect" class="crop-project-aspect"></div>
       <div id="crop-reset-row">
         <span id="crop-size-readout"></span>
         <button id="crop-reset-btn">Reset</button>
@@ -234,9 +284,9 @@
     <div class="row">
       <div class="field">
         <label for="output-filename">Filename</label>
-        <div style="display:flex; align-items:center; gap:4px">
+        <div id="output-name-wrap">
           <input class="input" type="text" id="output-filename" />
-          <span class="frame-time" id="output-ext" style="margin:0; white-space:nowrap"></span>
+          <span class="frame-time" id="output-ext"></span>
         </div>
       </div>
     </div>
@@ -253,6 +303,14 @@
       <button class="btn secondary" id="reveal-btn">Show in folder</button>
       <button class="btn secondary" id="play-btn">Play</button>
     </div>
+  </div>
+
+  <div id="export-progress-row" aria-hidden="true">
+    <span id="export-progress-stage">Preparing</span>
+    <div id="export-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div id="export-progress-fill"></div>
+    </div>
+    <span id="export-progress-percent">0%</span>
   </div>
 
   <div id="export-row">

@@ -20,8 +20,12 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod recorder;
+#[cfg(windows)]
+mod native_capture;
+
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tauri_plugin_shell::ShellExt;
 
 #[derive(Debug, Serialize)]
@@ -32,6 +36,37 @@ struct ExportResult {
     // the frontend tell the person whether GPU encoding they opted into
     // actually happened, or silently fell back to the CPU encoder.
     encoder_used: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportProgressPayload {
+    percent: f64,
+    label: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExportProgressSpan {
+    start_percent: f64,
+    end_percent: f64,
+    duration_seconds: f64,
+    label: String,
+}
+
+fn export_progress_span(start_percent: f64, end_percent: f64, duration_seconds: f64, label: impl Into<String>) -> ExportProgressSpan {
+    ExportProgressSpan {
+        start_percent,
+        end_percent,
+        duration_seconds: duration_seconds.max(0.001),
+        label: label.into(),
+    }
+}
+
+fn emit_export_progress(app: &AppHandle, percent: f64, label: impl Into<String>) {
+    let _ = app.emit("export-progress", ExportProgressPayload {
+        percent: percent.clamp(0.0, 100.0),
+        label: label.into(),
+    });
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -57,6 +92,7 @@ struct SectionParam {
     crop: Option<CropRect>,
 }
 fn default_speed() -> f64 { 1.0 }
+fn default_true_bool() -> bool { true }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,6 +131,9 @@ struct ExportParams {
                                              // externally-loaded subtitle file, not
                                              // embedded in the container) takes
                                              // priority over lang matching when set
+    #[serde(default = "default_true_bool")]
+    source_has_audio: bool, // metadata from ffprobe; screen recordings with
+                            // audio capture disabled legitimately have no audio stream
     #[serde(default)]
     mute_audio: bool, // strip audio entirely (-an) rather than encoding it;
                        // meaningless for GIF (never has audio), UI hides the
@@ -113,6 +152,7 @@ struct VideoMetadata {
     duration: f64,
     fps: f64,
     has_subtitles: bool,
+    has_audio: bool,
     width: u32,
     height: u32,
 }
@@ -199,11 +239,23 @@ fn cancel_export(state: tauri::State<ExportState>) -> Result<(), String> {
 // affected — every existing caller keeps working exactly as before.
 async fn run_bin_impl(
     app: &AppHandle, name: &str, args: &[String], cwd: Option<&std::path::Path>, track_export: bool,
+    progress: Option<ExportProgressSpan>,
 ) -> Result<Vec<u8>, String> {
     if track_export && app.state::<ExportState>().cancelled.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("cancelled".to_string());
     }
-    log_command(name, args, cwd);
+    // `-progress pipe:1` gives machine-readable key=value updates on stdout.
+    // Only export ffmpeg commands that were given a progress span opt into it;
+    // ffprobe and auxiliary ffmpeg calls keep their stdout semantics unchanged.
+    let mut run_args = args.to_vec();
+    if name == "ffmpeg" && progress.is_some() {
+        run_args.splice(0..0, [
+            "-progress".to_string(), "pipe:1".to_string(),
+            "-nostats".to_string(),
+        ]);
+    }
+
+    log_command(name, &run_args, cwd);
     let sidecar = app
         .shell()
         .sidecar(name)
@@ -215,7 +267,7 @@ async fn run_bin_impl(
     };
 
     let (mut rx, child) = sidecar
-        .args(args)
+        .args(&run_args)
         .spawn()
         .map_err(|e| format!("failed to run {name}: {e}"))?;
 
@@ -228,6 +280,11 @@ async fn run_bin_impl(
     let mut stdout: Vec<u8> = vec![];
     let mut stderr: Vec<u8> = vec![];
     let mut exit_success = false;
+    let mut last_progress_percent = progress.as_ref().map(|p| p.start_percent).unwrap_or(0.0);
+
+    if let Some(p) = &progress {
+        emit_export_progress(app, p.start_percent, p.label.clone());
+    }
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -245,7 +302,27 @@ async fn run_bin_impl(
             // regardless of crop, exactly as reported. .output() never
             // had this problem since it always returned the complete,
             // untouched byte stream in one piece.
-            CommandEvent::Stdout(line) => { stdout.extend_from_slice(&line); stdout.push(b'\n'); }
+            CommandEvent::Stdout(line) => {
+                if let Some(p) = &progress {
+                    // FFmpeg's progress protocol emits `out_time_us=<microseconds>`.
+                    // Map that media timestamp into this command's slice of the overall
+                    // export bar. Throttle tiny changes to avoid flooding the webview.
+                    if let Ok(text) = std::str::from_utf8(&line) {
+                        if let Some(raw) = text.trim().strip_prefix("out_time_us=") {
+                            if let Ok(us) = raw.parse::<f64>() {
+                                let fraction = (us / 1_000_000.0 / p.duration_seconds).clamp(0.0, 1.0);
+                                let percent = p.start_percent + (p.end_percent - p.start_percent) * fraction;
+                                if percent >= last_progress_percent + 0.2 {
+                                    last_progress_percent = percent;
+                                    emit_export_progress(app, percent, p.label.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                stdout.extend_from_slice(&line);
+                stdout.push(b'\n');
+            }
             CommandEvent::Stderr(line) => { stderr.extend_from_slice(&line); stderr.push(b'\n'); }
             CommandEvent::Terminated(payload) => {
                 exit_success = payload.code == Some(0);
@@ -271,17 +348,26 @@ async fn run_bin_impl(
     if !exit_success {
         return Err(String::from_utf8_lossy(&stderr).to_string());
     }
+    if let Some(p) = &progress {
+        emit_export_progress(app, p.end_percent, p.label.clone());
+    }
     Ok(stdout)
 }
 
 // Auxiliary commands never participate in export cancellation.
 async fn run_bin(app: &AppHandle, name: &str, args: &[String], cwd: Option<&std::path::Path>) -> Result<Vec<u8>, String> {
-    run_bin_impl(app, name, args, cwd, false).await
+    run_bin_impl(app, name, args, cwd, false, None).await
 }
 
 // Export commands own the cancellation slot.
 async fn run_export_bin(app: &AppHandle, name: &str, args: &[String], cwd: Option<&std::path::Path>) -> Result<Vec<u8>, String> {
-    run_bin_impl(app, name, args, cwd, true).await
+    run_bin_impl(app, name, args, cwd, true, None).await
+}
+
+async fn run_export_ffmpeg_progress(
+    app: &AppHandle, args: &[String], cwd: Option<&std::path::Path>, progress: ExportProgressSpan,
+) -> Result<Vec<u8>, String> {
+    run_bin_impl(app, "ffmpeg", args, cwd, true, Some(progress)).await
 }
 
 async fn run_bin_for_context(
@@ -305,6 +391,7 @@ async fn get_video_metadata(app: AppHandle, path: String) -> Result<VideoMetadat
     let mut duration = 0.0;
     let mut fps = 24.0;
     let mut has_subtitles = false;
+    let mut has_audio = false;
     let mut width = 0u32;
     let mut height = 0u32;
 
@@ -320,6 +407,8 @@ async fn get_video_metadata(app: AppHandle, path: String) -> Result<VideoMetadat
             }
         } else if line.contains("codec_type=subtitle") {
             has_subtitles = true;
+        } else if line.contains("codec_type=audio") {
+            has_audio = true;
         } else if let Some(v) = line.strip_prefix("width=") {
             // Only the first video stream's width/height — a file with an
             // attached cover-art image (itself reported as a "video"
@@ -332,7 +421,7 @@ async fn get_video_metadata(app: AppHandle, path: String) -> Result<VideoMetadat
         }
     }
 
-    Ok(VideoMetadata { duration, fps, has_subtitles, width, height })
+    Ok(VideoMetadata { duration, fps, has_subtitles, has_audio, width, height })
 }
 
 // Strips characters Windows won't allow in a filename, and drops a
@@ -458,6 +547,7 @@ fn validate_export_params(params: &ExportParams) -> Result<(u32, u32), String> {
 async fn export_clip(app: AppHandle, params: ExportParams) -> Result<ExportResult, String> {
     let (canvas_width, canvas_height) = validate_export_params(&params)?;
     app.state::<ExportState>().cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
+    emit_export_progress(&app, 0.0, "Preparing export");
     // Each section's contribution to the final combined duration is its
     // raw range divided by its own speed — a 5s section at 2x plays back
     // in 2.5s, so it only contributes 2.5s toward the total the rest of
@@ -520,15 +610,16 @@ async fn export_clip(app: AppHandle, params: ExportParams) -> Result<ExportResul
     );
 
     let encoder_used = if params.format == "gif" {
-        export_gif(&app, &params, &out_path, canvas_width, canvas_height).await?;
+        export_gif(&app, &params, &out_path, canvas_width, canvas_height, duration).await?;
         "gif".to_string()
     } else if params.format == "apng" {
-        export_apng(&app, &params, &out_path, canvas_width, canvas_height).await?;
+        export_apng(&app, &params, &out_path, canvas_width, canvas_height, duration).await?;
         "apng".to_string()
     } else {
         export_mp4(&app, &params, duration, &out_path, canvas_width, canvas_height).await?
     };
 
+    emit_export_progress(&app, 100.0, "Export complete");
     Ok(ExportResult { output_path: out_path, encoder_used })
 }
 
@@ -546,9 +637,21 @@ async fn export_clip(app: AppHandle, params: ExportParams) -> Result<ExportResul
 // frame concat filter joins them; that concat stage also re-encodes.
 async fn extract_and_concat_sections(
     app: &AppHandle, params: &ExportParams, canvas_width: u32, canvas_height: u32,
-    keep_audio: bool, temp_prefix: &str,
+    keep_audio: bool, temp_prefix: &str, progress_start: f64, progress_end: f64,
 ) -> Result<std::path::PathBuf, String> {
     let mut segment_paths: Vec<std::path::PathBuf> = vec![];
+    let section_count = params.sections.len().max(1);
+    let total_output_duration: f64 = params.sections.iter()
+        .map(|s| (s.out_time - s.in_time) / s.speed)
+        .sum::<f64>()
+        .max(0.001);
+    let span = (progress_end - progress_start).max(0.0);
+    let extraction_end = if params.sections.len() > 1 {
+        progress_start + span * 0.85
+    } else {
+        progress_end
+    };
+    let mut extracted_output_duration = 0.0f64;
 
     for (i, section) in params.sections.iter().enumerate() {
         let seg_duration = section.out_time - section.in_time;
@@ -723,7 +826,23 @@ async fn extract_and_concat_sections(
         extract_args.push("-avoid_negative_ts".into());
         extract_args.push("make_zero".into());
         extract_args.push(seg_path.to_string_lossy().to_string());
-        let extract_result = run_export_bin(app, "ffmpeg", &extract_args, cwd.as_deref()).await;
+        let section_output_duration = (seg_duration / section.speed).max(0.001);
+        let section_progress_start = progress_start
+            + (extraction_end - progress_start) * (extracted_output_duration / total_output_duration);
+        let section_progress_end = progress_start
+            + (extraction_end - progress_start)
+                * ((extracted_output_duration + section_output_duration) / total_output_duration);
+        let extract_result = run_export_ffmpeg_progress(
+            app,
+            &extract_args,
+            cwd.as_deref(),
+            export_progress_span(
+                section_progress_start,
+                section_progress_end,
+                section_output_duration,
+                format!("Encoding section {}/{}", i + 1, section_count),
+            ),
+        ).await;
         // Subtitle/font folders are only needed while this one ffmpeg
         // process is burning them into the segment. Remove them even on
         // failure so repeated exports do not accumulate temp directories.
@@ -734,6 +853,7 @@ async fn extract_and_concat_sections(
             return Err(err);
         }
         segment_paths.push(seg_path);
+        extracted_output_duration += section_output_duration;
     }
 
     if segment_paths.len() == 1 {
@@ -816,7 +936,12 @@ async fn extract_and_concat_sections(
 
     let combined_path = std::env::temp_dir().join(format!("klippit-{temp_prefix}-combined-{}.mkv", std::process::id()));
     concat_args.push(combined_path.to_string_lossy().to_string());
-    let concat_result = run_export_bin(app, "ffmpeg", &concat_args, None).await;
+    let concat_result = run_export_ffmpeg_progress(
+        app,
+        &concat_args,
+        None,
+        export_progress_span(extraction_end, progress_end, total_output_duration, "Joining sections"),
+    ).await;
 
     // Best-effort cleanup of the per-section intermediates regardless of
     // outcome — only the combined file (or the error) matters past this
@@ -940,7 +1065,12 @@ fn subtitle_filter(extracted: &ExtractedSubtitles, source_width: u32, source_hei
 }
 
 async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_path: &str, effective_width: u32, effective_height: u32) -> Result<String, String> {
-    let combined_path = extract_and_concat_sections(app, params, effective_width, effective_height, !params.mute_audio, "mp4").await?;
+    // A source can legitimately have no audio stream at all (notably a
+    // screen recording made with both audio toggles Off). Treat that the
+    // same as Mute internally so section extraction and final encoding never
+    // reference a non-existent `[a]` stream.
+    let mute_audio = params.mute_audio || !params.source_has_audio;
+    let combined_path = extract_and_concat_sections(app, params, effective_width, effective_height, !mute_audio, "mp4", 0.0, 55.0).await?;
     let combined_path_str = combined_path.to_string_lossy().to_string();
 
     // Crop and subtitles are already baked into combined_path (applied
@@ -959,13 +1089,13 @@ async fn export_mp4(app: &AppHandle, params: &ExportParams, duration: f64, out_p
         // whole bitrate budget to video instead. GPU encoding isn't
         // offered here — see the note on use_gpu in ExportParams.
         let target_bits = params.target_mb * 8_000_000.0;
-        let audio_kbps = if params.mute_audio { 0.0 } else { 128.0 };
+        let audio_kbps = if mute_audio { 0.0 } else { 128.0 };
         let video_kbps = ((target_bits / duration / 1000.0) - audio_kbps).max(200.0);
 
-        run_ffmpeg_2pass(app, &combined_path_str, 0.0, duration, vf.as_deref(), video_kbps, audio_kbps, out_path, params.mute_audio).await
+        run_ffmpeg_2pass(app, &combined_path_str, 0.0, duration, vf.as_deref(), video_kbps, audio_kbps, out_path, mute_audio, 55.0, 100.0).await
             .map(|_| "libx264".to_string())
     } else {
-        encode_quality_mode(app, params, &combined_path_str, 0.0, duration, vf.as_deref(), out_path).await
+        encode_quality_mode(app, params, &combined_path_str, 0.0, duration, vf.as_deref(), out_path, mute_audio, 55.0, 100.0).await
     };
 
     let _ = std::fs::remove_file(&combined_path);
@@ -1006,10 +1136,10 @@ fn gpu_quality_args(encoder: &str, crf: u32) -> Vec<String> {
 
 async fn encode_quality_mode(
     app: &AppHandle, params: &ExportParams, input: &str, start: f64, duration: f64, vf: Option<&str>,
-    out_path: &str,
+    out_path: &str, mute_audio: bool, progress_start: f64, progress_end: f64,
 ) -> Result<String, String> {
     let mut audio_args: Vec<String> = vec![];
-    if params.mute_audio {
+    if mute_audio {
         audio_args.push("-an".into());
     } else {
         audio_args.push("-c:a".into()); audio_args.push("aac".into());
@@ -1029,7 +1159,10 @@ async fn encode_quality_mode(
             args.extend(audio_args.clone());
             if let Some(f) = vf { args.push("-vf".into()); args.push(f.to_string()); }
             args.push(out_path.into());
-            match run_export_bin(app, "ffmpeg", &args, None).await {
+            match run_export_ffmpeg_progress(
+                app, &args, None,
+                export_progress_span(progress_start, progress_end, duration, format!("Encoding MP4 ({encoder})")),
+            ).await {
                 Ok(_) => return Ok((*encoder).to_string()),
                 Err(e) if e == "cancelled" => return Err(e),
                 Err(_) => {}
@@ -1053,14 +1186,17 @@ async fn encode_quality_mode(
     args.extend(audio_args);
     if let Some(f) = vf { args.push("-vf".into()); args.push(f.to_string()); }
     args.push(out_path.into());
-    run_export_bin(app, "ffmpeg", &args, None).await?;
+    run_export_ffmpeg_progress(
+        app, &args, None,
+        export_progress_span(progress_start, progress_end, duration, "Encoding MP4"),
+    ).await?;
     Ok("libx264".to_string())
 }
 
 async fn run_ffmpeg_2pass(
     app: &AppHandle, input: &str, start: f64, duration: f64, vf: Option<&str>,
     video_kbps: f64, audio_kbps: f64, out_path: &str,
-    mute_audio: bool,
+    mute_audio: bool, progress_start: f64, progress_end: f64,
 ) -> Result<(), String> {
     let bitrate = format!("{}k", video_kbps as u64);
     let audio = format!("{}k", audio_kbps as u64);
@@ -1087,7 +1223,11 @@ async fn run_ffmpeg_2pass(
     if let Some(f) = vf { pass1.push("-vf".into()); pass1.push(f.into()); }
     #[cfg(windows)] pass1.push("NUL".into());
     #[cfg(not(windows))] pass1.push("/dev/null".into());
-    run_export_bin(app, "ffmpeg", &pass1, None).await?;
+    let midpoint = progress_start + (progress_end - progress_start) * 0.5;
+    run_export_ffmpeg_progress(
+        app, &pass1, None,
+        export_progress_span(progress_start, midpoint, duration, "MP4 pass 1/2"),
+    ).await?;
 
     let mut pass2: Vec<String> = vec![
         "-y".into(), "-ss".into(), start.to_string(), "-i".into(), input.into(),
@@ -1103,7 +1243,10 @@ async fn run_ffmpeg_2pass(
     }
     if let Some(f) = vf { pass2.push("-vf".into()); pass2.push(f.into()); }
     pass2.push(out_path.into());
-    let result = run_export_bin(app, "ffmpeg", &pass2, None).await.map(|_| ());
+    let result = run_export_ffmpeg_progress(
+        app, &pass2, None,
+        export_progress_span(midpoint, progress_end, duration, "MP4 pass 2/2"),
+    ).await.map(|_| ());
 
     // Best-effort cleanup — leftover pass-log files in the temp dir are
     // harmless either way, so a failed removal here doesn't fail the export.
@@ -1113,7 +1256,7 @@ async fn run_ffmpeg_2pass(
     result
 }
 
-async fn export_gif(app: &AppHandle, params: &ExportParams, out_path: &str, effective_width: u32, effective_height: u32) -> Result<(), String> {
+async fn export_gif(app: &AppHandle, params: &ExportParams, out_path: &str, effective_width: u32, effective_height: u32, duration: f64) -> Result<(), String> {
     // Extraction (each section, crop/subtitles baked in per-section, then
     // concatenated if there's more than one) happens once here, rather
     // than re-seeking into the original source for every single
@@ -1126,7 +1269,7 @@ async fn export_gif(app: &AppHandle, params: &ExportParams, out_path: &str, effe
     // cost exactly once no matter how many GIF passes follow, since
     // every subsequent pass reads from this small file starting at
     // position 0 — no seeking needed there at all.
-    let combined_path = extract_and_concat_sections(app, params, effective_width, effective_height, false, "gif").await?;
+    let combined_path = extract_and_concat_sections(app, params, effective_width, effective_height, false, "gif", 0.0, 55.0).await?;
     let segment_path = combined_path.to_string_lossy().to_string();
 
     // Two-pass palette gen/use — same technique as the wasm version, just
@@ -1140,7 +1283,11 @@ async fn export_gif(app: &AppHandle, params: &ExportParams, out_path: &str, effe
 
     let mut result = Ok(());
     for attempt in 0..3 {
-        result = encode_gif_attempt(app, &segment_path, width, fps, out_path).await;
+        let attempts = if params.mode == "size" { 3.0 } else { 1.0 };
+        let attempt_width = 45.0 / attempts;
+        let attempt_start = 55.0 + attempt_width * attempt as f64;
+        let attempt_end = attempt_start + attempt_width;
+        result = encode_gif_attempt(app, &segment_path, width, fps, out_path, duration, attempt_start, attempt_end).await;
         if result.is_err() || params.mode != "size" { break; }
 
         let size_mb = std::fs::metadata(out_path).map(|m| m.len() as f64 / 1_000_000.0).unwrap_or(0.0);
@@ -1156,7 +1303,10 @@ async fn export_gif(app: &AppHandle, params: &ExportParams, out_path: &str, effe
     result
 }
 
-async fn encode_gif_attempt(app: &AppHandle, segment_path: &str, width: u32, fps: u32, out_path: &str) -> Result<(), String> {
+async fn encode_gif_attempt(
+    app: &AppHandle, segment_path: &str, width: u32, fps: u32, out_path: &str,
+    duration: f64, progress_start: f64, progress_end: f64,
+) -> Result<(), String> {
     // No seeking, no subtitle filter, no cwd needed here anymore — all
     // of that already happened once in export_gif's upfront extraction.
     // segment_path is a small, already-trimmed, already-subtitled file
@@ -1165,30 +1315,31 @@ async fn encode_gif_attempt(app: &AppHandle, segment_path: &str, width: u32, fps
     let base = format!("fps={fps},scale={width}:-2:flags=lanczos");
     let palette = format!("{out_path}.palette.png");
 
-    run_export_bin(app, "ffmpeg", &[
+    let midpoint = progress_start + (progress_end - progress_start) * 0.5;
+    run_export_ffmpeg_progress(app, &[
         "-y".into(), "-i".into(), segment_path.to_string(),
         "-vf".into(), format!("{base},palettegen"),
         palette.clone(),
-    ], None).await?;
+    ], None, export_progress_span(progress_start, midpoint, duration, "Building GIF palette")).await?;
 
-    run_export_bin(app, "ffmpeg", &[
+    run_export_ffmpeg_progress(app, &[
         "-y".into(), "-i".into(), segment_path.to_string(),
         "-i".into(), palette.clone(),
         "-lavfi".into(), format!("{base}[x];[x][1:v]paletteuse=dither=bayer"),
         out_path.into(),
-    ], None).await?;
+    ], None, export_progress_span(midpoint, progress_end, duration, "Encoding GIF")).await?;
 
     let _ = std::fs::remove_file(&palette);
     Ok(())
 }
 
-async fn export_apng(app: &AppHandle, params: &ExportParams, out_path: &str, effective_width: u32, effective_height: u32) -> Result<(), String> {
+async fn export_apng(app: &AppHandle, params: &ExportParams, out_path: &str, effective_width: u32, effective_height: u32, duration: f64) -> Result<(), String> {
     // Same extract-once (per section, then concatenated if more than
     // one) approach as GIF and for the same reason, but simpler: APNG
     // needs no palette generation at all, so a retry here is just one
     // direct ffmpeg call against the already-extracted segment, not
     // GIF's two-pass palettegen/paletteuse dance.
-    let combined_path = extract_and_concat_sections(app, params, effective_width, effective_height, false, "apng").await?;
+    let combined_path = extract_and_concat_sections(app, params, effective_width, effective_height, false, "apng", 0.0, 55.0).await?;
     let segment_path = combined_path.to_string_lossy().to_string();
 
     // APNG is lossless — there's no CRF-equivalent quality knob the way
@@ -1203,7 +1354,11 @@ async fn export_apng(app: &AppHandle, params: &ExportParams, out_path: &str, eff
 
     let mut result = Ok(());
     for attempt in 0..3 {
-        result = encode_apng_attempt(app, &segment_path, width, fps, out_path).await;
+        let attempts = if params.mode == "size" { 3.0 } else { 1.0 };
+        let attempt_width = 45.0 / attempts;
+        let attempt_start = 55.0 + attempt_width * attempt as f64;
+        let attempt_end = attempt_start + attempt_width;
+        result = encode_apng_attempt(app, &segment_path, width, fps, out_path, duration, attempt_start, attempt_end).await;
         if result.is_err() || params.mode != "size" { break; }
 
         let size_mb = std::fs::metadata(out_path).map(|m| m.len() as f64 / 1_000_000.0).unwrap_or(0.0);
@@ -1216,16 +1371,19 @@ async fn export_apng(app: &AppHandle, params: &ExportParams, out_path: &str, eff
     result
 }
 
-async fn encode_apng_attempt(app: &AppHandle, segment_path: &str, width: u32, fps: u32, out_path: &str) -> Result<(), String> {
+async fn encode_apng_attempt(
+    app: &AppHandle, segment_path: &str, width: u32, fps: u32, out_path: &str,
+    duration: f64, progress_start: f64, progress_end: f64,
+) -> Result<(), String> {
     // -plays 0 loops forever, matching GIF's default looping behavior.
     // No palette step at all, unlike GIF — PNG doesn't have an 8-bit/
     // 256-color ceiling, so this is one direct pass.
-    run_export_bin(app, "ffmpeg", &[
+    run_export_ffmpeg_progress(app, &[
         "-y".into(), "-i".into(), segment_path.to_string(),
         "-vf".into(), format!("fps={fps},scale={width}:-2:flags=lanczos"),
         "-plays".into(), "0".into(),
         out_path.into(),
-    ], None).await?;
+    ], None, export_progress_span(progress_start, progress_end, duration, "Encoding APNG")).await?;
     Ok(())
 }
 
@@ -1939,7 +2097,42 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                // F9/F10/F11 are registered only while the recorder window is
+                // open, so Klippit does not reserve them system-wide at idle.
+                .with_handler(|app, shortcut, event| {
+                    if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        match shortcut.to_string().as_str() {
+                            "F9" => recorder::emit_hotkey(app, "toggle"),
+                            "F10" => recorder::emit_hotkey(app, "stop"),
+                            "F11" => recorder::emit_hotkey(app, "discard"),
+                            _ => {}
+                        }
+                    }
+                })
+                .build(),
+        )
         .manage(ExportState::default())
+        .manage(recorder::RecorderState::default())
+        // Own the main-window shutdown path natively. This prevents hidden
+        // recorder windows or plugin event-loop state from keeping Klippit
+        // alive after the user closes the main window. The only time close is
+        // blocked is when a finalized temporary recording still needs an
+        // explicit Save / Discard / Cancel decision.
+        .on_window_event(|window, event| {
+            if window.label() != "main" { return; }
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let state = window.state::<recorder::RecorderState>();
+                if recorder::has_unsaved_recording(&state) {
+                    api.prevent_close();
+                    let _ = window.emit("recording-close-requested", ());
+                } else {
+                    recorder::shutdown_for_app_exit(window.app_handle(), &state);
+                    window.app_handle().exit(0);
+                }
+            }
+        })
         .setup(move |app| {
             // The window is built here programmatically, rather than
             // declared in tauri.conf.json, specifically so
@@ -2021,7 +2214,24 @@ fn main() {
             open_review_window,
             get_settings,
             save_settings_and_reinstall,
-            cancel_export
+            cancel_export,
+            recorder::open_recorder,
+            recorder::recorder_sync_controls,
+            recorder::recorder_set_config,
+            recorder::recorder_start,
+            recorder::recorder_pause,
+            recorder::recorder_resume,
+            recorder::recorder_stop,
+            recorder::recorder_discard,
+            recorder::recorder_close,
+            recorder::recorder_status,
+            recorder::recorder_log_path,
+            recorder::recorder_diagnostics,
+            recorder::get_unsaved_recording,
+            recorder::save_unsaved_recording,
+            recorder::discard_unsaved_recording,
+            recorder::find_recoverable_recording,
+            recorder::reopen_unsaved_recording
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

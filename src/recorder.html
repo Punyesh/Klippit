@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Klippit Screen Recorder</title>
+<style>
+:root{
+  --bg:#0b0c0e;--panel:#16171a;--panel2:#1c1e22;--line:#2b2e33;
+  --text:#e7e9ec;--dim:#7d828a;--red:#e0342c;--redDim:#401512;
+  --mono:"JetBrains Mono","SFMono-Regular",Consolas,Menlo,monospace;
+  --sans:"Segoe UI",system-ui,-apple-system,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;background:var(--panel);color:var(--text);font-family:var(--sans);overflow:hidden;user-select:none;font-size:11px}
+button,select{font:inherit}
+#bar{height:30px;display:flex;align-items:center;padding:0 8px;border-bottom:1px solid var(--line);background:var(--panel2);cursor:move}
+#brand-icon{width:16px;height:16px;display:flex;align-items:center;justify-content:center;margin-right:6px;color:var(--red);opacity:.9}
+.title{font:600 10px var(--mono);letter-spacing:.055em;text-transform:uppercase;color:#c8cbd0}.spacer{flex:1}.x{width:26px;height:22px;border:0;background:transparent;color:var(--dim);font-size:16px;cursor:pointer;border-radius:2px}.x:hover{background:var(--redDim);color:var(--text)}
+#content{position:relative;padding:10px 11px 8px;height:calc(100% - 30px)}
+#live-panel{height:42px;display:flex;align-items:center;padding:0 7px;margin-bottom:8px;border-bottom:1px solid var(--line)}
+.state-dot{width:7px;height:7px;border-radius:50%;background:#737881;margin-right:7px;flex:0 0 auto}
+.recstate{font:700 10px var(--mono);letter-spacing:.075em;min-width:72px}
+#elapsed{font:600 20px var(--mono);margin-left:12px;letter-spacing:.02em}
+.stats{margin-left:auto;color:#747982;font:9px var(--mono);text-align:right;line-height:1.3;white-space:nowrap}
+body.recording .state-dot{background:var(--red);box-shadow:0 0 0 2px rgba(224,52,44,.14)}body.recording .recstate{color:#ef5d56}
+body.paused .state-dot{background:transparent;border:1px solid var(--red)}body.paused .recstate{color:#c78681}
+body.starting .state-dot,body.finalizing .state-dot{background:var(--red);animation:pulse 1s infinite}
+@keyframes pulse{50%{opacity:.28}}
+.actions{height:34px;display:flex;align-items:center;gap:6px;margin:0 2px 8px}
+.btn{height:30px;min-width:82px;padding:0 12px;border:1px solid var(--line);border-radius:2px;background:var(--bg);color:#cfd2d6;font-size:10px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:6px}
+.btn:hover{border-color:#555961;color:var(--text);background:#17191d}.btn.primary{min-width:108px;border-color:#63312d;color:#ead3d1;background:#1b1110}.btn.primary:hover{border-color:var(--red);color:var(--text);background:var(--redDim)}.btn.stop{min-width:72px}.btn.danger{min-width:0;padding:0 8px;color:#777c84;background:transparent;border-color:transparent}.btn.danger:hover{color:#e36e68;border-color:#4a2623;background:#1c1110}.btn:disabled{opacity:.3;cursor:default;background:#111215;border-color:#25272b}.btn.hidden{display:none}
+body.recording .btn.primary{border-color:#69302c;background:#261210;color:#f0d8d6}body.paused .btn.primary{border-color:#59302d;background:#211312;color:#e2cac8}
+#footer{height:25px;display:flex;align-items:center;margin:0 2px;color:#626770;font:8px var(--mono)}
+#settings-toggle,#details-toggle{height:23px;padding:0 7px;border:1px solid transparent;border-radius:2px;background:transparent;color:#747982;cursor:pointer;font-size:9px;display:inline-flex;align-items:center;gap:5px}
+#settings-toggle:hover,#details-toggle:hover{border-color:var(--line);background:#121316;color:#c7cbd0}
+#settings-arrow{font-size:8px;color:#696e76}
+#hotkeys{margin-left:auto;white-space:nowrap;color:#555a62}
+#message-row{display:none;height:25px;align-items:center;gap:5px;margin:-2px 2px 3px;border-top:1px solid #3a2426;color:#b98f8c;font-size:9px;min-width:0}
+#message-row.show{display:flex}#message{min-width:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.popover{display:none;position:absolute;z-index:10;background:#121316;border:1px solid #373a40;border-radius:3px;box-shadow:0 10px 30px rgba(0,0,0,.42)}.popover.show{display:block}
+#settings-panel{left:11px;bottom:35px;width:390px;padding:9px}
+.popover-title{font:600 9px var(--mono);color:#838891;text-transform:uppercase;letter-spacing:.07em;margin:0 0 7px}
+.settings-grid{display:grid;grid-template-columns:.7fr 1.4fr .9fr;gap:6px;margin-bottom:7px}.field label{display:block;color:#666b73;font:600 8px var(--mono);margin-bottom:3px;text-transform:uppercase;letter-spacing:.06em}.field select{width:100%;height:26px;background:var(--bg);border:1px solid var(--line);border-radius:2px;color:var(--text);font-size:10px;padding:0 6px;outline:none}.field select:focus{border-color:#68413d}
+.toggles{display:flex;gap:5px}.toggle{height:25px;flex:1;border:1px solid var(--line);background:var(--bg);color:#7d828a;border-radius:2px;font-size:9px;cursor:pointer}.toggle:hover:not(:disabled){border-color:#464a51;color:#c4c8ce}.toggle.on{border-color:#55302d;background:#211311;color:#dfc8c6}.toggle.on::before{content:'● ';color:var(--red);font-size:7px}.toggle:disabled,.field select:disabled{opacity:.38;cursor:default}
+#diagnostics-panel{right:11px;bottom:35px;padding:7px;min-width:230px}.diagnostics-actions{display:flex;gap:4px}.diagbtn{height:24px;padding:0 7px;border:1px solid var(--line);border-radius:2px;background:var(--bg);color:var(--dim);font-size:8px;cursor:pointer;white-space:nowrap}.diagbtn:hover{color:var(--text);border-color:#555961}
+</style>
+</head>
+<body>
+<div id="bar">
+  <span id="brand-icon" aria-hidden="true"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/></svg></span>
+  <span class="title">Klippit Recorder</span><span class="spacer"></span><button class="x" id="close" title="Close recorder">×</button>
+</div>
+<div id="content">
+  <div id="live-panel">
+    <span class="state-dot"></span><span id="state" class="recstate">READY</span>
+    <span id="elapsed">00:00:00</span><span id="stats" class="stats">60 FPS · H.264<br>0 dropped</span>
+  </div>
+
+  <div class="actions">
+    <button class="btn primary" id="primary"><span id="primary-icon">●</span><span id="primary-label">Start</span></button>
+    <button class="btn stop hidden" id="stop" disabled><span>■</span><span>Stop</span></button>
+    <button class="btn danger hidden" id="discard"><span id="discard-label">Discard</span></button>
+  </div>
+
+  <div id="message-row"><div id="message"></div><button id="details-toggle" title="Recorder diagnostics">Details</button></div>
+
+  <div id="footer">
+    <button id="settings-toggle" aria-expanded="false"><span>Settings</span><span id="settings-arrow">▸</span></button>
+    <span id="hotkeys">F9 Start/Pause &nbsp;·&nbsp; F10 Stop &nbsp;·&nbsp; F11 Discard</span>
+  </div>
+
+  <div id="settings-panel" class="popover">
+    <div class="popover-title">Recording settings</div>
+    <div class="settings-grid">
+      <div class="field"><label>FPS</label><select id="fps"><option>24</option><option>30</option><option selected>60</option><option>120</option></select></div>
+      <div class="field"><label>Codec</label><select id="codec"><option value="auto" selected>Auto · H.264</option><option value="h264">H.264</option><option value="hevc">HEVC</option></select></div>
+      <div class="field"><label>Quality</label><select id="quality"><option value="high" selected>High</option><option value="balanced">Balanced</option><option value="small">Small</option></select></div>
+    </div>
+    <div class="toggles"><button class="toggle on" id="cursor">Cursor</button><button class="toggle" id="system">System audio</button><button class="toggle" id="mic">Microphone</button></div>
+  </div>
+
+  <div id="diagnostics-panel" class="popover">
+    <div class="popover-title">Diagnostics</div>
+    <div class="diagnostics-actions"><button class="diagbtn" id="copydiag">Copy</button><button class="diagbtn" id="openlog">Open log</button><button class="diagbtn" id="showlog">Show folder</button></div>
+  </div>
+</div>
+<script>
+'use strict';
+(function(){
+if(!window.__TAURI__)return;
+var invoke=window.__TAURI__.core.invoke,eventApi=window.__TAURI__.event,win=window.__TAURI__.window.getCurrentWindow();
+var phase='idle',busy=false,lastUiError='',cfg={fps:60,codec:'auto',quality:'high',drawCursor:true,systemAudio:false,microphone:false};
+var PREF_KEY='klippit.recorder.settings.v1';
+var $=function(id){return document.getElementById(id)};
+var fps=$('fps'),codec=$('codec'),quality=$('quality'),cursor=$('cursor'),system=$('system'),mic=$('mic'),primary=$('primary'),primaryIcon=$('primary-icon'),primaryLabel=$('primary-label'),stop=$('stop'),discard=$('discard'),discardLabel=$('discard-label'),msg=$('message'),messageRow=$('message-row'),settingsPanel=$('settings-panel'),settingsToggle=$('settings-toggle'),settingsArrow=$('settings-arrow'),diagnosticsPanel=$('diagnostics-panel'),detailsToggle=$('details-toggle');
+$('bar').addEventListener('pointerdown',function(e){if(e.target.tagName!=='BUTTON'&&e.button===0)win.startDragging();});
+function formatTime(sec){sec=Math.max(0,Math.floor(sec||0));var h=Math.floor(sec/3600),m=Math.floor(sec%3600/60),s=sec%60;return [h,m,s].map(function(v){return String(v).padStart(2,'0')}).join(':');}
+function validSaved(x){return x&&[24,30,60,120].indexOf(Number(x.fps))!==-1&&['auto','h264','hevc'].indexOf(x.codec)!==-1&&['high','balanced','small'].indexOf(x.quality)!==-1;}
+function loadPrefs(){try{var x=JSON.parse(localStorage.getItem(PREF_KEY)||'null');if(validSaved(x)){cfg.fps=Number(x.fps);cfg.codec=x.codec;cfg.quality=x.quality;cfg.drawCursor=x.drawCursor!==false;cfg.systemAudio=!!x.systemAudio;cfg.microphone=!!x.microphone;}}catch(_){}}
+function savePrefs(){try{localStorage.setItem(PREF_KEY,JSON.stringify(cfg));}catch(_){}}
+function updateToggle(el,on){el.classList.toggle('on',!!on);el.setAttribute('aria-pressed',on?'true':'false');}
+function applyCfg(){fps.value=String(cfg.fps);codec.value=cfg.codec;quality.value=cfg.quality;updateToggle(cursor,cfg.drawCursor);updateToggle(system,cfg.systemAudio);updateToggle(mic,cfg.microphone);}
+function readCfg(){cfg.fps=parseInt(fps.value,10);cfg.codec=codec.value;cfg.quality=quality.value;return cfg;}
+function showError(text){lastUiError=String(text||'Recorder error');msg.textContent=lastUiError;messageRow.classList.add('show');}
+function clearError(){lastUiError='';messageRow.classList.remove('show');diagnosticsPanel.classList.remove('show');}
+function syncConfig(){if(locked())return;readCfg();savePrefs();invoke('recorder_set_config',{config:cfg}).catch(function(e){showError('Settings failed: '+e);});}
+function setToggle(el,key){if(locked())return;cfg[key]=!cfg[key];updateToggle(el,cfg[key]);syncConfig();}
+cursor.onclick=function(){setToggle(cursor,'drawCursor')};system.onclick=function(){setToggle(system,'systemAudio')};mic.onclick=function(){setToggle(mic,'microphone')};
+[fps,codec,quality].forEach(function(el){el.addEventListener('change',syncConfig);});
+function locked(){return phase!=='idle'&&phase!=='ready';}
+function configEnabled(on){[fps,codec,quality,cursor,system,mic].forEach(function(x){x.disabled=!on;});}
+function setPrimary(icon,label,enabled){primaryIcon.textContent=icon;primaryLabel.textContent=label;primary.disabled=!enabled;}
+function setBodyState(name){document.body.className='';if(name)document.body.classList.add(name);}
+function closePopovers(except){if(except!=='settings'){settingsPanel.classList.remove('show');settingsToggle.setAttribute('aria-expanded','false');settingsArrow.textContent='▸';}if(except!=='diagnostics')diagnosticsPanel.classList.remove('show');}
+settingsToggle.onclick=function(e){e.stopPropagation();var open=!settingsPanel.classList.contains('show');closePopovers(open?'settings':'');settingsPanel.classList.toggle('show',open);settingsToggle.setAttribute('aria-expanded',open?'true':'false');settingsArrow.textContent=open?'▾':'▸';};
+detailsToggle.onclick=function(e){e.stopPropagation();var open=!diagnosticsPanel.classList.contains('show');closePopovers(open?'diagnostics':'');diagnosticsPanel.classList.toggle('show',open);};
+document.addEventListener('pointerdown',function(e){if(!settingsPanel.contains(e.target)&&!settingsToggle.contains(e.target)&&!diagnosticsPanel.contains(e.target)&&!detailsToggle.contains(e.target))closePopovers('');});
+document.addEventListener('keydown',function(e){if(e.key==='Escape')closePopovers('');});
+function renderStatus(s){
+  phase=s.phase||'idle';
+  var isRec=phase==='recording',isPaused=phase==='paused',isFailed=phase==='failed',isStarting=phase==='starting',isFinalizing=phase==='finalizing';
+  var active=isRec||isPaused||isFailed||isStarting||isFinalizing;
+  setBodyState(isRec?'recording':isPaused?'paused':isStarting?'starting':isFinalizing?'finalizing':isFailed?'failed':'ready');
+  var stateLabel=isRec?'REC':isPaused?'PAUSED':isFailed?'STOPPED':isStarting?'STARTING':isFinalizing?'FINALIZING':'READY';
+  $('state').textContent=stateLabel;$('elapsed').textContent=formatTime(s.elapsedSeconds);
+  var actual=s.fps>0?s.fps.toFixed(1):readCfg().fps;var enc=s.encoder||((cfg.codec==='hevc')?'HEVC':'H.264');
+  $('stats').innerHTML=actual+' FPS · '+enc+'<br>'+(s.droppedFrames||0)+' dropped';
+  configEnabled(!active);stop.disabled=!(isRec||isPaused||isFailed)||busy;discard.disabled=busy;
+  stop.classList.toggle('hidden',!(isRec||isPaused||isFailed));discard.classList.toggle('hidden',!(isRec||isPaused||isFailed));
+  if(active)closePopovers('');
+  if(isRec){setPrimary('Ⅱ','Pause',!busy);discardLabel.textContent='Discard';}
+  else if(isPaused){setPrimary('▶','Continue',!busy);discardLabel.textContent='Discard';}
+  else if(isFailed){setPrimary('!','Capture stopped',false);discardLabel.textContent='Discard';}
+  else if(isStarting){setPrimary('…','Starting',false);}
+  else if(isFinalizing){setPrimary('…','Finalizing',false);}
+  else{setPrimary('●','Start',!busy);}
+  var problem=s.captureError||s.audioError||isFailed||lastUiError;
+  if(problem){var text=lastUiError||(s.captureError?('Recorder error: '+s.captureError):('Audio warning: '+s.audioError));msg.textContent=text;messageRow.classList.add('show');}
+  else{messageRow.classList.remove('show');diagnosticsPanel.classList.remove('show');}
+}
+async function refresh(){try{renderStatus(await invoke('recorder_status'));}catch(e){showError(e);}}
+async function start(){if(busy)return;busy=true;clearError();try{await invoke('recorder_start',{config:readCfg()});await refresh();}catch(e){showError('Could not start: '+e);}finally{busy=false;await refresh();}}
+async function toggle(){if(phase==='recording')return pause();if(phase==='paused')return resume();if(phase==='idle'||phase==='ready')return start();}
+async function pause(){if(busy)return;busy=true;try{await invoke('recorder_pause');}catch(e){showError('Pause failed: '+e);}finally{busy=false;await refresh();}}
+async function resume(){if(busy)return;busy=true;try{await invoke('recorder_resume');}catch(e){showError('Continue failed: '+e);}finally{busy=false;await refresh();}}
+async function stopNow(){if(busy||!(phase==='recording'||phase==='paused'||phase==='failed'))return;busy=true;phase='finalizing';renderStatus({phase:'finalizing',elapsedSeconds:0,fps:0,droppedFrames:0});try{await invoke('recorder_stop');}catch(e){busy=false;showError('Stop failed: '+e);await refresh();}}
+async function discardNow(){if(busy)return;if((phase==='recording'||phase==='paused'||phase==='failed')&&!confirm('Discard this recording and reset the recorder?'))return;busy=true;try{await invoke('recorder_discard');clearError();phase='idle';}catch(e){showError('Discard failed: '+e);}finally{busy=false;await refresh();}}
+async function closeRecorder(){if(busy)return;if((phase==='recording'||phase==='paused'||phase==='failed')&&!confirm('Discard this recording and close the recorder?'))return;busy=true;try{await invoke('recorder_close');}catch(e){busy=false;showError('Close failed: '+e);}}
+async function diagnosticsText(){var text=await invoke('recorder_diagnostics');if(lastUiError)text+='\nUI error: '+lastUiError+'\n';return text;}
+async function copyDiagnostics(){try{var text=await diagnosticsText();var copied=false;if(navigator.clipboard&&navigator.clipboard.writeText){try{await navigator.clipboard.writeText(text);copied=true;}catch(_){}}if(!copied){var ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.focus();ta.select();copied=document.execCommand('copy');ta.remove();}msg.textContent=copied?'Diagnostics copied.':'Copy failed — use Open log.';}catch(e){showError('Diagnostics failed: '+e);}}
+async function logPath(){return await invoke('recorder_log_path');}
+async function openLog(){try{var p=await logPath();await window.__TAURI__.opener.openPath(p);}catch(e){showError('Open log failed: '+e);}}
+async function showLog(){try{var p=await logPath();await window.__TAURI__.opener.revealItemInDir(p);}catch(e){showError('Show log failed: '+e);}}
+$('copydiag').onclick=copyDiagnostics;$('openlog').onclick=openLog;$('showlog').onclick=showLog;
+primary.onclick=toggle;stop.onclick=stopNow;discard.onclick=discardNow;$('close').onclick=closeRecorder;
+eventApi.listen('recorder-hotkey',function(e){var a=e.payload;if(a==='toggle')toggle();else if(a==='stop')stopNow();else if(a==='discard')discardNow();});
+loadPrefs();applyCfg();syncConfig();setInterval(refresh,450);refresh();
+})();
+</script>
+</body>
+</html>

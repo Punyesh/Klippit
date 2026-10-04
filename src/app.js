@@ -28,6 +28,9 @@ var init = window.__KLIPPIT_INIT__ || {
   subtitle: { available: false }
 };
 
+var tempRecordingPending = !!init.temporaryRecording;
+var recordingCloseBypass = false;
+
 var state = {
   duration: 0,
   fps: 24, // replaced with the real value once ffprobe reports it (see loadMetadata)
@@ -57,10 +60,15 @@ var state = {
   outputFileName: '', // populated once we know the source filename — see updateDefaultFilename()
   sourceWidth: 0,
   sourceHeight: 0,
+  sourceHasAudio: true,
   muteAudio: false,
   useGpu: false,
   cropEnabled: false,
-  cropAspect: 'free', // project-wide shape: 'free' | '16:9' | '4:3' | '9:16' | '1:1'
+  cropAspect: 'free', // output shape: 'free' | '16:9' | '4:3' | '9:16' | '1:1'
+  // In Free mode, multi-section exports still need one common output
+  // aspect. This stores the last committed custom ratio, while the live
+  // crop box itself remains unconstrained until Done/Add Section.
+  cropCustomRatio: null,
   // The live crop box is the editor state for the CURRENT in-progress
   // section. Committed sections snapshot their own crop rectangles inside
   // state.sections, so position/zoom can differ per cut. The live box is
@@ -303,6 +311,13 @@ document.getElementById('add-section-btn').onclick = function () {
     speed: state.speed,
     crop: state.cropEnabled ? cloneCrop(currentCropSnapshot()) : null
   });
+  // In Free mode, Add Section is the commit point for the crop's
+  // shape. Adopt this section's ratio as the shared custom output aspect
+  // and conform earlier committed crops without changing their centers.
+  if (state.cropEnabled && state.cropAspect === 'free') {
+    commitFreeProjectRatio(state.sections[state.sections.length - 1].crop);
+    setCurrentCrop(state.sections[state.sections.length - 1].crop);
+  }
   // In/Out and speed reset for the next section, but crop deliberately
   // does NOT: the selection box stays exactly where the user left it,
   // as agreed for a fast shot-to-shot reframing workflow. Each committed
@@ -594,18 +609,18 @@ bindSeg('gpu-off', 'gpu-on', function (id) {
 });
 
 // ---------- crop ----------
-// Static crop applied uniformly to the whole clip (the "actual video
-// editor" territory — pan/follow-style animated cropping — was
-// deliberately scoped out as a separate, much bigger feature). Crop
-// coordinates live in SOURCE VIDEO PIXEL space throughout state, never
-// screen pixels, converted to/from screen coordinates only at render
-// and drag time via getVideoDisplayRect() below — this keeps the stored
-// crop correct regardless of window size or preview letterboxing.
+// Crop coordinates live in SOURCE VIDEO PIXEL space throughout state,
+// never screen pixels, converted to/from screen coordinates only at
+// render and drag time via getVideoDisplayRect() below. Each committed
+// section owns its own crop rectangle; the output aspect is shared so
+// differently framed sections can still concatenate into one video.
 var cropOverlay = document.getElementById('crop-overlay');
 var cropBox = document.getElementById('crop-box');
 var cropMaskHole = document.getElementById('crop-mask-hole');
 var cropDimensions = document.getElementById('crop-dimensions');
 var cropSizeReadout = document.getElementById('crop-size-readout');
+var cropEditStatus = document.getElementById('crop-edit-status');
+var cropProjectAspect = document.getElementById('crop-project-aspect');
 var ASPECT_RATIOS = { '16:9': 16 / 9, '4:3': 4 / 3, '9:16': 9 / 16, '1:1': 1 };
 
 
@@ -632,18 +647,23 @@ function setCurrentCrop(crop) {
   state.cropHeight = crop.height;
 }
 
-// Crop shape is project-wide while position/zoom are per-section. In
-// explicit aspect modes the selected ratio is the project ratio. In
-// Free mode, the first committed crop establishes a custom ratio once
-// multi-section editing begins; before that, a single section is truly
-// free-form.
-function effectiveCropRatio() {
+// Crop position/zoom are per-section, but a multi-section export needs one
+// common output aspect. Explicit modes (16:9, 4:3, etc.) constrain the
+// resize handles immediately. Free mode is different: the LIVE crop box
+// is genuinely unconstrained; its ratio only becomes the shared custom
+// output ratio when the user commits the crop with Done/Add Section.
+function projectCropRatio() {
   if (state.cropAspect !== 'free') return ASPECT_RATIOS[state.cropAspect] || null;
-  for (var i = 0; i < state.sections.length; i++) {
-    var c = state.sections[i].crop;
-    if (c && c.width > 0 && c.height > 0) return c.width / c.height;
-  }
-  return null;
+  return state.cropCustomRatio || null;
+}
+
+function cropResizeRatio() {
+  return state.cropAspect === 'free' ? null : (ASPECT_RATIOS[state.cropAspect] || null);
+}
+
+function formatCustomRatio(ratio) {
+  if (!ratio || !isFinite(ratio)) return '';
+  return (Math.round(ratio * 100) / 100).toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1') + ':1';
 }
 
 function fitCropToRatio(crop, ratio) {
@@ -681,6 +701,22 @@ function maxCropForRatio(ratio) {
   };
 }
 
+function conformCommittedCropsToRatio(ratio) {
+  if (!ratio) return;
+  for (var i = 0; i < state.sections.length; i++) {
+    if (state.sections[i].crop) state.sections[i].crop = fitCropToRatio(state.sections[i].crop, ratio);
+  }
+}
+
+function commitFreeProjectRatio(crop) {
+  if (state.cropAspect !== 'free' || !crop || !crop.width || !crop.height) return null;
+  var ratio = crop.width / crop.height;
+  if (!isFinite(ratio) || ratio <= 0) return null;
+  state.cropCustomRatio = ratio;
+  conformCommittedCropsToRatio(ratio);
+  return ratio;
+}
+
 function syncEditedSectionCrop() {
   if (state.editingCropSection === null) return;
   var section = state.sections[state.editingCropSection];
@@ -690,21 +726,32 @@ function syncEditedSectionCrop() {
 
 function initializeCommittedSectionCrops() {
   if (!state.cropEnabled) return;
-  var base = currentCropSnapshot() || maxCropForRatio(effectiveCropRatio());
+  var base = currentCropSnapshot() || maxCropForRatio(projectCropRatio());
   if (!base) return;
   for (var i = 0; i < state.sections.length; i++) {
     if (!state.sections[i].crop) state.sections[i].crop = cloneCrop(base);
+  }
+  // Defensive consistency for projects created before the per-section
+  // aspect UI was clarified: if Free already has a committed ratio, make
+  // sure every stored crop matches it before export.
+  if (state.cropAspect === 'free' && state.cropCustomRatio) {
+    conformCommittedCropsToRatio(state.cropCustomRatio);
   }
 }
 
 function beginSectionCropEdit(index) {
   if (!state.cropEnabled || !state.sections[index]) return;
+  // Switching directly from one Crop button to another should commit the
+  // first edit instead of leaving its custom ratio in an ambiguous state.
+  if (state.editingCropSection !== null && state.editingCropSection !== index) {
+    finishSectionCropEdit(false);
+  }
   if (state.editingCropSection === null) {
     state.pendingCropBeforeEdit = cloneCrop(currentCropSnapshot());
   }
   state.editingCropSection = index;
   if (!state.sections[index].crop) {
-    state.sections[index].crop = cloneCrop(currentCropSnapshot() || maxCropForRatio(effectiveCropRatio()));
+    state.sections[index].crop = cloneCrop(currentCropSnapshot() || maxCropForRatio(projectCropRatio()));
   }
   setCurrentCrop(state.sections[index].crop);
   var midpoint = (state.sections[index].inTime + state.sections[index].outTime) / 2;
@@ -716,11 +763,20 @@ function beginSectionCropEdit(index) {
 function finishSectionCropEdit(shouldRender) {
   if (state.editingCropSection === null) return;
   syncEditedSectionCrop();
+
+  // In Free mode, Done is the commit point: the edited rectangle defines
+  // the new custom project aspect, then every other committed section is
+  // conformed around its own center. Until this moment the handles are
+  // completely free, so clicking Free actually means Free.
+  var edited = state.sections[state.editingCropSection];
+  var committedRatio = state.cropAspect === 'free' && edited && edited.crop
+    ? commitFreeProjectRatio(edited.crop)
+    : projectCropRatio();
+
   state.editingCropSection = null;
   if (state.pendingCropBeforeEdit) {
     var restored = cloneCrop(state.pendingCropBeforeEdit);
-    var ratio = effectiveCropRatio();
-    if (ratio) restored = fitCropToRatio(restored, ratio);
+    if (committedRatio) restored = fitCropToRatio(restored, committedRatio);
     setCurrentCrop(restored);
   }
   state.pendingCropBeforeEdit = null;
@@ -804,47 +860,75 @@ function renderCropOverlay() {
   var label = Math.round(state.cropWidth) + ' \u00d7 ' + Math.round(state.cropHeight);
   if (state.editingCropSection !== null) label += '  ·  section ' + (state.editingCropSection + 1);
   cropDimensions.textContent = label;
-  var readout = label;
-  if (state.cropAspect === 'free' && state.sections.length > 0 && effectiveCropRatio()) readout += '  ·  custom ratio locked';
-  cropSizeReadout.textContent = readout;
+  cropSizeReadout.textContent = Math.round(state.cropWidth) + ' \u00d7 ' + Math.round(state.cropHeight);
+
+  if (state.editingCropSection !== null) {
+    cropEditStatus.textContent = 'Editing crop — Section ' + (state.editingCropSection + 1) +
+      (state.cropAspect === 'free' ? ' · Free until Done' : '');
+  } else if (state.sections.length > 0) {
+    cropEditStatus.textContent = state.cropAspect === 'free'
+      ? 'New section crop · Free until Add Section'
+      : 'New section crop';
+  } else {
+    cropEditStatus.textContent = '';
+  }
+
+  if (state.cropAspect === 'free') {
+    if (state.cropCustomRatio && state.sections.length > 0) {
+      var commitText = state.editingCropSection !== null ? ' · updates on Done' : ' · updates on Add Section';
+      cropProjectAspect.textContent = 'Custom ' + formatCustomRatio(state.cropCustomRatio) + ' · all sections' + commitText;
+    } else {
+      cropProjectAspect.textContent = state.sections.length > 0
+        ? 'Free now · becomes the shared custom aspect when committed'
+        : 'Free aspect';
+    }
+  } else {
+    cropProjectAspect.textContent = state.cropAspect + ' · all sections';
+  }
 }
 window.addEventListener('resize', renderCropOverlay);
 
-// Reset to the largest crop that fits the project aspect ratio. In Free
-// single-section mode that is the full source frame; for a locked ratio it
-// is the largest centered rectangle of that shape.
+// Reset means "show me the largest possible crop". In Free mode that is
+// the full source frame even in a multi-section project; committing it can
+// therefore intentionally change the shared output aspect back to source.
 function resetCrop() {
   if (!state.sourceWidth || !state.sourceHeight) return;
-  var crop = maxCropForRatio(effectiveCropRatio());
+  var crop = maxCropForRatio(cropResizeRatio());
   setCurrentCrop(crop);
   syncEditedSectionCrop();
   renderCropOverlay();
 }
 
 function applyCropAspect(ratioKey) {
+  var previousRatio = projectCropRatio();
   state.cropAspect = ratioKey;
   if (!state.sourceWidth || !state.cropWidth) return;
 
-  // Free is genuinely unconstrained for a single section. Once there
-  // are committed sections, switching to Free establishes a custom
-  // project ratio from the currently visible crop; every section then
-  // keeps that same shape while remaining independently movable and
-  // resizable.
-  var ratio = ratioKey === 'free'
-    ? (state.sections.length > 0 ? state.cropWidth / state.cropHeight : null)
-    : ASPECT_RATIOS[ratioKey];
-
-  if (ratio) {
-    for (var i = 0; i < state.sections.length; i++) {
-      if (state.sections[i].crop) state.sections[i].crop = fitCropToRatio(state.sections[i].crop, ratio);
+  if (ratioKey === 'free') {
+    // Preserve the current shared shape as the baseline project ratio,
+    // but do NOT use it to constrain resizing. The next Done/Add Section
+    // can replace it with whatever free-form ratio the user chooses.
+    if (state.sections.length > 0) {
+      state.cropCustomRatio = previousRatio || (state.cropWidth / state.cropHeight);
+    } else {
+      state.cropCustomRatio = null;
     }
-    var current = fitCropToRatio(currentCropSnapshot(), ratio);
-    if (state.editingCropSection !== null && state.sections[state.editingCropSection] && state.sections[state.editingCropSection].crop) {
-      current = cloneCrop(state.sections[state.editingCropSection].crop);
-    }
-    setCurrentCrop(current);
-    syncEditedSectionCrop();
+    renderCropOverlay();
+    renderSectionsUI();
+    return;
   }
+
+  var ratio = ASPECT_RATIOS[ratioKey];
+  state.cropCustomRatio = null;
+  conformCommittedCropsToRatio(ratio);
+  if (state.pendingCropBeforeEdit) state.pendingCropBeforeEdit = fitCropToRatio(state.pendingCropBeforeEdit, ratio);
+
+  var current = fitCropToRatio(currentCropSnapshot(), ratio);
+  if (state.editingCropSection !== null && state.sections[state.editingCropSection] && state.sections[state.editingCropSection].crop) {
+    current = cloneCrop(state.sections[state.editingCropSection].crop);
+  }
+  setCurrentCrop(current);
+  syncEditedSectionCrop();
   renderCropOverlay();
   renderSectionsUI();
 }
@@ -938,7 +1022,7 @@ cropBox.addEventListener('pointerdown', function (e) {
         newY = hasN ? anchorY - newH : anchorY;
       }
 
-      var ratio = effectiveCropRatio();
+      var ratio = cropResizeRatio();
       if (ratio) {
         if (hasHorizontal && !hasVertical) {
           // Pure width drag (e/w edge) — derive height from the ratio,
@@ -989,6 +1073,12 @@ var subsOffBtn = document.getElementById('subs-off');
 var subsOnBtn = document.getElementById('subs-on');
 var subsStatus = document.getElementById('subs-status');
 function disableSubtitleControls(message) {
+  // A file with no subtitle stream cannot be in Burn-in mode. Keep both
+  // the internal state and the segmented control in a valid Off state so
+  // export never asks the backend to burn subtitles that do not exist.
+  state.burnSubs = false;
+  subsOffBtn.setAttribute('aria-pressed', 'true');
+  subsOnBtn.setAttribute('aria-pressed', 'false');
   subsOffBtn.disabled = true;
   subsOnBtn.disabled = true;
   subsStatus.textContent = message;
@@ -1002,8 +1092,8 @@ function disableSubtitleControls(message) {
 // Klippit failed to notice something that's actually just unsupported.
 function noSubtitleMessage() {
   return init.trigger === 'vlc'
-    ? 'No embedded sub detected. External sub handling not supported on VLC.'
-    : 'No subtitle stream detected';
+    ? "No embedded subtitles.\nExternal VLC subtitles aren't supported."
+    : 'No subtitle stream detected.';
 }
 
 // ---------- size presets ----------
@@ -1045,6 +1135,26 @@ function loadMetadata() {
     state.fps = meta.fps || state.fps;
     state.sourceWidth = meta.width || 0;
     state.sourceHeight = meta.height || 0;
+    state.sourceHasAudio = !!meta.hasAudio;
+    var audioKeepBtn = document.getElementById('audio-keep');
+    var audioMuteBtn = document.getElementById('audio-mute');
+    if (!state.sourceHasAudio) {
+      // Screen recordings made with audio capture Off (and ordinary silent
+      // videos) contain no audio stream. Reflect that explicitly and make
+      // export treat the source as muted instead of asking ffmpeg for [a].
+      state.muteAudio = true;
+      audioKeepBtn.setAttribute('aria-pressed', 'false');
+      audioMuteBtn.setAttribute('aria-pressed', 'true');
+      audioKeepBtn.disabled = true;
+      audioMuteBtn.disabled = true;
+      audioKeepBtn.title = 'No audio stream in this source';
+      audioMuteBtn.title = 'No audio stream in this source';
+    } else {
+      audioKeepBtn.disabled = false;
+      audioMuteBtn.disabled = false;
+      audioKeepBtn.title = '';
+      audioMuteBtn.title = '';
+    }
     // Edge case: crop was toggled on before metadata (and therefore
     // source dimensions) finished loading — initialize it now rather
     // than leaving the toggle showing "On" with no overlay ever
@@ -1203,11 +1313,60 @@ var revealBtn = document.getElementById('reveal-btn');
 var playBtn = document.getElementById('play-btn');
 var lastExportedPath = null;
 
+var progressRow = document.getElementById('export-progress-row');
+var progressTrack = document.getElementById('export-progress-track');
+var progressFill = document.getElementById('export-progress-fill');
+var progressStage = document.getElementById('export-progress-stage');
+var progressPercent = document.getElementById('export-progress-percent');
+var exportProgressMax = 0;
+var exportIsBusy = false;
+
+function resetExportProgress() {
+  exportProgressMax = 0;
+  if (progressFill) progressFill.style.width = '0%';
+  if (progressPercent) progressPercent.textContent = '0%';
+  if (progressStage) progressStage.textContent = 'Preparing';
+  if (progressTrack) progressTrack.setAttribute('aria-valuenow', '0');
+}
+
+function updateExportProgress(payload) {
+  if (!exportIsBusy || !payload) return;
+  var next = Number(payload.percent);
+  if (!isFinite(next)) return;
+  // Some export paths retry an encoder/size attempt. Never let the
+  // overall bar move backwards when a new ffmpeg process starts.
+  exportProgressMax = Math.max(exportProgressMax, Math.max(0, Math.min(100, next)));
+  var rounded = Math.round(exportProgressMax);
+  if (progressFill) progressFill.style.width = exportProgressMax.toFixed(2) + '%';
+  if (progressPercent) progressPercent.textContent = rounded + '%';
+  if (progressStage && payload.label) progressStage.textContent = payload.label;
+  if (progressTrack) progressTrack.setAttribute('aria-valuenow', String(rounded));
+}
+
+if (window.__TAURI__ && window.__TAURI__.event) {
+  window.__TAURI__.event.listen('export-progress', function (event) {
+    updateExportProgress(event.payload);
+  }).catch(function (err) {
+    console.log('[klippit] export progress listener failed:', err);
+  });
+}
+
 var cancelBtn = document.getElementById('cancel-btn');
 
 function setBusy(busy) {
+  exportIsBusy = busy;
   exportBtn.disabled = busy;
   spinnerEl.style.display = busy ? 'inline-block' : 'none';
+  if (busy) {
+    resetExportProgress();
+    if (progressRow) {
+      progressRow.classList.add('visible');
+      progressRow.setAttribute('aria-hidden', 'false');
+    }
+  } else if (progressRow) {
+    progressRow.classList.remove('visible');
+    progressRow.setAttribute('aria-hidden', 'true');
+  }
   // While exporting, this button's job changes from "close the whole
   // panel" to "cancel the export in progress" — closing the panel
   // outright while ffmpeg is still running isn't something you'd want
@@ -1286,6 +1445,7 @@ function exportClip() {
     fileName: state.outputFileName,
     sourceWidth: state.sourceWidth,
     sourceHeight: state.sourceHeight,
+    sourceHasAudio: state.sourceHasAudio,
     subtitleLang: currentSubtitleLang(),
     subtitleExternalFile: currentSubtitleExternalFile(),
     muteAudio: state.muteAudio,
@@ -1298,7 +1458,9 @@ function exportClip() {
   if (!window.__TAURI__) {
     // Standalone browser preview — no backend to actually encode against.
     console.log('[klippit] export_clip params (dev preview, no backend):', params);
+    updateExportProgress({ percent: 42, label: 'Encoding preview' });
     setTimeout(function () {
+      updateExportProgress({ percent: 100, label: 'Export complete' });
       setStatus('(dev preview) no Tauri backend here — see console for params', 'done');
       setBusy(false);
     }, 400);
@@ -1306,6 +1468,7 @@ function exportClip() {
   }
 
   window.__TAURI__.core.invoke('export_clip', { params: params }).then(function (result) {
+    updateExportProgress({ percent: 100, label: 'Export complete' });
     var path = result.outputPath;
     var encoderLabels = { h264_nvenc: 'NVIDIA GPU', h264_amf: 'AMD GPU', h264_qsv: 'Intel GPU' };
     var note = '';
@@ -1321,6 +1484,7 @@ function exportClip() {
     setStatus('done' + note + ' — ' + path, 'done');
     lastExportedPath = path;
     statusActions.style.display = 'flex';
+    if (tempRecordingPending) showRecordingExportPrompt();
   }).catch(function (err) {
     // The Rust side returns the plain string "cancelled" specifically
     // for this case (see run_bin/cancel_export) — distinct from a
@@ -1373,7 +1537,16 @@ function closePanel() {
 // function (rather than one-shot top-level code) is what makes that
 // possible.
 function applyInit(newInit) {
+  if (tempRecordingPending && newInit && !newInit.temporaryRecording && newInit.filePath && newInit.filePath !== init.filePath) {
+    if (!confirm('The current screen recording is still temporary.\n\nDiscard the original recording and load the new file?')) return;
+    releaseTemporaryRecordingSource();
+    if (window.__TAURI__) window.__TAURI__.core.invoke('discard_unsaved_recording').catch(function (e) { console.log('[klippit] temporary recording cleanup failed:', e); });
+    tempRecordingPending = false;
+  }
   init = newInit || init;
+  tempRecordingPending = !!init.temporaryRecording;
+  var tempBanner = document.getElementById('recording-temp-banner');
+  if (tempBanner) tempBanner.style.display = tempRecordingPending ? 'flex' : 'none';
   document.getElementById('source-name').textContent = init.fileName;
   document.getElementById('source-name').title = init.filePath;
 
@@ -1388,6 +1561,16 @@ function applyInit(newInit) {
   lastExportedPath = null;
   state.sourceWidth = 0;
   state.sourceHeight = 0;
+  state.sourceHasAudio = true;
+  state.muteAudio = false;
+  var audioKeepBtn = document.getElementById('audio-keep');
+  var audioMuteBtn = document.getElementById('audio-mute');
+  audioKeepBtn.setAttribute('aria-pressed', 'true');
+  audioMuteBtn.setAttribute('aria-pressed', 'false');
+  audioKeepBtn.disabled = false;
+  audioMuteBtn.disabled = false;
+  audioKeepBtn.title = '';
+  audioMuteBtn.title = '';
   // Crop coordinates are tied to this specific file's dimensions —
   // reset per file, same as in/out. cropAspect (the "9:16" etc.
   // preference) deliberately isn't reset here, since that's a user
@@ -1397,6 +1580,7 @@ function applyInit(newInit) {
   state.cropY = 0;
   state.cropWidth = 0;
   state.cropHeight = 0;
+  state.cropCustomRatio = null;
   state.editingCropSection = null;
   state.pendingCropBeforeEdit = null;
   document.getElementById('crop-off').setAttribute('aria-pressed', 'true');
@@ -1413,6 +1597,9 @@ function applyInit(newInit) {
   // so nothing here should pre-emptively disable anything based on
   // mpv/VLC's active-track state, which only reflects what was selected
   // in the player, not what the file contains.
+  state.burnSubs = false;
+  subsOffBtn.setAttribute('aria-pressed', 'true');
+  subsOnBtn.setAttribute('aria-pressed', 'false');
   subsOffBtn.disabled = false;
   subsOnBtn.disabled = false;
   subsStatus.textContent = '';
@@ -1544,6 +1731,257 @@ if (setupWarningDismiss) {
   setupWarningDismiss.onclick = function () {
     document.getElementById('setup-warning').style.display = 'none';
   };
+}
+
+// ---------- screen recorder ----------
+var recordBtn = document.getElementById('record-btn');
+var tempRecordingBanner = document.getElementById('recording-temp-banner');
+var saveOriginalBtn = document.getElementById('save-recording-original-btn');
+var discardRecordingBtn = document.getElementById('discard-recording-btn');
+var recordingCloseModal = document.getElementById('recording-close-modal');
+var recordingExportModal = document.getElementById('recording-export-modal');
+var recordingNewModal = document.getElementById('recording-new-modal');
+
+function launchScreenRecorderBackend() {
+  if (!window.__TAURI__) {
+    setStatus('screen recorder needs the Tauri backend', 'error');
+    return Promise.reject(new Error('Tauri backend unavailable'));
+  }
+  return window.__TAURI__.core.invoke('open_recorder').catch(function (err) {
+    // This path is primarily crash recovery. A temporary recording that is
+    // already open in this editor is handled before the backend is invoked.
+    if (String(err).toLowerCase().indexOf('unsaved') !== -1 && confirm(String(err) + '\n\nOpen the unsaved recording instead?')) {
+      return window.__TAURI__.core.invoke('reopen_unsaved_recording');
+    }
+    setStatus('recorder: ' + err, 'error');
+    throw err;
+  });
+}
+
+function showRecordingNewPrompt() {
+  if (recordingNewModal) recordingNewModal.style.display = 'flex';
+}
+function hideRecordingNewPrompt() {
+  if (recordingNewModal) recordingNewModal.style.display = 'none';
+}
+
+function openScreenRecorder() {
+  if (!window.__TAURI__) {
+    setStatus('screen recorder needs the Tauri backend', 'error');
+    return;
+  }
+  if (tempRecordingPending) {
+    showRecordingNewPrompt();
+    return;
+  }
+  launchScreenRecorderBackend().catch(function () { /* status already shown */ });
+}
+if (recordBtn) recordBtn.onclick = openScreenRecorder;
+
+function chooseOriginalRecordingPath() {
+  var base = (init.fileName || 'Klippit Recording.mkv').replace(/\.[^.]+$/, '') + '.mkv';
+  return window.__TAURI__.dialog.save({
+    defaultPath: base,
+    filters: [{ name: 'Matroska video', extensions: ['mkv'] }]
+  });
+}
+function saveTemporaryOriginal(closeAfter) {
+  if (!window.__TAURI__ || !tempRecordingPending) return Promise.resolve(false);
+  return chooseOriginalRecordingPath().then(function (destination) {
+    if (!destination) return false;
+    return window.__TAURI__.core.invoke('save_unsaved_recording', { destination: destination }).then(function () {
+      tempRecordingPending = false;
+      if (tempRecordingBanner) tempRecordingBanner.style.display = 'none';
+      setStatus('original recording saved — ' + destination, 'done');
+      if (closeAfter) {
+        recordingCloseBypass = true;
+        return window.__TAURI__.window.getCurrentWindow().close().then(function () { return true; });
+      }
+      return true;
+    });
+  });
+}
+if (saveOriginalBtn) saveOriginalBtn.onclick = function () {
+  saveTemporaryOriginal(false).catch(function (e) { setStatus('could not save original: ' + e, 'error'); });
+};
+
+if (discardRecordingBtn) discardRecordingBtn.onclick = function () {
+  if (!tempRecordingPending) return;
+  if (!confirm('Discard this temporary screen recording and return to the recorder?\n\nThe original recording will be deleted.')) return;
+  discardRecordingBtn.disabled = true;
+  discardCurrentTemporaryRecording(true).finally(function () {
+    discardRecordingBtn.disabled = false;
+  });
+};
+
+var recordingNewCancel = document.getElementById('recording-new-cancel');
+var recordingNewDiscard = document.getElementById('recording-new-discard');
+var recordingNewSave = document.getElementById('recording-new-save');
+if (recordingNewCancel) recordingNewCancel.onclick = hideRecordingNewPrompt;
+if (recordingNewDiscard) recordingNewDiscard.onclick = function () {
+  recordingNewDiscard.disabled = true;
+  discardCurrentTemporaryRecording(true).finally(function () {
+    recordingNewDiscard.disabled = false;
+  });
+};
+if (recordingNewSave) recordingNewSave.onclick = function () {
+  recordingNewSave.disabled = true;
+  saveTemporaryOriginal(false).then(function (saved) {
+    if (!saved) return;
+    // The backend copy is now safe. Release the temporary source before
+    // open_recorder() removes its old working directory.
+    releaseTemporaryRecordingSource();
+    disposeSubtitleOverlay();
+    hideRecordingNewPrompt();
+    emptyEditorAfterRecording();
+    return launchScreenRecorderBackend();
+  }).catch(function (e) {
+    setStatus('could not save original: ' + e, 'error');
+  }).finally(function () {
+    recordingNewSave.disabled = false;
+  });
+};
+
+function showRecordingExportPrompt() {
+  if (recordingExportModal) recordingExportModal.style.display = 'flex';
+}
+function hideRecordingExportPrompt() {
+  if (recordingExportModal) recordingExportModal.style.display = 'none';
+}
+var exportRecordingLater = document.getElementById('recording-export-later');
+var exportRecordingDelete = document.getElementById('recording-export-delete');
+var exportRecordingKeep = document.getElementById('recording-export-keep');
+if (exportRecordingLater) exportRecordingLater.onclick = hideRecordingExportPrompt;
+function releaseTemporaryRecordingSource() {
+  // Windows will normally keep the source file open while Chromium's video
+  // element is using it. Explicitly detach it before an intentional delete
+  // so the backend can remove the temporary recording immediately rather
+  // than leaving an undeletable folder behind.
+  try {
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+  } catch (e) { /* best effort; backend will report a delete failure */ }
+}
+
+function emptyEditorAfterRecording() {
+  applyInit({
+    filePath: '',
+    fileName: '(no file loaded — Browse or Record)',
+    startTime: 0,
+    subtitle: { available: false },
+    temporaryRecording: false
+  });
+}
+
+function discardCurrentTemporaryRecording(startAnother) {
+  if (!window.__TAURI__ || !tempRecordingPending) {
+    if (startAnother) return launchScreenRecorderBackend();
+    return Promise.resolve();
+  }
+  var previousInit = init;
+  releaseTemporaryRecordingSource();
+  disposeSubtitleOverlay();
+  return window.__TAURI__.core.invoke('discard_unsaved_recording').then(function () {
+    tempRecordingPending = false;
+    if (tempRecordingBanner) tempRecordingBanner.style.display = 'none';
+    hideRecordingNewPrompt();
+    hideRecordingExportPrompt();
+    hideRecordingClosePrompt();
+    emptyEditorAfterRecording();
+    setStatus(startAnother ? 'previous recording discarded' : 'recording discarded', 'done');
+    if (startAnother) return launchScreenRecorderBackend();
+  }).catch(function (e) {
+    // Reattach the source if Windows refused the delete for any reason.
+    applyInit(previousInit);
+    setStatus('could not discard recording: ' + e, 'error');
+    throw e;
+  });
+}
+
+if (exportRecordingKeep) exportRecordingKeep.onclick = function () {
+  exportRecordingKeep.disabled = true;
+  saveTemporaryOriginal(false).then(function (saved) {
+    exportRecordingKeep.disabled = false;
+    if (saved) hideRecordingExportPrompt();
+  }).catch(function (e) {
+    exportRecordingKeep.disabled = false;
+    setStatus('could not save original: ' + e, 'error');
+  });
+};
+if (exportRecordingDelete) exportRecordingDelete.onclick = function () {
+  exportRecordingDelete.disabled = true;
+  releaseTemporaryRecordingSource();
+  // "Delete original" means this editing session is finished: keeping the
+  // editor open after removing its source file would leave a broken preview.
+  window.__TAURI__.core.invoke('discard_unsaved_recording').then(function () {
+    tempRecordingPending = false;
+    recordingCloseBypass = true;
+    if (tempRecordingBanner) tempRecordingBanner.style.display = 'none';
+    hideRecordingExportPrompt();
+    return window.__TAURI__.window.getCurrentWindow().close();
+  }).catch(function (e) {
+    exportRecordingDelete.disabled = false;
+    setStatus('could not delete original recording: ' + e, 'error');
+  });
+};
+
+function showRecordingClosePrompt() {
+  if (recordingCloseModal) recordingCloseModal.style.display = 'flex';
+}
+function hideRecordingClosePrompt() {
+  if (recordingCloseModal) recordingCloseModal.style.display = 'none';
+}
+var closeCancel = document.getElementById('recording-close-cancel');
+var closeDiscard = document.getElementById('recording-close-discard');
+var closeSave = document.getElementById('recording-close-save');
+if (closeCancel) closeCancel.onclick = hideRecordingClosePrompt;
+if (closeSave) closeSave.onclick = function () {
+  closeSave.disabled = true;
+  saveTemporaryOriginal(true).catch(function (e) {
+    closeSave.disabled = false;
+    setStatus('could not save original: ' + e, 'error');
+    hideRecordingClosePrompt();
+  });
+};
+if (closeDiscard) closeDiscard.onclick = function () {
+  closeDiscard.disabled = true;
+  releaseTemporaryRecordingSource();
+  window.__TAURI__.core.invoke('discard_unsaved_recording').then(function () {
+    tempRecordingPending = false;
+    recordingCloseBypass = true;
+    return window.__TAURI__.window.getCurrentWindow().close();
+  }).catch(function (e) {
+    closeDiscard.disabled = false;
+    setStatus('could not discard recording: ' + e, 'error');
+    hideRecordingClosePrompt();
+  });
+};
+
+// Main-window close is owned by the Rust backend so hidden recorder windows
+// cannot keep the process alive. Rust blocks close only when it knows there is
+// a finalized unsaved recording, then asks this UI to show the decision modal.
+if (window.__TAURI__ && window.__TAURI__.event) {
+  try {
+    window.__TAURI__.event.listen('recording-close-requested', function () {
+      tempRecordingPending = true;
+      showRecordingClosePrompt();
+    });
+  } catch (e) { console.log('[klippit] recording-close event unavailable:', e); }
+}
+
+// Direct launch recovery: an interrupted/finalized temporary recording is
+// never silently deleted. Offer it back when Klippit starts without another
+// source already supplied by mpv/VLC.
+if (window.__TAURI__ && !init.filePath) {
+  setTimeout(function () {
+    window.__TAURI__.core.invoke('find_recoverable_recording').then(function (path) {
+      if (!path) return;
+      if (confirm('Klippit found an unsaved screen recording from an earlier session.\n\nOpen it now?')) {
+        window.__TAURI__.core.invoke('reopen_unsaved_recording');
+      }
+    }).catch(function (e) { console.log('[klippit] recovery scan failed:', e); });
+  }, 350);
 }
 
 // ---------- settings panel ----------

@@ -1,5 +1,14 @@
 # Klippit — development log
 
+## 2026-10-04 - recorder hotfix 10: bounded parallel startup
+
+- Replaced serial recorder encoder probing with a bounded parallel startup race.
+- H.264 Auto now races AMD AMF (direct D3D11), Media Foundation, and x264; the first path that writes a verified video packet wins and the others are terminated.
+- Startup success accepts either FFmpeg frame progress or more than 4 KiB of flushed Matroska output, avoiding both stale `frame=0` progress and header-only false positives.
+- Startup is capped at 2.5 s for a new recording and 1.8 s for a known encoder on resume; candidate waits no longer add together.
+- Recorder diagnostics now keep full stderr for failed candidates and scope the recent log to the current recording session.
+- Error diagnostics share the existing message row instead of increasing the fixed window content height; recorder window raised slightly to 590x266 so Stop/Discard remain accessible.
+
 A frame-accurate clip/GIF/screenshot exporter, triggered by a keypress
 while watching in mpv. Panel UI ported from Sakuga Enhancer's design
 system; backend uses native `ffmpeg`/`ffprobe` instead of `ffmpeg.wasm`.
@@ -1853,3 +1862,119 @@ check that crate's current docs for the exact call shape.
 5. Come back to single-instance messaging once the core loop works.
 6. `cargo tauri build` once everything above works in `dev` mode — that's
    what actually produces the distributable `.msi`/`.exe`.
+## 2026-10-04 — Screen recorder prototype
+
+- Added a separate recorder subsystem and two lightweight always-on-top windows:
+  a resizable capture-region frame and a compact recorder control bar.
+- Video capture uses FFmpeg's Windows Desktop Duplication (`ddagrab`) source,
+  keeping frames in D3D11 memory for direct NVENC/AMF paths where supported;
+  software/download fallbacks remain available when the preferred path fails.
+- Added 24/30/60/120 FPS, Auto/H.264/HEVC/AV1, quality presets, cursor capture,
+  WASAPI system-audio loopback, and microphone capture.
+- Pause/Continue finalizes independent MKV segments and resumes with the same
+  encoder; Stop joins the segments and opens the temporary result directly in
+  the existing Klippit editor.
+- Added F9 Start/Pause/Continue, F10 Stop, F11 Discard while the recorder is
+  open, recording stats, temporary-original save/discard prompts, and basic
+  crash recovery.
+- Silent recordings are now first-class editor sources: metadata tracks whether
+  an audio stream actually exists so later MP4 export never references a
+  missing audio stream.
+
+
+### Screen recorder hotfix 6
+- Recorder encoder startup now requires confirmed video output (`frame > 0` or meaningful MKV growth).
+- `progress=end` with zero frames is treated as an immediate startup failure instead of a live recording.
+- Encoder startup timeout is bounded at 3.5 seconds per candidate, with candidate progress/error details logged.
+- AMF is tried before NVENC in Auto hardware fallback order, which avoids pointless CUDA-first startup on AMD systems.
+
+### Screen recorder hotfix 7
+- Work around Desktop Duplication's static-desktop first-frame delay by nudging the capture-excluded recorder controls by one pixel during capture startup, generating a harmless DWM present outside the recorded region.
+- Reduced per-candidate startup timeout from 3.5 s to 1.8 s now that the DDA source is actively woken.
+- Remember the last encoder that successfully produced video and try it first on later recordings in the same Klippit session, while retaining the full fallback chain if it stops working.
+- Pause/continue still pins the exact selected encoder so all segments remain concat-compatible.
+
+### Recorder UI pass
+- Replaced the hidden red-dot launcher with a labeled **Record screen** button.
+- Reworked recorder controls into an explicit state-driven toolbar: Start Recording, Pause/Continue, Stop, and Discard/Close.
+- Capture frame is neutral while ready, red while recording, amber while paused, with an in-frame status badge.
+- Recorder controls are centered directly below the capture area so the frame and controls read as one tool.
+
+## Screen recorder hotfix 8 — startup regression fix (2026-10-04)
+
+- Reverted the hotfix 7 assumption that every encoder must produce data within 1.8 seconds.
+- Diagnostics showed `h264_mf` had previously produced valid recorder output when given the older startup window, while hotfix 7 killed the same path after 1.8 seconds.
+- Recorder now recovers the most recent `encoder-selected` entry from the persistent recorder log and tries that candidate first across app restarts/rebuilds.
+- If no previous success exists, H.264 Auto prioritizes the Windows Media Foundation path before speculative vendor encoders.
+- Startup timeouts are candidate-specific: known-good / Media Foundation paths get 4.5 seconds, software fallback 3.5 seconds, other hardware candidates 2.5 seconds.
+- Removed the capture-excluded-window "wake" workaround; the movement hypothesis was not supported by the later diagnostics.
+- Built on top of the hotfix 7 recorder UI redesign.
+
+
+## Screen recorder capture architecture — gfxcapture / Windows Graphics Capture
+
+- Replaced the recorder's `ddagrab` Desktop Duplication source with FFmpeg 8.1+'s `gfxcapture`, which is backed by the Windows Graphics Capture (WinRT) API and returns D3D11 hardware frames.
+- Region selection is now applied directly in the capture source through `crop_left/top/right/bottom`, so pixels outside the selected area are not sent through the encoder.
+- Auto encoding no longer serially probes NVENC/AMF/QSV/MF/x264. It tries one vendor-neutral Media Foundation hardware path first, then a single software fallback.
+- The hardware path keeps frames on D3D11 and uses `scale_d3d11` to convert to NV12 before Media Foundation hardware encoding, avoiding the old GPU → CPU → GPU round trip.
+- Startup now requires an actual encoded frame; Matroska header growth is no longer treated as proof of a working capture.
+- If a live process produces no frame inside the short startup window, Klippit treats it as a capture-source failure and stops immediately instead of repeating the same source failure across more encoders.
+- Recorder startup verifies that bundled FFmpeg contains both `gfxcapture` and `scale_d3d11`; `scripts/setup-ffmpeg.ps1` now verifies those filters after downloading FFmpeg.
+
+
+## Native recorder rewrite — prewarmed Windows capture session (2026-10-04)
+
+- Replaced FFmpeg-owned live screen capture with a native Rust capture module based on `windows-capture` 2.0.1 and Windows Graphics Capture.
+- The capture session is prepared when the recorder opens, not when Start is pressed. Moving the selection to another monitor or changing cursor capture refreshes the prewarmed session before recording.
+- Start creates only the native Windows Media video encoder and immediately seeds it from the most recent captured monitor frame. There is no FFmpeg process spawn, encoder probing, progress parsing, or startup timeout roulette in the live path.
+- Capture and output cadence are decoupled. The capture callback stores the latest selected-region frame; a native encoder thread ticks at 24/30/60/120 FPS and repeats the latest frame when the desktop has not changed. A static desktop is therefore valid recording input rather than a startup failure.
+- Pause finalizes the current native MP4 segment but deliberately leaves the Windows capture session alive. Continue starts a new encoder segment from the already-cached frame, avoiding capture reinitialization.
+- Live frames never cross Tauri IPC or JavaScript. Optional system/microphone audio remains native WASAPI.
+- FFmpeg is retained downstream only for recorder audio mux/remux/concat and the existing Klippit editing/export pipeline. Final recorder output remains an MKV source opened automatically in Klippit.
+- Removed AV1 from the recorder codec selector for this native preview because the native encoder wrapper currently exposes H.264/HEVC but not AV1.
+- Recorder diagnostics now report native capture readiness, capture updates, encoder frame/duplicate/drop counts, and native errors rather than FFmpeg progress/stderr.
+- Crash recovery now recognizes finalized native MP4 pause segments as well as final MKV recordings. An application crash during an actively-written MP4 can still lose that active segment; completed paused segments remain recoverable.
+
+## Native recorder preview 11b
+
+- Fixed startup on Windows builds that do not expose `GraphicsCaptureSession.IsBorderRequired`. The recorder now uses `DrawBorderSettings::Default` instead of forcing border-off.
+- Cursor-on now uses the WGC system default and no longer requires the optional `IsCursorCaptureEnabled` property.
+- Cursor-off is requested only when the platform reports cursor toggling support; otherwise capture stays available with the system cursor behavior.
+- This keeps optional WGC capabilities from preventing the core capture session from initializing.
+
+### Native recorder preview 11c - recorded clip lifecycle
+- Temporary recordings loaded into the editor now expose **Discard recording** next to **Save original**.
+- Pressing **Record** while a temporary recording is open now shows an explicit Save / Discard / Cancel decision instead of silently hitting the backend unsaved-recording guard.
+- Discarding from the editor unloads the video first so Windows can delete the temporary recording, then returns Klippit to its empty Browse/Record state.
+- Saving before **Record New** releases the temporary source before the recorder cleans its old working directory.
+- The yellow outline around the captured display is the Windows Graphics Capture notification border. Preview 11b intentionally leaves Windows' default border behavior intact for compatibility with systems that do not support the optional border-control API.
+
+
+## v1.3.0: native recorder UI consolidation
+
+- Promoted the screen recorder to a first-class main-toolbar action, replacing the redundant in-app Klippit mark with a larger recorder icon.
+- Simplified the recorder window to status/timer plus context-sensitive actions. Stop/Discard are hidden until a recording exists.
+- Moved FPS, codec, quality, cursor, system audio, and microphone into a compact Settings popover that is collapsed on every recorder open.
+- Persisted those recorder preferences in the Tauri WebView's local storage so the user's last values survive application restarts.
+- Moved verbose diagnostic actions behind an error-only Details popover.
+- Reduced the recorder control window from 590x266 to 590x190; settings and diagnostics overlay rather than expanding the window.
+- Bumped application version from 1.2.0 to 1.3.0 for the native screen-recording feature release.
+
+
+## v1.3.1: export progress + output suffix layout
+
+- Fixed the Output filename flex layout: the editable stem now shrinks within the row while the extension suffix has a non-shrinking slot, preventing `.mp4` / `.gif` / `.apng` from being clipped off-screen.
+- Added an `export-progress` Tauri event carrying percentage and stage label.
+- Export FFmpeg jobs opt into `-progress pipe:1 -nostats`; `out_time_us` is mapped into an overall export span and throttled before being emitted to the webview.
+- Section extraction occupies the first 55% of the bar (with a join substage for multi-section projects); final format encoding occupies the remaining 45%. MP4 two-pass, GIF palette/use, APNG, and target-size retries receive explicit subranges.
+- The frontend clamps progress monotonically so encoder/size retries cannot make the bar move backwards.
+- Bumped application version from 1.3.0 to 1.3.1.
+
+
+## 2026-10-04 - v1.3.2 recorder workflow polish
+
+- Changed recorder-side Discard from exit-to-main into reset-to-READY while retaining the prepared capture session and current selection window.
+- Added a distinct `recorder_close` command for the recorder title-bar close action.
+- Editor-side Discard now immediately reopens the recorder after deleting the temporary source.
+- Remember the last recorder rectangle across Stop/Close so returning from the editor restores the prior capture area.
+- Main toolbar recorder control now includes the text label `Record` beside a slightly larger icon.

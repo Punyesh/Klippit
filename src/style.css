@@ -92,11 +92,6 @@ html, body {
   flex-shrink: 0;
   gap: 8px;
 }
-#head .brand {
-  color: var(--red);
-  display: flex;
-  align-items: center;
-}
 #head .source-name {
   font-family: var(--mono);
   font-size: 10px;
@@ -341,6 +336,33 @@ html, body {
   white-space: nowrap;
 }
 #crop-controls { margin-top: 6px; }
+.crop-control-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin: 7px 0 4px;
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.crop-control-heading span:last-child {
+  letter-spacing: 0;
+  text-transform: none;
+  opacity: .75;
+}
+.crop-edit-status,
+.crop-project-aspect {
+  font-family: var(--mono);
+  font-size: 9px;
+  line-height: 1.35;
+  color: var(--dim);
+}
+.crop-edit-status { color: var(--text); }
+.crop-edit-status:empty,
+.crop-project-aspect:empty { display: none; }
+.crop-project-aspect { margin-top: 5px; }
 #crop-reset-row {
   display: flex;
   align-items: center;
@@ -528,6 +550,16 @@ html, body {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .frame-time { text-align: center; font-size: 10px; color: var(--dim); margin-top: 3px; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subtitle-status {
+  margin: 5px 0 9px;
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 9px;
+  line-height: 1.35;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+.subtitle-status:empty { display: none; }
 .frame-time-row {
   display: flex; align-items: center; justify-content: center; gap: 10px;
 }
@@ -640,6 +672,9 @@ input[type="range"].input, input[type="range"]#seek-bar { accent-color: var(--re
 .preset-btn[aria-pressed="true"] { border-color: var(--red); color: var(--text); background: var(--red-dim); }
 
 /* ---------- output + export ---------- */
+#output-name-wrap { display: flex; align-items: center; gap: 4px; min-width: 0; width: 100%; }
+#output-filename { flex: 1 1 auto; width: 0; min-width: 0; }
+#output-ext { flex: 0 0 auto; min-width: max-content; margin: 0; white-space: nowrap; }
 #output-row { display: flex; gap: 5px; align-items: center; }
 #output-path {
   flex: 1; font-size: 10px; color: var(--dim); font-family: var(--mono);
@@ -667,9 +702,24 @@ input[type="range"].input, input[type="range"]#seek-bar { accent-color: var(--re
 #status-actions { display: flex; gap: 6px; flex-shrink: 0; }
 #status-actions .btn { padding: 3px 8px; font-size: 10px; }
 
-/* Indeterminate spinner shown on the export button while busy — real
-   percentage progress would need ffmpeg's own -progress output streamed
-   live (see README); this just confirms something is happening. */
+#export-progress-row {
+  display: none; align-items: center; gap: 7px; padding: 0 10px 6px;
+  background: var(--panel2); flex-shrink: 0; font-family: var(--mono);
+  font-size: 9px; color: var(--dim);
+}
+#export-progress-row.visible { display: flex; }
+#export-progress-stage { width: 92px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#export-progress-track {
+  position: relative; flex: 1; height: 4px; overflow: hidden; border-radius: 2px;
+  background: #111215; border: 1px solid var(--line);
+}
+#export-progress-fill {
+  width: 0%; height: 100%; background: var(--red); transition: width .12s linear;
+}
+#export-progress-percent { width: 30px; text-align: right; color: var(--text); }
+
+/* Small activity spinner stays on the Export button as a secondary busy
+   cue; the bar above now carries the real ffmpeg-derived progress. */
 .spinner {
   display: inline-block;
   width: 11px; height: 11px;
@@ -681,3 +731,42 @@ input[type="range"].input, input[type="range"]#seek-bar { accent-color: var(--re
   margin-right: 6px;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- screen recorder ---------- */
+#record-btn {
+  height: 28px; padding: 0 8px 0 6px; flex: 0 0 auto; gap: 5px; border-radius: 3px;
+  border: 1px solid transparent; background: transparent; color: var(--text); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 600; letter-spacing: .01em;
+}
+#record-btn svg { color: var(--red); opacity: .9; transition: opacity .12s ease, transform .12s ease; }
+#record-btn:hover { border-color: #493034; background: #211316; }
+#record-btn:hover svg { opacity: 1; transform: scale(1.05); }
+#record-btn:active svg { transform: scale(.98); }
+#recording-temp-banner {
+  align-items: center; justify-content: space-between; gap: 10px;
+  padding: 6px 10px; background: #191418; border-bottom: 1px solid #553039;
+  color: var(--dim); font-size: 10px; flex-shrink: 0;
+}
+#recording-temp-banner strong { color: var(--text); font-weight: 600; }
+#recording-temp-banner button {
+  background: transparent; border: 1px solid var(--line); color: var(--text);
+  border-radius: 2px; padding: 3px 7px; font-size: 10px; cursor: pointer; white-space: nowrap;
+}
+#recording-temp-banner button:hover { border-color: var(--red); }
+.recording-temp-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+#discard-recording-btn { color: var(--dim) !important; }
+#discard-recording-btn:hover { color: var(--text) !important; }
+#recording-close-modal, #recording-export-modal, #recording-new-modal {
+  position: fixed; inset: 0; z-index: 150; background: rgba(0,0,0,.66);
+  align-items: center; justify-content: center;
+}
+#recording-close-panel, .recording-modal-panel {
+  width: 430px; max-width: 90vw; background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 4px; padding: 16px; box-shadow: 0 14px 42px rgba(0,0,0,.45);
+}
+.recording-modal-title { font: 600 12px var(--mono); color: var(--text); margin-bottom: 8px; }
+.recording-modal-copy { font-size: 11px; line-height: 1.5; color: var(--dim); margin-bottom: 14px; }
+.recording-modal-actions { display: flex; justify-content: flex-end; gap: 7px; }
+#recording-new-modal .recording-modal-panel { width: 500px; }
+#recording-new-modal .recording-modal-actions { flex-wrap: wrap; }

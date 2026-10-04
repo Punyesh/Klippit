@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Klippit recording region</title>
+<style>
+  :root{--line:#8a8f97;--red:#e0342c;--bg:rgba(11,12,14,.90);--text:#e7e9ec;--dim:#9b9fa6;--mono:"JetBrains Mono",Consolas,monospace}
+  *{box-sizing:border-box} html,body{margin:0;width:100%;height:100%;background:transparent;overflow:hidden;user-select:none;font-family:"Segoe UI",system-ui,sans-serif}
+  #frame{position:absolute;inset:0;border:2px solid rgba(138,143,151,.9);box-shadow:inset 0 0 0 1px rgba(0,0,0,.65);transition:border-color .12s,box-shadow .12s}
+  body.recording #frame{border-color:var(--red);box-shadow:inset 0 0 0 1px rgba(0,0,0,.7),0 0 0 1px rgba(224,52,44,.15)}
+  body.paused #frame{border-color:rgba(224,52,44,.72);border-style:dashed;box-shadow:inset 0 0 0 1px rgba(0,0,0,.7)}
+  #badge{position:absolute;left:8px;top:8px;padding:3px 6px;border-radius:2px;background:var(--bg);border:1px solid rgba(255,255,255,.11);color:var(--dim);font:700 9px var(--mono);letter-spacing:.07em;white-space:nowrap}
+  #badge-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#777c84;margin-right:5px;vertical-align:1px}
+  body.recording #badge{color:#f0d9d7;border-color:rgba(224,52,44,.32)}body.recording #badge-dot{background:var(--red)}
+  body.paused #badge{color:#caa19e;border-color:rgba(224,52,44,.24)}body.paused #badge-dot{background:transparent;border:1px solid var(--red)}
+  #move{position:absolute;left:50%;top:8px;transform:translateX(-50%);padding:3px 6px;border-radius:2px;background:var(--bg);border:1px solid rgba(255,255,255,.10);color:#b8bbc0;font:9px var(--mono);cursor:move;white-space:nowrap}
+  #dims{position:absolute;left:50%;bottom:8px;transform:translateX(-50%);padding:3px 6px;border-radius:2px;background:var(--bg);border:1px solid rgba(255,255,255,.10);color:#aeb2b8;font:9px var(--mono);white-space:nowrap}
+  body.recording #move,body.paused #move,body.starting #move{display:none}
+  .h{position:absolute;z-index:5}.n,.s{height:9px;left:9px;right:9px;cursor:ns-resize}.n{top:0}.s{bottom:0}.e,.w{width:9px;top:9px;bottom:9px;cursor:ew-resize}.e{right:0}.w{left:0}
+  .nw,.ne,.sw,.se{width:16px;height:16px;z-index:6}.nw{left:0;top:0;cursor:nwse-resize}.ne{right:0;top:0;cursor:nesw-resize}.sw{left:0;bottom:0;cursor:nesw-resize}.se{right:0;bottom:0;cursor:nwse-resize}
+</style>
+</head>
+<body>
+<div id="frame"></div>
+<div id="badge"><span id="badge-dot"></span><span id="badge-text">READY</span></div>
+<div id="move">Drag to move capture area</div>
+<div id="dims">— × —</div>
+<div class="h n" data-dir="North"></div><div class="h s" data-dir="South"></div>
+<div class="h e" data-dir="East"></div><div class="h w" data-dir="West"></div>
+<div class="h nw" data-dir="NorthWest"></div><div class="h ne" data-dir="NorthEast"></div>
+<div class="h sw" data-dir="SouthWest"></div><div class="h se" data-dir="SouthEast"></div>
+<script>
+'use strict';
+(function(){
+  if(!window.__TAURI__) return;
+  var invoke=window.__TAURI__.core.invoke;
+  var win=window.__TAURI__.window.getCurrentWindow();
+  var dims=document.getElementById('dims'), badge=document.getElementById('badge-text');
+  var locked=false;
+  var syncTimer=null;
+  function sync(){
+    clearTimeout(syncTimer);
+    syncTimer=setTimeout(function(){
+      invoke('recorder_sync_controls').then(function(g){dims.textContent=g.width+' × '+g.height+' · '+g.monitorName;}).catch(function(e){dims.textContent=String(e);});
+    },25);
+  }
+  document.getElementById('move').addEventListener('pointerdown',function(e){if(!locked&&e.button===0)win.startDragging();});
+  document.querySelectorAll('[data-dir]').forEach(function(el){el.addEventListener('pointerdown',function(e){if(!locked&&e.button===0)win.startResizeDragging(el.dataset.dir);});});
+  win.onMoved(sync);win.onResized(sync);sync();
+  setInterval(function(){
+    invoke('recorder_status').then(function(s){
+      locked=s.phase==='recording'||s.phase==='paused'||s.phase==='starting'||s.phase==='finalizing';
+      document.body.className='';
+      if(s.phase==='recording'){document.body.classList.add('recording');badge.textContent='REC';}
+      else if(s.phase==='paused'){document.body.classList.add('paused');badge.textContent='PAUSED';}
+      else if(s.phase==='starting'){document.body.classList.add('starting');badge.textContent='STARTING';}
+      else{badge.textContent='READY';}
+    }).catch(function(){});
+  },250);
+})();
+</script>
+</body>
+</html>
